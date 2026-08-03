@@ -22,11 +22,20 @@ resume:
   master_file: "resume/master_resume.md"
   output_dir: "output/tailored"
 
-# ===== 个人知识库（打招呼语与定制简历的生成依据）=====
-# 把项目复盘、技术亮点、量化成果、自我介绍话术等 .md/.txt 放进该目录
+# ===== 个人知识库（可选）=====
+# 打招呼语与定制简历的生成依据。没有知识库也能正常运行
 knowledge:
+  provider: "none"                 # none=不使用 | local=本地目录 | rag=外部RAG检索接口
+  # --- local 模式：把项目复盘、技术亮点、量化成果等 .md/.txt 放进目录即可 ---
   dir: "knowledge"
-  max_chars: 12000                 # 注入提示词的知识库字数上限，重要内容放前面
+  max_chars: 12000                 # 注入提示词的知识内容上限
+  # --- rag 模式：按岗位 JD 实时检索最相关的知识片段（接口契约见 docs/rag-api.md）---
+  # 适合已有个人知识库系统（如 Morse 数字分身、自建向量库）的用户
+  rag:
+    endpoint: "http://127.0.0.1:3000/api/internal/rag/search"
+    api_key: ""                    # 可选，配置后以 Bearer Token 携带
+    top_k: 6
+    timeout_seconds: 10
 
 boss:
   keywords:

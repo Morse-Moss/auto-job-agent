@@ -1,7 +1,7 @@
 """Boss直聘平台自动化。
 
 流程：扫码登录(Cookie持久化) -> 搜索岗位 -> 抓取JD -> AI结合求职要求打分 ->
-     高分岗位以知识库为依据生成定制简历+打招呼语 -> 自动点击「立即沟通」发送 -> 本地记录防重复
+     高分岗位检索知识库(可选) -> 生成定制简历+打招呼语 -> 自动点击「立即沟通」发送 -> 本地记录防重复
 
 注意 Boss 前端经常改版。脚本失效时，优先用 F12 检查并更新下方 SELECTORS。
 注意 请控制频率：max_apply_per_run 建议不超过 20，delay_range_seconds 不要调太小。
@@ -103,11 +103,13 @@ class BossPlatform(BasePlatform):
                             self.store.record(job, score, reason, greeted=False)
                             continue
 
-                        tailored = self.ai.tailor_resume(resume_md, job, self.knowledge)
+                        knowledge = self.job_knowledge(job)
+
+                        tailored = self.ai.tailor_resume(resume_md, job, knowledge)
                         path = self.resume_mgr.save_tailored(job, tailored)
                         print(f"   定制简历已保存: {path}")
 
-                        greet = self.ai.greeting(resume_md, job, self.knowledge)
+                        greet = self.ai.greeting(resume_md, job, knowledge)
                         ok = self._send_greeting(detail, greet)
                         self.store.record(job, score, reason, greeted=ok)
                         if ok:

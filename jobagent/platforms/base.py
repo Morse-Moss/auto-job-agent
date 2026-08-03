@@ -6,12 +6,16 @@ from abc import ABC, abstractmethod
 class BasePlatform(ABC):
     name = "base"
 
-    def __init__(self, cfg: dict, ai, resume_mgr, store, knowledge: str = ""):
+    def __init__(self, cfg: dict, ai, resume_mgr, store, kb=None):
         self.cfg = cfg
         self.ai = ai
         self.resume_mgr = resume_mgr
         self.store = store
-        self.knowledge = knowledge  # 个人知识库全文，用于打招呼语与简历定制
+        self.kb = kb  # 知识提供者（可选），jobagent.knowledge.BaseKnowledgeProvider 实例
+
+    def job_knowledge(self, job: dict) -> str:
+        """获取该岗位可用的知识文本；未配置知识库时返回空串。"""
+        return self.kb.for_job(job) if self.kb else ""
 
     @abstractmethod
     def run(self, dry_run: bool = False) -> None:
