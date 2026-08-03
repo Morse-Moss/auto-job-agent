@@ -10,6 +10,7 @@ import argparse
 
 from jobagent.config import load_config
 from jobagent.ai import DeepSeekClient
+from jobagent.knowledge import KnowledgeBase
 from jobagent.resume import ResumeManager
 from jobagent.store import Store
 from jobagent.platforms.boss import BossPlatform
@@ -32,7 +33,16 @@ def main() -> None:
     resume_mgr = ResumeManager(cfg["resume"])
     store = Store()
 
-    platform = PLATFORMS[args.platform](cfg, ai, resume_mgr, store)
+    knowledge = KnowledgeBase(cfg.get("knowledge")).load()
+    if knowledge:
+        print(f"已加载个人知识库（{len(knowledge)} 字），将作为打招呼与简历定制的依据")
+    else:
+        print("提示：knowledge/ 目录为空，打招呼与简历定制将仅依据母版简历")
+
+    if not (cfg.get("preferences") or "").strip():
+        print("提示：config.yaml 未填写 preferences 求职要求，打分将仅按简历匹配度")
+
+    platform = PLATFORMS[args.platform](cfg, ai, resume_mgr, store, knowledge=knowledge)
     try:
         platform.run(dry_run=args.dry_run)
     finally:

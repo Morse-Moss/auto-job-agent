@@ -1,10 +1,10 @@
 """Boss直聘平台自动化。
 
-流程：扫码登录(Cookie持久化) -> 搜索岗位 -> 抓取JD -> AI打分 ->
-     高分岗位生成定制简历+打招呼语 -> 自动点击「立即沟通」发送 -> 本地记录防重复
+流程：扫码登录(Cookie持久化) -> 搜索岗位 -> 抓取JD -> AI结合求职要求打分 ->
+     高分岗位以知识库为依据生成定制简历+打招呼语 -> 自动点击「立即沟通」发送 -> 本地记录防重复
 
-⚠️ Boss 前端经常改版。脚本失效时，优先用 F12 检查并更新下方 SELECTORS。
-⚠️ 请控制频率：max_apply_per_run 建议 ≤20，delay_range_seconds 不要调太小。
+注意 Boss 前端经常改版。脚本失效时，优先用 F12 检查并更新下方 SELECTORS。
+注意 请控制频率：max_apply_per_run 建议不超过 20，delay_range_seconds 不要调太小。
 """
 
 import random
@@ -56,6 +56,7 @@ class BossPlatform(BasePlatform):
     def run(self, dry_run: bool = False) -> None:
         cfg = self.cfg["boss"]
         min_score = self.cfg["match"]["min_score"]
+        preferences = (self.cfg.get("preferences") or "").strip()
         resume_md = self.resume_mgr.master
         applied = 0
 
@@ -85,30 +86,28 @@ class BossPlatform(BasePlatform):
                         self.store.record(job, -1, "命中黑名单", greeted=False)
                         continue
 
-                    # 抓取 JD 详情
                     detail = context.new_page()
                     try:
                         job = self._load_detail(detail, job)
                         if not job.get("jd"):
                             continue
-                        if self._blacklisted(job, cfg):  # JD 全文再过一遍黑名单
+                        if self._blacklisted(job, cfg):
                             self.store.record(job, -1, "JD命中黑名单", greeted=False)
                             continue
 
-                        score, reason = self.ai.match_score(resume_md, job)
-                        tag = "✅" if score >= min_score else "⏭️"
+                        score, reason = self.ai.match_score(resume_md, job, preferences)
+                        tag = "[投]" if score >= min_score else "[跳过]"
                         print(f"{tag} [{score:3d}] {job['title']} @ {job['company']} — {reason}")
 
                         if score < min_score or dry_run:
                             self.store.record(job, score, reason, greeted=False)
                             continue
 
-                        # 定制简历 + 打招呼
-                        tailored = self.ai.tailor_resume(resume_md, job)
+                        tailored = self.ai.tailor_resume(resume_md, job, self.knowledge)
                         path = self.resume_mgr.save_tailored(job, tailored)
                         print(f"   定制简历已保存: {path}")
 
-                        greet = self.ai.greeting(resume_md, job)
+                        greet = self.ai.greeting(resume_md, job, self.knowledge)
                         ok = self._send_greeting(detail, greet)
                         self.store.record(job, score, reason, greeted=ok)
                         if ok:
@@ -133,7 +132,6 @@ class BossPlatform(BasePlatform):
 
         print("未登录，正在打开登录页，请用 Boss App 扫码…")
         page.goto(f"{BASE_URL}/web/user/?ka=header-login", wait_until="domcontentloaded")
-        # 最长等 3 分钟扫码
         page.wait_for_selector(SELECTORS["logged_in"], timeout=180_000)
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         context.storage_state(path=str(STATE_FILE))
@@ -150,7 +148,7 @@ class BossPlatform(BasePlatform):
         try:
             page.wait_for_selector(SELECTORS["job_card"], timeout=15_000)
         except PWTimeout:
-            print("⚠️ 未找到岗位卡片。可能是选择器过期或触发了验证码，请打开浏览器窗口查看。")
+            print("警告：未找到岗位卡片。可能是选择器过期或触发了验证码，请查看浏览器窗口。")
             return []
 
         jobs: list[dict] = []
@@ -183,7 +181,7 @@ class BossPlatform(BasePlatform):
             page.wait_for_selector(SELECTORS["jd_text"], timeout=15_000)
             job["jd"] = page.inner_text(SELECTORS["jd_text"]).strip()
         except PWTimeout:
-            print(f"⚠️ 抓取 JD 失败: {job['title']}（选择器过期或验证码）")
+            print(f"警告：抓取 JD 失败: {job['title']}（选择器过期或验证码）")
             job["jd"] = ""
         return job
 
@@ -196,7 +194,6 @@ class BossPlatform(BasePlatform):
             if "继续沟通" in btn_text:
                 return False  # 之前聊过，跳过
             btn.click()
-            # 点击后可能进入聊天页或弹出聊天框
             box = page.wait_for_selector(SELECTORS["chat_input"], timeout=15_000)
             box.click()
             page.keyboard.type(greeting, delay=random.randint(30, 80))
@@ -205,7 +202,7 @@ class BossPlatform(BasePlatform):
             time.sleep(random.uniform(1, 2))
             return True
         except PWTimeout:
-            print("⚠️ 打招呼失败（聊天入口/输入框选择器可能过期）")
+            print("警告：打招呼失败（聊天入口/输入框选择器可能过期）")
             return False
 
     # ------------------------------------------------------------------

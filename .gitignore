@@ -7,6 +7,10 @@ venv/
 config.yaml
 resume/master_resume.md
 
+# 个人知识库（仅保留说明文件）
+knowledge/*
+!knowledge/README.md
+
 # 运行时产物
 .state/
 output/

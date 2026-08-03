@@ -6,11 +6,12 @@ from abc import ABC, abstractmethod
 class BasePlatform(ABC):
     name = "base"
 
-    def __init__(self, cfg: dict, ai, resume_mgr, store):
+    def __init__(self, cfg: dict, ai, resume_mgr, store, knowledge: str = ""):
         self.cfg = cfg
         self.ai = ai
         self.resume_mgr = resume_mgr
         self.store = store
+        self.knowledge = knowledge  # 个人知识库全文，用于打招呼语与简历定制
 
     @abstractmethod
     def run(self, dry_run: bool = False) -> None:
