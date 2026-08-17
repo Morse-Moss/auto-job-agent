@@ -6,6 +6,10 @@ venv/
 # 私密内容：真实配置与真实简历永不提交
 config.yaml
 resume/master_resume.md
+resume/AI-Product-Builder-Resume.scoring.md
+resume/NOTES.md
+resume/*.pdf
+resume/*.docx
 
 # 个人知识库（仅保留说明文件）
 knowledge/*
@@ -14,5 +18,9 @@ knowledge/*
 # 运行时产物
 .state/
 output/
+artifacts/
+private/
+references/
+tmp/
 *.db
 .env

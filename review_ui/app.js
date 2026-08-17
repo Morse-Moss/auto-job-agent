@@ -1,0 +1,1233 @@
+const state = {
+  jobs: [],
+  stats: { total: 0, reviewed: 0 },
+  filter: "all",
+  selectedId: null,
+  selectedPlatform: null,
+  selectedSampleName: "positioning-v1",
+  detailRequest: 0,
+  view: "calibration",
+  calibration: null,
+  calibratedResumeText: "",
+  calibratedFilename: "",
+  collectionRunning: false,
+  learning: null,
+  matching: null,
+  matchFilter: "all",
+  selectedMatchId: null,
+  selectedMatchPlatform: null,
+  matchDetailRequest: 0,
+  boundary: null,
+};
+
+const labels = {
+  buckets: { favorites: "收藏样本", core: "核心样本", stretch: "挑战样本", exclude: "排除样本" },
+  tiers: { core: "当前可投", adjacent: "相邻可投", stretch: "有门槛", exclude: "不建议投" },
+  tracks: {
+    fde: "FDE",
+    agent_engineering: "Agent",
+    rag_engineering: "RAG",
+    ai_application: "AI 应用",
+    solution_delivery: "方案交付",
+    ai_product_delivery: "AI 产品 / FDE",
+    pure_java: "传统 Java",
+    product: "产品",
+    sales: "销售 / 商务",
+    other: "其他",
+  },
+  risks: {
+    third_party: "第三方招聘待确认",
+    outsourcing_risk: "疑似外包 / 派遣",
+    seniority_gap: "经验门槛偏高",
+    salary_stretch: "薪资带宽偏高",
+    graduate_only: "应届资格待确认",
+    internship: "实习岗位",
+    pure_java: "偏纯 Java",
+    onsite_heavy: "长期 / 高频驻场",
+    non_engineering_role: "非研发岗",
+    product_role: "偏产品岗",
+    overseas_assignment: "海外派驻",
+    non_ai_role: "AI 相关度低",
+  },
+  recommendations: {
+    priority: "优先投",
+    challenge: "挑战投",
+    not_fit: "当前不建议投",
+  },
+  interests: { want: "想投", maybe: "再看", reject: "放弃" },
+  conflicts: { strong: "强冲突", soft: "软冲突", aligned: "判断一致" },
+  information: {
+    sufficient: "信息较完整",
+    partial: "部分信息缺失",
+    insufficient: "信息不足",
+  },
+};
+
+const analysisFields = [
+  ["direction", "directionValue", "directionEvidence"],
+  ["technical_match", "technicalMatchValue", "technicalMatchEvidence"],
+  ["business_value", "businessValue", "businessEvidence"],
+  ["attainability", "attainabilityValue", "attainabilityEvidence"],
+  ["salary_reachability", "salaryReachabilityValue", "salaryEvidence"],
+  ["employment_risk", "employmentRiskValue", "employmentEvidence"],
+];
+
+const DEFAULT_SAMPLE_NAME = "positioning-v1";
+
+const elements = {
+  list: document.querySelector("#jobList"),
+  visibleCount: document.querySelector("#visibleCount"),
+  progressText: document.querySelector("#progressText"),
+  progressBar: document.querySelector("#progressBar"),
+  detailEmpty: document.querySelector("#detailEmpty"),
+  detailContent: document.querySelector("#detailContent"),
+  decisionForm: document.querySelector("#decisionForm"),
+  formError: document.querySelector("#formError"),
+  saveButton: document.querySelector("#saveButton"),
+  saveState: document.querySelector("#saveState"),
+  correctionForm: document.querySelector("#correctionForm"),
+  correctionError: document.querySelector("#correctionError"),
+  correctionButton: document.querySelector("#correctionButton"),
+  correctionState: document.querySelector("#correctionState"),
+  learningIntent: document.querySelector("#learningIntent"),
+  calibrationView: document.querySelector("#calibrationView"),
+  calibrationError: document.querySelector("#calibrationError"),
+  calibrationStatus: document.querySelector("#calibrationStatus"),
+  resumeFile: document.querySelector("#resumeFile"),
+  calibrateResumeButton: document.querySelector("#calibrateResumeButton"),
+  collectResumeJobsButton: document.querySelector("#collectResumeJobsButton"),
+  resumeFileAction: document.querySelector(".file-action"),
+  resumeSkillList: document.querySelector("#resumeSkillList"),
+  collectionQueries: document.querySelector("#collectionQueries"),
+  preferenceSignals: document.querySelector("#preferenceSignals"),
+  calibrationUnknowns: document.querySelector("#calibrationUnknowns"),
+  reviewView: document.querySelector("#reviewView"),
+  learningView: document.querySelector("#learningView"),
+  learningPriorities: document.querySelector("#learningPriorities"),
+  marketDemands: document.querySelector("#marketDemands"),
+  noteSignals: document.querySelector("#noteSignals"),
+  learningError: document.querySelector("#learningError"),
+  matchingView: document.querySelector("#matchingView"),
+  matchJobList: document.querySelector("#matchJobList"),
+  matchVisibleCount: document.querySelector("#matchVisibleCount"),
+  matchDetailEmpty: document.querySelector("#matchDetailEmpty"),
+  matchDetailContent: document.querySelector("#matchDetailContent"),
+  matchingError: document.querySelector("#matchingError"),
+  boundaryView: document.querySelector("#boundaryView"),
+  boundaryInsights: document.querySelector("#boundaryInsights"),
+  boundaryGroups: document.querySelector("#boundaryGroups"),
+  boundaryRuleGate: document.querySelector("#boundaryRuleGate"),
+  boundaryError: document.querySelector("#boundaryError"),
+};
+
+async function fetchJson(url, options) {
+  const response = await fetch(url, options);
+  const payload = await response.json().catch(() => ({ error: "服务返回了无法读取的内容" }));
+  if (!response.ok) throw new Error(payload.error || `请求失败 (${response.status})`);
+  return payload;
+}
+
+function filteredJobs() {
+  if (state.filter === "all") return state.jobs;
+  if (state.filter === "unreviewed") return state.jobs.filter((job) => !job.reviewed);
+  return state.jobs.filter((job) => job.interest === state.filter);
+}
+
+function renderProgress() {
+  const total = state.stats.total || 0;
+  const reviewed = state.stats.reviewed || 0;
+  elements.progressText.textContent = `${reviewed} / ${total}`;
+  elements.progressBar.style.width = `${total ? (reviewed / total) * 100 : 0}%`;
+}
+
+function renderCompanyProfile(job) {
+  const profile = job.company_profile || {};
+  const setValue = (id, value) => {
+    document.querySelector(`#${id}`).textContent = value || "未采集";
+  };
+  setValue("companySize", profile.company_size);
+  setValue("companyIndustry", profile.industry);
+  setValue("companyFinancing", profile.financing);
+  const age = profile.company_age && profile.founded_date
+    ? `${profile.company_age}（${profile.founded_date}）`
+    : profile.company_age || profile.founded_date;
+  setValue("companyAge", age);
+  setValue("companyLegalName", profile.legal_name);
+  setValue("companyStatus", profile.operating_status);
+  setValue("companyCapital", profile.registered_capital);
+  document.querySelector("#companyCollectedAt").textContent = job.collected_at
+    ? `采集于 ${String(job.collected_at).slice(0, 10)}`
+    : "";
+}
+
+function createTextElement(tag, className, text) {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  element.textContent = text;
+  return element;
+}
+
+function invalidateMatchResults() {
+  state.matching = null;
+  state.boundary = null;
+}
+
+function renderCalibrationDashboard(dashboard) {
+  state.calibration = dashboard;
+  const profile = dashboard.profile;
+  const preferences = dashboard.preference_calibration || {};
+  const collection = dashboard.collection_plan || {};
+  const match = dashboard.match || {};
+  const unknowns = preferences.unknowns || [];
+  const signals = preferences.signals || [];
+  const skills = profile?.skills || [];
+
+  document.querySelector("#calibrationSkillCount").textContent = String(skills.length);
+  document.querySelector("#calibrationLocalJobs").textContent = String(collection.local_jobs || 0);
+  document.querySelector("#calibrationReviewedJobs").textContent = String(preferences.reviewed_jobs || 0);
+  document.querySelector("#calibrationUnknownCount").textContent = String(unknowns.length);
+  document.querySelector("#calibrationAsOf").textContent = dashboard.calibrated_at
+    ? `校准于 ${String(dashboard.calibrated_at).slice(0, 16).replace("T", " ")}`
+    : "";
+  document.querySelector("#calibrationScope").textContent = profile
+    ? `${profile.display_name || profile.profile_id} · 已校准 ${match.total || 0} 个岗位 · 原始简历未保存`
+    : dashboard.empty_message || "选择本地简历开始校准。";
+  document.querySelector("#resumeProfileVersion").textContent = profile?.version || "";
+
+  const summary = document.querySelector("#profileSummary");
+  summary.replaceChildren();
+  if (profile) {
+    const educationLabels = { unknown: "未识别", high_school: "高中", associate: "大专", bachelor: "本科", master: "硕士", doctor: "博士" };
+    [
+      ["候选人", profile.display_name || profile.profile_id],
+      ["经验", `${profile.experience_years || 0} 年`],
+      ["学历", educationLabels[profile.education?.level] || "未识别"],
+      ["目标方向", (profile.target_tracks || []).map((track) => labels.tracks[track] || track).join("、") || "待岗位样本确认"],
+    ].forEach(([name, value]) => {
+      const wrapper = document.createElement("div");
+      wrapper.append(createTextElement("dt", "", name), createTextElement("dd", "", value));
+      summary.append(wrapper);
+    });
+  }
+
+  elements.resumeSkillList.replaceChildren();
+  if (!skills.length) {
+    elements.resumeSkillList.append(createTextElement("p", "list-empty", profile ? "没有提取到足够明确的能力证据。" : "完成校准后显示能力和对应简历原文。"));
+  }
+  skills.forEach((skill) => {
+    const article = document.createElement("article");
+    article.className = "resume-skill-item";
+    article.append(createTextElement("h4", "", skill.name || skill.id));
+    (skill.evidence || []).forEach((evidence) => article.append(createTextElement("p", "", evidence)));
+    elements.resumeSkillList.append(article);
+  });
+
+  elements.collectionQueries.replaceChildren();
+  (collection.queries || []).forEach((query) => elements.collectionQueries.append(createTextElement("span", "query-chip", query)));
+  if (!(collection.queries || []).length) elements.collectionQueries.append(createTextElement("p", "list-empty", "校准后生成岗位搜索范围。"));
+  const collectionMessages = {
+    not_run: `当前已使用 ${collection.local_jobs || 0} 个本地岗位；可在本地校准后按画像补充岗位。`,
+    running: "正在按简历画像采集岗位；你可以继续查看本地结果。",
+    completed: `采集完成，本轮新增 ${collection.collected_new_jobs || 0} 个岗位，现有 ${collection.local_jobs || 0} 个。`,
+    sample_completed: `采集完成，本轮新增 ${collection.collected_new_jobs || 0} 个岗位。`,
+    exhausted: `已检索完当前范围，本轮新增 ${collection.collected_new_jobs || 0} 个岗位。`,
+    security_check: "招聘平台触发安全校验，采集已停止；本地校准结果仍可使用。",
+    stopped: "采集已停止；本地校准结果仍可使用。",
+  };
+  const collectionStatus = collection.external_collection || "not_run";
+  const collectionMessage = collectionMessages[collectionStatus] || `采集状态：${collectionStatus}`;
+  const collectionError = collection.external_collection_error ? ` ${collection.external_collection_error}` : "";
+  document.querySelector("#externalCollectionState").textContent = `${collectionMessage}${collectionError}`;
+  elements.collectResumeJobsButton.disabled = !profile || !state.calibratedResumeText || state.collectionRunning;
+
+  elements.preferenceSignals.replaceChildren();
+  if (!signals.length) elements.preferenceSignals.append(createTextElement("p", "list-empty", "现有审阅还不足以形成稳定偏好。"));
+  signals.forEach((signal) => {
+    const article = document.createElement("article");
+    article.className = "preference-item";
+    const heading = document.createElement("div");
+    heading.append(
+      createTextElement("h4", "", signal.label),
+      createTextElement("span", "soft-label", `软调整 ${signal.score_adjustment > 0 ? "+" : ""}${signal.score_adjustment}`),
+    );
+    article.append(heading);
+    const evidence = (signal.evidence || []).map((item) => `${item.title} · ${item.decision}`).join("；");
+    article.append(createTextElement("p", "", evidence || "暂无可展示证据"));
+    elements.preferenceSignals.append(article);
+  });
+
+  elements.calibrationUnknowns.replaceChildren();
+  if (!unknowns.length) elements.calibrationUnknowns.append(createTextElement("p", "list-empty", "当前没有待确认项。"));
+  unknowns.forEach((item) => {
+    const article = document.createElement("article");
+    article.className = "unknown-item";
+    article.append(createTextElement("h4", "", item.label), createTextElement("p", "", item.reason));
+    elements.calibrationUnknowns.append(article);
+  });
+}
+
+async function loadCalibrationDashboard(force = false) {
+  elements.calibrationError.textContent = "";
+  if (state.calibration && !force) {
+    renderCalibrationDashboard(state.calibration);
+    return;
+  }
+  try {
+    renderCalibrationDashboard(await fetchJson("/api/calibration"));
+  } catch (error) {
+    elements.calibrationError.textContent = `${error.message} 请重新选择简历校准。`;
+  }
+}
+
+async function calibrateSelectedResume() {
+  const file = elements.resumeFile.files?.[0];
+  if (!file) return;
+  elements.calibrationError.textContent = "";
+  elements.calibrationStatus.textContent = "正在提取简历证据并重算岗位匹配...";
+  elements.calibrateResumeButton.disabled = true;
+  elements.calibrateResumeButton.textContent = "校准中";
+  try {
+    const resumeText = await file.text();
+    const dashboard = await fetchJson("/api/calibration", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ resume_text: resumeText, filename: file.name }),
+    });
+    invalidateMatchResults();
+    state.calibratedResumeText = resumeText;
+    state.calibratedFilename = file.name;
+    renderCalibrationDashboard(dashboard);
+    elements.calibrationStatus.textContent = `已完成：${dashboard.match?.total || 0} 个岗位重新校准。`;
+  } catch (error) {
+    elements.calibrationError.textContent = `${error.message} 请检查简历内容后重试。`;
+    elements.calibrationStatus.textContent = "";
+  } finally {
+    elements.calibrateResumeButton.disabled = state.collectionRunning || !file;
+    elements.calibrateResumeButton.textContent = "1. 本地校准";
+  }
+}
+
+function setCollectionRunning(running) {
+  state.collectionRunning = running;
+  elements.resumeFile.disabled = running;
+  elements.resumeFileAction.classList.toggle("disabled", running);
+  elements.resumeFileAction.setAttribute("aria-disabled", String(running));
+  elements.calibrateResumeButton.disabled = running || !elements.resumeFile.files?.[0];
+  elements.collectResumeJobsButton.disabled = running || !state.calibratedResumeText;
+  elements.collectResumeJobsButton.textContent = running ? "采集中" : "2. 按画像采集";
+}
+
+async function pollCollectionStatus() {
+  const payload = await fetchJson("/api/calibration/collection-status");
+  const collection = payload.collection || { status: "idle" };
+  if (collection.status === "running") {
+    setCollectionRunning(true);
+    elements.calibrationStatus.textContent = "正在读取岗位与公司信息；可继续使用其他视图。";
+    window.setTimeout(() => pollCollectionStatus().catch(showCollectionPollingError), 1500);
+    return;
+  }
+  setCollectionRunning(false);
+  if (collection.status === "idle") return;
+  const collectionCompleted = ["completed", "exhausted", "sample_completed"].includes(collection.status);
+  if (collectionCompleted) state.learning = null;
+  invalidateMatchResults();
+  const dashboard = await fetchJson("/api/calibration");
+  renderCalibrationDashboard(dashboard);
+  const added = Number(collection.collected_new_jobs || 0);
+  elements.calibrationStatus.textContent = collectionCompleted
+    ? `采集结束：新增 ${added} 个岗位，匹配已重算。`
+    : "采集已停止，本地校准结果仍可使用。";
+}
+
+function showCollectionPollingError(error) {
+  elements.calibrationError.textContent = `${error.message} 无法读取采集状态，请稍后刷新。`;
+}
+
+async function collectResumeJobs() {
+  if (!state.calibratedResumeText || state.collectionRunning) return;
+  let collectionStarted = false;
+  elements.calibrationError.textContent = "";
+  setCollectionRunning(true);
+  elements.calibrationStatus.textContent = "正在启动按画像采集...";
+  try {
+    await fetchJson("/api/calibration/collect", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        resume_text: state.calibratedResumeText,
+        filename: state.calibratedFilename || "resume.md",
+      }),
+    });
+    collectionStarted = true;
+    await pollCollectionStatus();
+  } catch (error) {
+    if (!collectionStarted) setCollectionRunning(false);
+    elements.calibrationError.textContent = `${error.message} 本地校准结果未受影响。`;
+    elements.calibrationStatus.textContent = collectionStarted
+      ? "采集仍在后台运行，请稍后刷新页面查看状态。"
+      : "";
+  }
+}
+
+function renderLearningDashboard(dashboard) {
+  state.learning = dashboard;
+  const snapshot = dashboard.snapshot || {};
+  const notes = dashboard.notes || {};
+  const priorities = dashboard.priorities || [];
+  const demands = dashboard.market_demands || [];
+  document.querySelector("#learningScope").textContent = `基于本地 ${snapshot.collected_jobs || 0} 个岗位，其中 ${snapshot.target_jobs || 0} 个处于当前可投或挑战范围`;
+  document.querySelector("#learningAsOf").textContent = snapshot.latest_collected_at
+    ? `数据截至 ${String(snapshot.latest_collected_at).slice(0, 10)}`
+    : "";
+  document.querySelector("#learningTargetJobs").textContent = String(snapshot.target_jobs || 0);
+  document.querySelector("#learningReviewedJobs").textContent = String(snapshot.reviewed_jobs || 0);
+  document.querySelector("#learningNoteCount").textContent = String(notes.learning || 0);
+  document.querySelector("#learningDemandCount").textContent = String(demands.length);
+
+  elements.learningPriorities.replaceChildren();
+  if (!priorities.length) {
+    elements.learningPriorities.append(createTextElement("p", "list-empty", "还没有足够的学习信号。"));
+  }
+  priorities.forEach((priority, index) => {
+    const row = document.createElement("article");
+    row.className = "priority-item";
+    const number = createTextElement("span", "priority-number", String(index + 1).padStart(2, "0"));
+    const body = document.createElement("div");
+    body.className = "priority-body";
+    const heading = document.createElement("div");
+    heading.className = "priority-heading";
+    heading.append(
+      createTextElement("h4", "", priority.name),
+      createTextElement(
+        "span",
+        "priority-signal",
+        priority.note_count
+          ? `${priority.note_count} 条备注 · ${priority.market_job_count} 个岗位 / ${priority.share_percent}%`
+          : `${priority.market_job_count} 个岗位 / ${priority.share_percent}%`,
+      ),
+    );
+    const recommendation = createTextElement("p", "priority-recommendation", priority.recommendation);
+    const deliverable = document.createElement("p");
+    deliverable.className = "priority-deliverable";
+    deliverable.append(
+      createTextElement("span", "", "建议产出"),
+      createTextElement("strong", "", priority.deliverable),
+    );
+    body.append(heading, recommendation, deliverable);
+    row.append(number, body);
+    elements.learningPriorities.append(row);
+  });
+
+  elements.marketDemands.replaceChildren();
+  demands.slice(0, 10).forEach((demand) => {
+    const row = document.createElement("div");
+    row.className = "demand-item";
+    const heading = document.createElement("div");
+    heading.className = "demand-heading";
+    heading.append(
+      createTextElement("strong", "", demand.name),
+      createTextElement("span", "", `${demand.job_count} / ${snapshot.target_jobs || 0}`),
+    );
+    const track = document.createElement("div");
+    track.className = "demand-track";
+    const fill = document.createElement("span");
+    fill.style.width = `${Math.max(0, Math.min(100, demand.share_percent || 0))}%`;
+    track.append(fill);
+    row.append(heading, track);
+    elements.marketDemands.append(row);
+  });
+
+  const categoryLabels = { learning: "学习", risk: "风险", strength: "优势", general: "其他" };
+  const summary = document.querySelector("#noteSummary");
+  summary.replaceChildren();
+  ["learning", "risk", "strength", "general"].forEach((category) => {
+    if (!notes[category]) return;
+    summary.append(createTextElement("span", category, `${categoryLabels[category]} ${notes[category]}`));
+  });
+
+  elements.noteSignals.replaceChildren();
+  (notes.signals || []).forEach((signal) => {
+    const row = document.createElement("article");
+    row.className = "note-signal-item";
+    const heading = document.createElement("div");
+    heading.className = "note-signal-heading";
+    const badge = createTextElement("span", `note-category ${signal.category}`, categoryLabels[signal.category] || "其他");
+    const jobLabel = [signal.title, signal.company].filter(Boolean).join(" · ");
+    if (signal.sample_name) {
+      const jobButton = createTextElement("button", "note-job-link", jobLabel);
+      jobButton.type = "button";
+      jobButton.dataset.jobId = signal.job_id;
+      jobButton.dataset.platform = signal.platform;
+      jobButton.dataset.sampleName = signal.sample_name;
+      heading.append(badge, jobButton);
+    } else {
+      heading.append(badge, createTextElement("span", "note-job-label", jobLabel));
+    }
+    row.append(heading, createTextElement("p", "", signal.excerpt));
+    elements.noteSignals.append(row);
+  });
+  if (!notes.signals?.length) {
+    elements.noteSignals.append(createTextElement("p", "list-empty", "还没有个人备注。"));
+  }
+}
+
+async function loadLearningDashboard() {
+  elements.learningError.textContent = "";
+  if (state.learning) {
+    renderLearningDashboard(state.learning);
+    return;
+  }
+  try {
+    const dashboard = await fetchJson("/api/learning");
+    renderLearningDashboard(dashboard);
+  } catch (error) {
+    elements.learningError.textContent = `${error.message} 请确认本地数据库可读后重试。`;
+  }
+}
+
+function filteredMatches() {
+  const jobs = state.matching?.jobs || [];
+  if (state.matchFilter === "all") return jobs;
+  if (state.matchFilter === "changed") return jobs.filter((job) => job.changed);
+  return jobs.filter((job) => job.recommendation === state.matchFilter);
+}
+
+function renderMatchQueue() {
+  const jobs = filteredMatches();
+  const filterLabels = {
+    all: "全部岗位",
+    priority: "优先投",
+    challenge: "挑战投",
+    not_fit: "当前不建议投",
+    changed: "新旧判断冲突",
+  };
+  document.querySelector("#matchFilterTitle").textContent = filterLabels[state.matchFilter];
+  elements.matchVisibleCount.textContent = String(jobs.length);
+  elements.matchJobList.replaceChildren();
+  if (!jobs.length) {
+    elements.matchJobList.append(createTextElement("p", "list-empty", "这个筛选下没有岗位。"));
+    return;
+  }
+  jobs.forEach((job) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    const selected = job.job_id === state.selectedMatchId
+      && (!state.selectedMatchPlatform || job.platform === state.selectedMatchPlatform);
+    button.className = `match-job-item${selected ? " active" : ""}`;
+    button.dataset.matchJobId = job.job_id;
+    button.dataset.platform = job.platform;
+    const top = document.createElement("span");
+    top.className = "match-job-top";
+    top.append(
+      createTextElement("span", `match-label ${job.recommendation}`, labels.recommendations[job.recommendation]),
+      createTextElement("strong", "match-list-score", String(job.score)),
+    );
+    const title = createTextElement("span", "match-job-title", job.title || "未命名岗位");
+    const company = createTextElement("span", "match-job-company", job.company || "公司信息缺失");
+    const meta = document.createElement("span");
+    meta.className = "match-job-meta";
+    meta.append(
+      createTextElement("span", "", labels.tracks[job.track] || job.track),
+      createTextElement("span", "", job.experience_raw || "经验未提供"),
+    );
+    if (job.changed) meta.append(createTextElement("span", "match-change-flag", "v1→v2"));
+    button.append(top, title, company, meta);
+    button.addEventListener("click", () => selectMatch(job.job_id, job.platform));
+    elements.matchJobList.append(button);
+  });
+}
+
+function renderMatchingDashboard(dashboard) {
+  state.matching = dashboard;
+  const snapshot = dashboard.snapshot;
+  if (!snapshot) {
+    document.querySelector("#matchScope").textContent = dashboard.empty_message || "尚未生成匹配预览。";
+    document.querySelector("#matchVersion").textContent = "";
+    ["matchTotal", "matchPriority", "matchChallenge", "matchNotFit", "matchConflicts"]
+      .forEach((id) => { document.querySelector(`#${id}`).textContent = "0"; });
+    renderMatchQueue();
+    elements.matchDetailEmpty.querySelector("strong").textContent = "尚未生成 v2 匹配预览";
+    elements.matchDetailEmpty.querySelector("span").textContent = dashboard.empty_message || "请先生成本地预览。";
+    return;
+  }
+  document.querySelector("#matchScope").textContent = `${snapshot.profile_id} · ${snapshot.total} 个岗位 · ${snapshot.insufficient} 个信息不足`;
+  document.querySelector("#matchVersion").textContent = `${snapshot.analysis_version} / ${snapshot.profile_version}`;
+  document.querySelector("#matchTotal").textContent = String(snapshot.total);
+  document.querySelector("#matchPriority").textContent = String(snapshot.priority);
+  document.querySelector("#matchChallenge").textContent = String(snapshot.challenge);
+  document.querySelector("#matchNotFit").textContent = String(snapshot.not_fit);
+  document.querySelector("#matchConflicts").textContent = String(snapshot.conflicts);
+  renderMatchQueue();
+}
+
+function renderEvidenceCards(containerId, values, emptyText) {
+  const container = document.querySelector(`#${containerId}`);
+  container.replaceChildren();
+  if (!values?.length) {
+    container.append(createTextElement("p", "list-empty", emptyText));
+    return;
+  }
+  values.forEach((item) => {
+    const row = document.createElement("article");
+    row.className = "match-evidence-item";
+    row.append(createTextElement("h4", "", item.label || item.id));
+    const evidence = document.createElement("dl");
+    evidence.append(
+      createTextElement("dt", "", "JD 要求"),
+      createTextElement("dd", "", item.jd_evidence || "未提取到原文"),
+      createTextElement("dt", "", "个人证据"),
+      createTextElement("dd", "", item.candidate_evidence || "当前档案没有直接证据"),
+    );
+    row.append(evidence);
+    container.append(row);
+  });
+}
+
+function renderMatchDetail(match) {
+  elements.matchDetailEmpty.hidden = true;
+  elements.matchDetailContent.hidden = false;
+  elements.matchingError.textContent = "";
+  const recommendation = document.querySelector("#matchRecommendation");
+  recommendation.className = `match-label ${match.recommendation}`;
+  recommendation.textContent = labels.recommendations[match.recommendation] || match.recommendation;
+  const information = document.querySelector("#matchInformation");
+  information.className = `information-label ${match.information_status}`;
+  information.textContent = labels.information[match.information_status] || match.information_status;
+  document.querySelector("#matchChanged").hidden = !match.changed;
+  document.querySelector("#matchJobTitle").textContent = match.title || "未命名岗位";
+  document.querySelector("#matchCompanyLine").textContent = match.company || "公司信息缺失";
+  document.querySelector("#matchScore").textContent = String(match.score ?? 0);
+  document.querySelector("#matchConfidence").textContent = `置信度 ${Math.round((match.confidence || 0) * 100)}%`;
+
+  const meta = document.querySelector("#matchMeta");
+  meta.replaceChildren();
+  [
+    ["方向", labels.tracks[match.track] || match.track],
+    ["薪资", match.salary_raw],
+    ["地点", match.location],
+    ["经验", match.experience_raw],
+    ["学历", match.education_raw],
+  ].forEach(([name, value]) => {
+    const wrapper = document.createElement("div");
+    wrapper.append(createTextElement("dt", "", name), createTextElement("dd", "", value || "未提供"));
+    meta.append(wrapper);
+  });
+
+  document.querySelector("#previousMatch").textContent = labels.tiers[match.previous_fit_tier] || "旧版无判断";
+  document.querySelector("#currentMatch").textContent = labels.recommendations[match.recommendation] || match.recommendation;
+  document.querySelector("#hardRequirementCount").textContent = `${match.hard_requirements?.length || 0} 项`;
+  document.querySelector("#matchStrengthCount").textContent = `${match.strengths?.length || 0} 项`;
+  document.querySelector("#matchGapCount").textContent = `${match.gaps?.length || 0} 项`;
+  renderEvidenceCards("hardRequirements", match.hard_requirements, "没有识别到明确不满足的硬门槛。交由能力和偏好继续判断。");
+  renderEvidenceCards("matchStrengths", match.strengths, "当前档案还没有匹配到直接能力证据。");
+  renderEvidenceCards("matchGaps", match.gaps, "没有识别到需要单独补齐的能力缺口。");
+  const preferenceSignals = match.preference_signals || [];
+  document.querySelector("#preferenceSignalsSection").hidden = !preferenceSignals.length;
+  document.querySelector("#matchPreferenceCount").textContent = `${preferenceSignals.length} 项`;
+  renderEvidenceCards(
+    "matchPreferenceSignals",
+    preferenceSignals.map((item) => ({
+      ...item,
+      jd_evidence: `分数${item.adjustment > 0 ? "+" : ""}${item.adjustment} · 仅作软调整`,
+      candidate_evidence: (item.evidence || []).map((value) => value.title || value.note).filter(Boolean).join("；"),
+    })),
+    "没有行为偏好影响这条结果。",
+  );
+
+  const uncertainties = document.querySelector("#matchUncertainties");
+  uncertainties.replaceChildren();
+  (match.uncertainties || []).forEach((value) => uncertainties.append(createTextElement("li", "", value)));
+  document.querySelector("#matchUncertaintySection").hidden = !(match.uncertainties || []).length;
+  document.querySelector("#matchJdText").textContent = match.jd_text || "没有采集到 JD 正文";
+  const reviewButton = document.querySelector("#openReviewJob");
+  reviewButton.dataset.jobId = match.job_id;
+  reviewButton.dataset.platform = match.platform;
+  reviewButton.dataset.sampleName = match.sample_name || "__reviewed__";
+  reviewButton.hidden = !match.decision;
+}
+
+async function selectMatch(jobId, platform = "") {
+  state.selectedMatchId = jobId;
+  state.selectedMatchPlatform = platform || null;
+  renderMatchQueue();
+  const requestId = ++state.matchDetailRequest;
+  elements.matchDetailEmpty.hidden = false;
+  elements.matchDetailEmpty.querySelector("strong").textContent = "正在读取匹配证据";
+  elements.matchDetailEmpty.querySelector("span").textContent = "结果来自本地版本化分析。";
+  elements.matchDetailContent.hidden = true;
+  try {
+    const query = new URLSearchParams();
+    if (platform) query.set("platform", platform);
+    const suffix = query.toString() ? `?${query}` : "";
+    const payload = await fetchJson(`/api/matches/${encodeURIComponent(jobId)}${suffix}`);
+    if (requestId !== state.matchDetailRequest) return;
+    state.selectedMatchPlatform = payload.match.platform || platform || null;
+    renderMatchDetail(payload.match);
+  } catch (error) {
+    if (requestId !== state.matchDetailRequest) return;
+    elements.matchDetailEmpty.querySelector("strong").textContent = "匹配详情读取失败";
+    elements.matchDetailEmpty.querySelector("span").textContent = error.message;
+  }
+}
+
+async function loadMatchingDashboard() {
+  elements.matchingError.textContent = "";
+  try {
+    const dashboard = await fetchJson("/api/matches");
+    renderMatchingDashboard(dashboard);
+    if (dashboard.jobs?.length && !state.selectedMatchId) {
+      await selectMatch(dashboard.jobs[0].job_id, dashboard.jobs[0].platform);
+    }
+  } catch (error) {
+    elements.matchingError.textContent = `${error.message} 请确认本地匹配预览已经生成。`;
+  }
+}
+
+function renderBoundaryDashboard(dashboard) {
+  state.boundary = dashboard;
+  const snapshot = dashboard.snapshot;
+  if (!snapshot) {
+    document.querySelector("#boundaryScope").textContent = dashboard.empty_message || "尚未生成边界样本。";
+    document.querySelector("#boundaryVersion").textContent = "";
+    ["boundarySelected", "boundaryStrong", "boundarySoft", "boundaryInformation", "boundaryLearning"]
+      .forEach((id) => { document.querySelector(`#${id}`).textContent = "0"; });
+    elements.boundaryInsights.replaceChildren(createTextElement("p", "list-empty", "暂无可分析的误判模式。"));
+    elements.boundaryGroups.replaceChildren(createTextElement("p", "list-empty", dashboard.empty_message || "暂无复核样本。"));
+    elements.boundaryRuleGate.textContent = "";
+    return;
+  }
+
+  document.querySelector("#boundaryScope").textContent = `基于 ${snapshot.reviewed_jobs} 条已审岗位，抽取 ${snapshot.selected_jobs} 条高信息样本`;
+  document.querySelector("#boundaryVersion").textContent = `${snapshot.analysis_version} / ${snapshot.profile_version}`;
+  const selectedMetrics = snapshot.selected_metrics || {};
+  document.querySelector("#boundarySelected").textContent = String(selectedMetrics.jobs ?? snapshot.selected_jobs ?? 0);
+  document.querySelector("#boundaryStrong").textContent = String(selectedMetrics.strong_conflicts || 0);
+  document.querySelector("#boundarySoft").textContent = String(selectedMetrics.soft_conflicts || 0);
+  document.querySelector("#boundaryInformation").textContent = String(selectedMetrics.information_gaps || 0);
+  document.querySelector("#boundaryLearning").textContent = String(selectedMetrics.learning_signals || 0);
+
+  elements.boundaryInsights.replaceChildren();
+  (dashboard.insights || []).forEach((insight) => {
+    const article = document.createElement("article");
+    article.className = `boundary-insight ${insight.severity || "medium"}`;
+    const heading = document.createElement("div");
+    heading.append(
+      createTextElement("h4", "", insight.title),
+      createTextElement("span", "boundary-insight-count", String(insight.count || 0)),
+    );
+    article.append(heading, createTextElement("p", "", insight.detail));
+    elements.boundaryInsights.append(article);
+  });
+  const actions = dashboard.actions || {};
+  elements.boundaryRuleGate.replaceChildren(
+    createTextElement("strong", "", actions.threshold_change_recommended ? "已达到规则调整门槛" : "暂不自动改阈值"),
+    createTextElement("p", "", actions.rule_change_gate || "先确认冲突原因，再修改规则。"),
+    createTextElement("p", "boundary-next-step", actions.next_step || ""),
+  );
+
+  const signalLabels = {
+    conflict: "判断冲突",
+    information: "信息不全",
+    learning: "学习标记",
+    correction: "已有纠错",
+    boundary: "临近边界",
+  };
+  elements.boundaryGroups.replaceChildren();
+  (dashboard.groups || []).forEach((group) => {
+    const section = document.createElement("section");
+    section.className = `boundary-group ${group.recommendation}`;
+    const heading = document.createElement("header");
+    const title = document.createElement("div");
+    title.append(
+      createTextElement("h4", "", group.label),
+      createTextElement("span", "", `已审 ${group.available} · 本轮 ${group.jobs?.length || 0}`),
+    );
+    heading.append(title);
+    section.append(heading);
+
+    const list = document.createElement("div");
+    list.className = "boundary-job-list";
+    (group.jobs || []).forEach((job) => {
+      const article = document.createElement("article");
+      article.className = `boundary-job ${job.conflict_level}`;
+      const top = document.createElement("div");
+      top.className = "boundary-job-top";
+      const identity = document.createElement("div");
+      identity.className = "boundary-job-identity";
+      identity.append(
+        createTextElement("h5", "", job.title || "未命名岗位"),
+        createTextElement("p", "", [job.company, job.salary_raw, job.experience_raw].filter(Boolean).join(" · ") || "岗位信息缺失"),
+      );
+      const score = document.createElement("div");
+      score.className = "boundary-job-score";
+      score.append(
+        createTextElement("strong", "", String(job.score ?? 0)),
+        createTextElement("span", `conflict-label ${job.conflict_level}`, labels.conflicts[job.conflict_level] || job.conflict_level),
+      );
+      top.append(identity, score);
+
+      const decision = document.createElement("div");
+      decision.className = "boundary-decision-line";
+      decision.append(
+        createTextElement("span", `match-label ${job.recommendation}`, labels.recommendations[job.recommendation] || job.recommendation),
+        createTextElement("span", "boundary-arrow", "→"),
+        createTextElement("span", `interest-label ${job.interest}`, `你的决定：${labels.interests[job.interest] || job.interest}`),
+      );
+
+      const signals = document.createElement("div");
+      signals.className = "boundary-signals";
+      (job.signals || []).forEach((signal) => signals.append(createTextElement("span", signal, signalLabels[signal] || signal)));
+
+      const reasons = document.createElement("ul");
+      reasons.className = "boundary-reasons";
+      (job.reasons || []).forEach((reason) => reasons.append(createTextElement("li", "", reason)));
+      const evidence = document.createElement("div");
+      evidence.className = "boundary-evidence";
+      if (job.note) {
+        const note = document.createElement("p");
+        note.append(
+          createTextElement("strong", "", "个人备注"),
+          createTextElement("span", "", job.note),
+        );
+        evidence.append(note);
+      }
+      const evidenceGroups = [
+        ["JD 证据 · 硬门槛", job.hard_requirements, "hard"],
+        ["JD 证据 · 能力缺口", job.gaps, "gap"],
+        ["JD 证据 · 匹配优势", job.strengths, "strength"],
+      ];
+      evidenceGroups.forEach(([label, values, className]) => {
+        const jdEvidence = (values || [])
+          .map((item) => item.jd_evidence)
+          .filter(Boolean)
+          .slice(0, 2);
+        if (!jdEvidence.length) return;
+        const source = document.createElement("p");
+        source.className = className;
+        source.append(
+          createTextElement("strong", "", label),
+          createTextElement("span", "", jdEvidence.join("；")),
+        );
+        evidence.append(source);
+      });
+      const open = createTextElement("button", "text-action boundary-open-review", "回到原审阅");
+      open.type = "button";
+      open.dataset.jobId = job.job_id;
+      open.dataset.platform = job.platform;
+      open.dataset.sampleName = job.sample_name || DEFAULT_SAMPLE_NAME;
+      article.append(top, decision);
+      if (job.signals?.length) article.append(signals);
+      article.append(reasons);
+      if (evidence.childElementCount) article.append(evidence);
+      article.append(open);
+      list.append(article);
+    });
+    if (!group.jobs?.length) list.append(createTextElement("p", "list-empty", "这一档没有已审样本。"));
+    section.append(list);
+    elements.boundaryGroups.append(section);
+  });
+}
+
+async function loadBoundaryDashboard(force = false) {
+  elements.boundaryError.textContent = "";
+  if (state.boundary && !force) {
+    renderBoundaryDashboard(state.boundary);
+    return;
+  }
+  try {
+    renderBoundaryDashboard(await fetchJson("/api/boundary-calibration"));
+  } catch (error) {
+    elements.boundaryError.textContent = `${error.message} 请确认本地匹配预览和审阅记录可读。`;
+  }
+}
+
+async function switchView(view) {
+  state.view = view;
+  const calibration = view === "calibration";
+  const learning = view === "learning";
+  const matching = view === "matching";
+  const boundary = view === "boundary";
+  elements.calibrationView.hidden = !calibration;
+  elements.reviewView.hidden = calibration || learning || matching || boundary;
+  elements.learningView.hidden = !learning;
+  elements.matchingView.hidden = !matching;
+  elements.boundaryView.hidden = !boundary;
+  document.querySelectorAll("[data-view-target]").forEach((button) => {
+    const active = button.dataset.viewTarget === view;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+  });
+  if (calibration) await loadCalibrationDashboard();
+  if (learning) await loadLearningDashboard();
+  if (matching) await loadMatchingDashboard();
+  if (boundary) await loadBoundaryDashboard();
+}
+
+function renderQueue() {
+  const jobs = filteredJobs();
+  elements.visibleCount.textContent = String(jobs.length);
+  elements.list.replaceChildren();
+  if (!jobs.length) {
+    const empty = document.createElement("p");
+    empty.className = "list-empty";
+    empty.textContent = "这个筛选下没有岗位。";
+    elements.list.append(empty);
+    return;
+  }
+
+  jobs.forEach((job) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    const selected = job.job_id === state.selectedId
+      && (!state.selectedPlatform || job.platform === state.selectedPlatform);
+    button.className = `job-item${job.reviewed ? " reviewed" : ""}${selected ? " active" : ""}`;
+    button.dataset.jobId = job.job_id;
+    button.dataset.platform = job.platform;
+
+    const top = document.createElement("span");
+    top.className = "job-item-top";
+    const bucket = document.createElement("span");
+    bucket.className = "mini-bucket";
+    bucket.textContent = labels.buckets[job.sample_bucket] || job.sample_bucket;
+    const mark = document.createElement("span");
+    mark.className = `interest-mark ${job.interest || ""}`;
+    mark.setAttribute("aria-label", job.reviewed ? `已决定：${job.interest}` : "未决定");
+    top.append(bucket, mark);
+
+    const title = document.createElement("span");
+    title.className = "job-item-title";
+    title.textContent = job.title || "未命名岗位";
+    const company = document.createElement("span");
+    company.className = "job-item-company";
+    company.textContent = job.company || "公司信息缺失";
+    const meta = document.createElement("span");
+    meta.className = "job-item-meta";
+    const salary = document.createElement("span");
+    salary.textContent = job.salary_raw || "薪资未知";
+    const track = document.createElement("span");
+    track.textContent = labels.tracks[job.track] || job.track || "其他";
+    const tier = document.createElement("span");
+    tier.className = `queue-tier ${job.fit_tier || ""}`;
+    tier.textContent = labels.tiers[job.fit_tier] || "待判断";
+    meta.append(salary, track, tier);
+    button.append(top, title, company, meta);
+    button.addEventListener("click", () => selectJob(
+      job.job_id,
+      DEFAULT_SAMPLE_NAME,
+      job.platform,
+    ));
+    elements.list.append(button);
+  });
+}
+
+function addMeta(label, value) {
+  const wrapper = document.createElement("div");
+  const term = document.createElement("dt");
+  const description = document.createElement("dd");
+  term.textContent = label;
+  description.textContent = value || "未提供";
+  wrapper.append(term, description);
+  document.querySelector("#jobMeta").append(wrapper);
+}
+
+function setDecisionForm(decision) {
+  elements.decisionForm.reset();
+  elements.formError.textContent = "";
+  elements.saveState.textContent = decision ? "已保存" : "";
+  if (decision) {
+    const interest = elements.decisionForm.querySelector(`[name="interest"][value="${decision.interest}"]`);
+    if (interest) interest.checked = true;
+    elements.decisionForm.elements.rejection_reason.value = decision.rejection_reason || "";
+    elements.decisionForm.elements.note.value = decision.note || "";
+    elements.learningIntent.checked = Boolean(
+      decision.learning_intent ?? decision.learning_suggested,
+    );
+  }
+  updateSaveAction();
+}
+
+function setCorrectionForm(corrections) {
+  elements.correctionForm.reset();
+  elements.correctionError.textContent = "";
+  elements.correctionState.textContent = "";
+  if (!corrections?.length) return;
+  const latest = corrections[corrections.length - 1];
+  elements.correctionForm.elements.category.value = latest.category;
+  elements.correctionForm.elements.note.value = latest.note;
+  elements.correctionState.textContent = `已记录 ${corrections.length} 条`;
+}
+
+function renderEvidence(listId, values) {
+  const list = document.querySelector(`#${listId}`);
+  list.replaceChildren();
+  const items = values?.length ? values : ["JD 信息不足，暂不判断"];
+  items.forEach((value) => {
+    const item = document.createElement("li");
+    item.textContent = value;
+    list.append(item);
+  });
+}
+
+function renderSystemAnalysis(job) {
+  const analysis = job.system_analysis || {};
+  analysisFields.forEach(([key, valueId, evidenceId]) => {
+    const judgment = analysis[key] || { value: "信息不足", tone: "muted", evidence: [] };
+    const value = document.querySelector(`#${valueId}`);
+    value.className = `analysis-value ${judgment.tone || "muted"}`;
+    value.textContent = judgment.value || "信息不足";
+    renderEvidence(evidenceId, judgment.evidence);
+  });
+  document.querySelector("#analysisVersion").textContent = job.analyzed_at
+    ? `规则分析 ${String(job.analyzed_at).slice(0, 10)}`
+    : "";
+
+  const riskLine = document.querySelector("#riskLine");
+  const risks = document.querySelector("#riskChips");
+  risks.replaceChildren();
+  (job.risks || []).forEach((risk) => {
+    const chip = document.createElement("span");
+    chip.textContent = labels.risks[risk] || risk;
+    risks.append(chip);
+  });
+  riskLine.hidden = !job.risks?.length;
+}
+
+function renderDetail(job) {
+  elements.detailEmpty.hidden = true;
+  elements.detailContent.hidden = false;
+  document.querySelector("#sampleBucket").textContent = labels.buckets[job.sample_bucket] || job.sample_bucket;
+  document.querySelector("#fitTier").textContent = labels.tiers[job.fit_tier] || job.fit_tier;
+  document.querySelector("#fitTier").className = `tier ${job.fit_tier || ""}`;
+  document.querySelector("#jobTitle").textContent = job.title || "未命名岗位";
+  document.querySelector("#companyLine").textContent = job.company || "公司信息缺失";
+  const sourceLink = document.querySelector("#sourceLink");
+  sourceLink.href = job.source_url || "#";
+  sourceLink.hidden = !job.source_url;
+
+  const meta = document.querySelector("#jobMeta");
+  meta.replaceChildren();
+  addMeta("薪资", job.salary_raw);
+  addMeta("地点", job.location);
+  addMeta("经验", job.experience_raw);
+  addMeta("学历", job.education_raw);
+  addMeta("招聘者", [job.recruiter_name, job.recruiter_role].filter(Boolean).join(" · "));
+  addMeta("技能", (job.skills || []).join("、"));
+
+  renderCompanyProfile(job);
+  renderSystemAnalysis(job);
+  const jd = job.jd_text || job.detail_text || "没有采集到 JD 正文";
+  document.querySelector("#jdText").textContent = jd;
+  document.querySelector("#jdLength").textContent = `${jd.length} 字`;
+  setDecisionForm(job.decision);
+  setCorrectionForm(job.corrections);
+}
+
+function jobApiUrl(jobId, sampleName = DEFAULT_SAMPLE_NAME, suffix = "", platform = "") {
+  const query = new URLSearchParams({ sample_name: sampleName });
+  if (platform) query.set("platform", platform);
+  return `/api/jobs/${encodeURIComponent(jobId)}${suffix}?${query}`;
+}
+
+async function selectJob(jobId, sampleName = DEFAULT_SAMPLE_NAME, platform = "") {
+  state.selectedId = jobId;
+  state.selectedPlatform = platform || null;
+  state.selectedSampleName = sampleName;
+  renderQueue();
+  const requestId = ++state.detailRequest;
+  elements.detailEmpty.hidden = false;
+  elements.detailEmpty.querySelector("strong").textContent = "正在读取完整 JD";
+  elements.detailEmpty.querySelector("span").textContent = "数据来自本地数据库。";
+  elements.detailContent.hidden = true;
+  try {
+    const payload = await fetchJson(jobApiUrl(jobId, sampleName, "", platform));
+    if (requestId !== state.detailRequest) return;
+    state.selectedPlatform = payload.job.platform || platform || null;
+    renderDetail(payload.job);
+  } catch (error) {
+    if (requestId !== state.detailRequest) return;
+    elements.detailEmpty.querySelector("strong").textContent = "这条岗位读取失败";
+    elements.detailEmpty.querySelector("span").textContent = error.message;
+  }
+}
+
+async function loadJobs(selectFirst = true) {
+  const payload = await fetchJson("/api/jobs");
+  state.jobs = payload.jobs;
+  state.stats = payload.stats;
+  renderProgress();
+  renderQueue();
+  if (selectFirst && !state.selectedId && state.jobs.length) {
+    await selectJob(
+      state.jobs[0].job_id,
+      DEFAULT_SAMPLE_NAME,
+      state.jobs[0].platform,
+    );
+  }
+}
+
+function decisionPayload() {
+  const data = new FormData(elements.decisionForm);
+  return {
+    interest: data.get("interest"),
+    rejection_reason: data.get("rejection_reason"),
+    note: data.get("note"),
+    learning_intent: data.get("learning_intent") === "on",
+  };
+}
+
+async function saveDecision(event) {
+  event.preventDefault();
+  if (!state.selectedId || !elements.decisionForm.reportValidity()) return;
+  elements.formError.textContent = "";
+  elements.saveButton.disabled = true;
+  elements.saveButton.textContent = "正在保存...";
+  try {
+    const selectedSampleName = state.selectedSampleName || DEFAULT_SAMPLE_NAME;
+    await fetchJson(jobApiUrl(
+      state.selectedId,
+      selectedSampleName,
+      "",
+      state.selectedPlatform,
+    ), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(decisionPayload()),
+    });
+    state.learning = null;
+    state.boundary = null;
+    const currentIndex = state.jobs.findIndex(
+      (job) => job.job_id === state.selectedId && job.platform === state.selectedPlatform,
+    );
+    await loadJobs(false);
+    if (selectedSampleName !== DEFAULT_SAMPLE_NAME) {
+      await selectJob(state.selectedId, selectedSampleName, state.selectedPlatform);
+      return;
+    }
+    const next = state.jobs.slice(currentIndex + 1).find((job) => !job.reviewed)
+      || state.jobs.find((job) => !job.reviewed);
+    if (next) await selectJob(next.job_id, DEFAULT_SAMPLE_NAME, next.platform);
+    else await selectJob(state.selectedId, DEFAULT_SAMPLE_NAME, state.selectedPlatform);
+  } catch (error) {
+    elements.formError.textContent = error.message;
+  } finally {
+    elements.saveButton.disabled = false;
+    updateSaveAction();
+  }
+}
+
+async function saveCorrection(event) {
+  event.preventDefault();
+  if (!state.selectedId || !elements.correctionForm.reportValidity()) return;
+  const data = new FormData(elements.correctionForm);
+  elements.correctionError.textContent = "";
+  elements.correctionState.textContent = "";
+  elements.correctionButton.disabled = true;
+  elements.correctionButton.textContent = "提交中...";
+  try {
+    await fetchJson(jobApiUrl(
+      state.selectedId,
+      state.selectedSampleName || DEFAULT_SAMPLE_NAME,
+      "/correction",
+      state.selectedPlatform,
+    ), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ category: data.get("category"), note: data.get("note") }),
+    });
+    state.boundary = null;
+    elements.correctionState.textContent = "已记录";
+  } catch (error) {
+    elements.correctionError.textContent = error.message;
+  } finally {
+    elements.correctionButton.disabled = false;
+    elements.correctionButton.textContent = "提交纠错";
+  }
+}
+
+function updateSaveAction() {
+  const rejected = elements.decisionForm.querySelector('[name="interest"][value="reject"]')?.checked;
+  elements.saveButton.textContent = rejected ? "放弃并看下一条" : "保存并看下一条";
+}
+
+document.querySelector("#filters").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-filter]");
+  if (!button) return;
+  state.filter = button.dataset.filter;
+  document.querySelectorAll("#filters button").forEach((item) => item.classList.toggle("active", item === button));
+  renderQueue();
+});
+
+document.querySelector(".view-tabs").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-view-target]");
+  if (button) switchView(button.dataset.viewTarget);
+});
+
+elements.noteSignals.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-job-id]");
+  if (!button) return;
+  switchView("review").then(() => selectJob(
+    button.dataset.jobId,
+    button.dataset.sampleName || DEFAULT_SAMPLE_NAME,
+    button.dataset.platform,
+  ));
+});
+
+elements.boundaryGroups.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-job-id]");
+  if (!button) return;
+  switchView("review").then(() => selectJob(
+    button.dataset.jobId,
+    button.dataset.sampleName || DEFAULT_SAMPLE_NAME,
+    button.dataset.platform,
+  ));
+});
+
+document.querySelector(".match-metrics").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-match-filter]");
+  if (!button) return;
+  state.matchFilter = button.dataset.matchFilter;
+  document.querySelectorAll("[data-match-filter]").forEach((item) => item.classList.toggle("active", item === button));
+  renderMatchQueue();
+});
+
+document.querySelector("#openReviewJob").addEventListener("click", (event) => {
+  const button = event.currentTarget;
+  switchView("review").then(() => selectJob(
+    button.dataset.jobId,
+    button.dataset.sampleName || "__reviewed__",
+    button.dataset.platform,
+  ));
+});
+
+elements.decisionForm.addEventListener("submit", saveDecision);
+elements.correctionForm.addEventListener("submit", saveCorrection);
+document.querySelectorAll('[name="interest"]').forEach((input) => input.addEventListener("change", updateSaveAction));
+document.querySelector("#quickReject").addEventListener("click", () => {
+  const reject = elements.decisionForm.querySelector('[name="interest"][value="reject"]');
+  reject.checked = true;
+  updateSaveAction();
+  saveDecision({ preventDefault() {} });
+});
+
+elements.resumeFile.addEventListener("change", () => {
+  const file = elements.resumeFile.files?.[0];
+  document.querySelector("#resumeFileName").textContent = file ? file.name : "尚未选择文件";
+  elements.calibrateResumeButton.disabled = state.collectionRunning || !file;
+  state.calibratedResumeText = "";
+  state.calibratedFilename = "";
+  elements.collectResumeJobsButton.disabled = true;
+  elements.calibrationStatus.textContent = "";
+});
+elements.calibrateResumeButton.addEventListener("click", calibrateSelectedResume);
+elements.collectResumeJobsButton.addEventListener("click", collectResumeJobs);
+
+loadCalibrationDashboard().catch(() => {});
+pollCollectionStatus().catch(showCollectionPollingError);
+
+loadJobs().catch((error) => {
+  elements.list.replaceChildren();
+  const message = document.createElement("p");
+  message.className = "list-empty";
+  message.textContent = `${error.message} 请确认本地数据库存在后刷新页面。`;
+  elements.list.append(message);
+});

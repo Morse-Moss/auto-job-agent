@@ -1,0 +1,371 @@
+import json
+import sqlite3
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+import main as main_module
+from jobagent.collection import (
+    CollectionStore,
+    classify_job,
+    job_from_detail_payload,
+    normalize_search_card,
+)
+from jobagent import config as config_module
+from jobagent.platforms.boss_collector import BossCollector
+
+
+class CollectionStoreTests(unittest.TestCase):
+    def test_detail_collection_is_incremental_and_deduplicated(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = CollectionStore(Path(temp_dir) / "jobs.db")
+            run_id = store.start_run(target_count=3)
+            job = {
+                "platform": "boss",
+                "job_id": "job-1",
+                "source": "boss-favorites",
+                "source_key": "favorites",
+                "source_page": 1,
+                "source_url": "https://www.zhipin.com/job_detail/job-1.html",
+                "title": "AI FDE",
+                "company": "Example",
+                "jd": "负责客户需求诊断、Agent/RAG 开发与部署交付。",
+            }
+
+            store.save_observation(job, run_id)
+            store.save_detail(job, run_id)
+            store.save_detail({**job, "jd": job["jd"] + "持续复盘效果。"}, run_id)
+            store.update_cursor("favorites", page_number=2, item_index=4, status="running")
+
+            self.assertEqual(store.collected_detail_count(), 1)
+            self.assertTrue(store.has_collected_detail("job-1"))
+            self.assertEqual(store.get_cursor("favorites")["page_number"], 2)
+            self.assertEqual(
+                json.loads(store.get_detail("job-1")["labels_json"]),
+                ["fde", "agent_rag", "direct"],
+            )
+            store.finish_run(run_id, "sample_completed")
+            self.assertEqual(store.get_run(run_id)["status"], "sample_completed")
+            store.close()
+
+    def test_inventory_count_includes_failed_detail_records(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = CollectionStore(Path(temp_dir) / "jobs.db")
+            run_id = store.start_run(target_count=2)
+            base_job = {
+                "platform": "boss",
+                "source": "boss-search",
+                "source_key": "search:上海:AI 应用工程师",
+                "source_page": 1,
+                "company": "Example",
+            }
+            store.save_detail(
+                {
+                    **base_job,
+                    "job_id": "collected",
+                    "source_url": "https://example.invalid/collected",
+                    "title": "Collected",
+                    "jd": "完整 JD",
+                },
+                run_id,
+            )
+            store.save_failure(
+                {
+                    **base_job,
+                    "job_id": "failed",
+                    "source_url": "https://example.invalid/failed",
+                    "title": "Failed",
+                },
+                run_id,
+                "detail unavailable",
+            )
+
+            self.assertEqual(store.collected_detail_count(), 1)
+            self.assertEqual(store.detail_inventory_count(), 2)
+            store.close()
+
+    def test_collect_only_config_does_not_require_an_ai_key(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.yaml"
+            config_path.write_text(
+                "collection:\n  target: 300\nboss:\n  cdp_endpoint: http://127.0.0.1:17332\n",
+                encoding="utf-8",
+            )
+            with patch.object(config_module, "ROOT", Path(temp_dir)):
+                cfg = config_module.load_config(require_ai=False)
+
+        self.assertEqual(cfg["collection"]["target"], 300)
+
+    def test_existing_detail_schema_is_migrated_without_losing_rows(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "jobs.db"
+            connection = sqlite3.connect(db_path)
+            connection.execute(
+                """
+                CREATE TABLE job_details (
+                  platform TEXT NOT NULL,
+                  job_id TEXT NOT NULL,
+                  source_run_id TEXT NOT NULL,
+                  source_url TEXT NOT NULL,
+                  source_page INTEGER NOT NULL,
+                  title TEXT,
+                  company TEXT,
+                  detail_status TEXT NOT NULL,
+                  jd_text TEXT,
+                  detail_text TEXT,
+                  collected_at TEXT NOT NULL,
+                  PRIMARY KEY(platform,job_id)
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO job_details VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "boss",
+                    "existing",
+                    "old-run",
+                    "https://example.invalid/existing",
+                    1,
+                    "Existing",
+                    "Example",
+                    "collected",
+                    "Existing JD",
+                    "Existing detail",
+                    "2026-08-05T00:00:00+08:00",
+                ),
+            )
+            connection.commit()
+            connection.close()
+
+            store = CollectionStore(db_path)
+
+            self.assertEqual(store.collected_detail_count(), 1)
+            self.assertIn("labels_json", store.get_detail("existing").keys())
+            store.close()
+
+
+class CollectionClassificationTests(unittest.TestCase):
+    def test_search_card_fallback_decodes_salary_and_recovers_company(self):
+        card = normalize_search_card(
+            {
+                "title": "AI智能应用（FDE）工程师",
+                "salary_raw": "\ue032\ue036-\ue033\ue036K",
+                "experience_raw": "经验不限",
+                "education_raw": "本科",
+                "company": "",
+                "location": "",
+                "card_text": (
+                    "AI智能应用（FDE）工程师\n"
+                    "\ue032\ue036-\ue033\ue036K\n经验不限\n本科\n泛微网络\n"
+                    "上海·闵行区·浦江"
+                ),
+            }
+        )
+
+        self.assertEqual(card["salary_raw"], "15-25K")
+        self.assertEqual(card["company"], "泛微网络")
+        self.assertEqual(card["location"], "上海·闵行区·浦江")
+
+    def test_classification_keeps_fde_and_risk_labels_separate(self):
+        fde = classify_job(
+            {
+                "title": "AI 前线部署工程师 FDE",
+                "jd": "前往客户现场调研业务需求，完成 Agent 和 RAG 编码、系统集成、上线交付。",
+                "company": "产品公司",
+                "recruiter_role": "HR",
+            }
+        )
+        java = classify_job(
+            {
+                "title": "Java 后端开发",
+                "jd": "Spring Boot、MyBatis、微服务 CRUD，长期驻场客户现场。",
+                "company": "某技术服务公司",
+                "recruiter_role": "猎头顾问",
+            }
+        )
+
+        self.assertEqual(fde, ["fde", "agent_rag", "direct"])
+        self.assertIn("pure_java", java)
+        self.assertIn("outsourcing_risk", java)
+        self.assertIn("third_party", java)
+
+    def test_detail_payload_preserves_positioning_fields(self):
+        job = job_from_detail_payload(
+            {"platform": "boss", "job_id": "old", "source_url": ""},
+            {
+                "zpData": {
+                    "jobInfo": {
+                        "encryptId": "new",
+                        "jobName": "AI FDE",
+                        "salaryDesc": "15-25K",
+                        "postDescription": "负责 Agent 交付",
+                        "cityName": "上海",
+                        "experienceName": "1-3年",
+                        "degreeName": "本科",
+                        "skills": ["RAG", "Python"],
+                    },
+                    "brandComInfo": {
+                        "brandName": "产品公司",
+                        "industryName": "人工智能",
+                        "stageName": "A轮",
+                        "scaleName": "20-99人",
+                    },
+                    "bossInfo": {"name": "李女士", "title": "HR"},
+                }
+            },
+        )
+
+        self.assertEqual(job["job_id"], "new")
+        self.assertEqual(job["location"], "上海")
+        self.assertEqual(job["skills"], ["RAG", "Python"])
+        self.assertEqual(job["industry"], "人工智能")
+
+
+class CollectionCliTests(unittest.TestCase):
+    def test_collect_only_never_constructs_ai_resume_or_knowledge_provider(self):
+        cfg = {
+            "boss": {"cdp_endpoint": "http://127.0.0.1:17332"},
+            "collection": {"db_path": "jobs.db", "target": 300},
+        }
+        result = SimpleNamespace(collected=3, total=3, status="sample_completed")
+        collector = Mock()
+        collector.run.return_value = result
+        collection_store = Mock()
+
+        with (
+            patch.object(main_module, "load_config", return_value=cfg),
+            patch.object(main_module, "OpenAICompatibleClient") as ai,
+            patch.object(main_module, "ResumeManager") as resume,
+            patch.object(main_module, "create_provider") as knowledge,
+            patch.object(main_module, "Store") as application_store,
+            patch.object(main_module, "CollectionStore", return_value=collection_store),
+            patch.object(main_module, "BossCollector", return_value=collector),
+            patch("builtins.print"),
+            patch("sys.argv", ["main.py", "--collect-only", "--collect-target", "3"]),
+        ):
+            main_module.main()
+
+        ai.assert_not_called()
+        resume.assert_not_called()
+        knowledge.assert_not_called()
+        application_store.assert_not_called()
+        collector.run.assert_called_once_with(target=3)
+        collection_store.close.assert_called_once()
+
+
+class CollectionBrowserLifecycleTests(unittest.TestCase):
+    def test_collector_uses_all_detail_records_for_target_without_opening_browser(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = CollectionStore(Path(temp_dir) / "jobs.db")
+            run_id = store.start_run(target_count=2)
+            base_job = {
+                "platform": "boss",
+                "source": "boss-search",
+                "source_key": "search:上海:AI 应用工程师",
+                "source_page": 1,
+                "company": "Example",
+            }
+            store.save_detail(
+                {
+                    **base_job,
+                    "job_id": "collected",
+                    "source_url": "https://example.invalid/collected",
+                    "title": "Collected",
+                    "jd": "完整 JD",
+                },
+                run_id,
+            )
+            store.save_failure(
+                {
+                    **base_job,
+                    "job_id": "failed",
+                    "source_url": "https://example.invalid/failed",
+                    "title": "Failed",
+                },
+                run_id,
+                "detail unavailable",
+            )
+            collector = BossCollector(
+                {
+                    "boss": {"cdp_endpoint": "http://127.0.0.1:17332"},
+                    "collection": {},
+                },
+                store,
+            )
+
+            try:
+                with patch(
+                    "jobagent.platforms.boss_collector.sync_playwright"
+                ) as playwright:
+                    result = collector.run(target=2)
+
+                playwright.assert_not_called()
+                self.assertEqual(result.collected, 0)
+                self.assertEqual(result.total, 2)
+                self.assertEqual(result.status, "sample_completed")
+            finally:
+                store.close()
+
+    def test_collector_closes_its_pages_before_playwright_disconnects(self):
+        class OwnedPage:
+            def __init__(self, manager):
+                self.manager = manager
+                self.closed = False
+
+            def close(self):
+                if self.manager.exited:
+                    raise RuntimeError("Playwright already disconnected")
+                self.closed = True
+
+        class Manager:
+            def __init__(self, browser):
+                self.exited = False
+                self.playwright = SimpleNamespace(
+                    chromium=SimpleNamespace(connect_over_cdp=Mock(return_value=browser))
+                )
+
+            def __enter__(self):
+                return self.playwright
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                self.exited = True
+                return False
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            original = Mock()
+            original.url = "https://www.zhipin.com/web/geek/jobs"
+            context = Mock()
+            context.pages = [original]
+            browser = Mock()
+            browser.contexts = [context]
+            manager = Manager(browser)
+            owned = [OwnedPage(manager), OwnedPage(manager)]
+            context.new_page.side_effect = owned
+            store = CollectionStore(Path(temp_dir) / "jobs.db")
+            collector = BossCollector(
+                {
+                    "boss": {"cdp_endpoint": "http://127.0.0.1:17332"},
+                    "collection": {},
+                },
+                store,
+            )
+
+            try:
+                with (
+                    patch(
+                        "jobagent.platforms.boss_collector.sync_playwright",
+                        return_value=manager,
+                    ),
+                    patch.object(collector, "_collect_favorites"),
+                ):
+                    collector.run(target=1)
+
+                self.assertTrue(all(page.closed for page in owned))
+            finally:
+                store.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

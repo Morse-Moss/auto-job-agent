@@ -2,9 +2,10 @@
 # config.yaml 已被 .gitignore 忽略，不会被提交
 
 ai:
-  api_key: "sk-yourDeepSeekKey"   # https://platform.deepseek.com
-  base_url: "https://api.deepseek.com"
-  model: "deepseek-chat"
+  api_key: "sk-your-api-key"
+  base_url: "https://api.openai.com/v1"  # 也可填写其他 OpenAI-compatible 服务
+  model: "gpt-4o-mini"
+  max_output_tokens: 1200          # 仅评分时可收紧到 256
 
 match:
   min_score: 65                    # 匹配分低于此值自动跳过（0-100）
@@ -37,14 +38,45 @@ knowledge:
     top_k: 6
     timeout_seconds: 10
 
+# ===== 只读岗位采集（不调用 AI、不投递、不沟通） =====
+collection:
+  db_path: "output/jobagent.db"
+  target: 300
+  resume_collection_increment: 50  # 每次按简历画像采集时，在现有库存上追加的目标数
+  keywords:
+    - "FDE"
+    - "前线部署工程师"
+    - "AI Agent 开发"
+    - "AI 应用工程师"
+    - "RAG 工程师"
+    - "AI 解决方案工程师"
+    - "AI 交付工程师"
+    - "大模型应用开发"
+  cities: ["上海", "深圳", "广州", "杭州"]
+  max_jobs_per_source: 45
+  navigation_delay_range_seconds: [12, 18]
+  detail_settle_range_seconds: [8, 15]
+  detail_delay_range_seconds: [35, 65]
+  max_consecutive_failures: 3
+
+# ===== 版本化个人匹配预览（本地、无模型调用） =====
+matching:
+  profile_file: "private/candidate-profile.json"
+  analysis_version: "match-v2.0"
+  resume_analysis_version: "resume-match-v1"
+
 boss:
   keywords:
-    - "Python 后端"
+    - "AI Agent 开发"
   city: "上海"                     # 支持城市见 jobagent/platforms/boss.py 的 CITY_CODES
-  max_jobs_per_keyword: 30
-  max_apply_per_run: 20            # 单次运行最多打招呼次数（防风控，建议不超过20）
-  delay_range_seconds: [10, 25]
-  headless: false                  # 保持 false，首次需扫码登录
+  max_jobs_per_keyword: 3
+  max_apply_per_run: 3             # 单次运行最多打招呼次数
+  cdp_endpoint: "http://127.0.0.1:17332" # 连接已有 CDP 浏览器，不新建登录上下文
+  page_settle_range_seconds: [12, 18]
+  detail_settle_range_seconds: [8, 15]
+  chat_settle_range_seconds: [3, 6]
+  delay_range_seconds: [45, 90]
+  headless: false                  # 仅无 cdp_endpoint 的兼容启动路径使用
   blacklist_companies: []
   blacklist_keywords:
     - "外包"

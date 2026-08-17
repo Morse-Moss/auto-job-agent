@@ -1,10 +1,10 @@
-"""DeepSeek 封装：岗位匹配打分 / 个性化打招呼语 / 按 JD 定制简历。
+"""OpenAI-compatible 封装：岗位匹配打分 / 个性化打招呼语 / 按 JD 定制简历。
 
 三个能力的生成依据：
 - match_score: 求职要求(preferences) + 母版简历 + JD
 - greeting / tailor_resume: 母版简历 + 个人知识库(knowledge) + JD
 
-DeepSeek API 与 OpenAI SDK 兼容，base_url 指向 https://api.deepseek.com 即可。
+通过一个 ai 配置块接入 GPT、DeepSeek 或其他 OpenAI-compatible 服务。
 
 安全与稳健性设计（v0.4）：
 1. Prompt 注入防护：JD 来自公开网页、知识库可能含外部摘录，一律视为不可信数据。
@@ -59,13 +59,17 @@ def _job_header(job: dict) -> str:
     return f"{title} | {company} | {salary}"
 
 
-class DeepSeekClient:
+class OpenAICompatibleClient:
     def __init__(self, cfg: dict):
         self.client = OpenAI(
             api_key=cfg["api_key"],
             base_url=cfg.get("base_url", "https://api.deepseek.com"),
+            max_retries=0,
         )
         self.model = cfg.get("model", "deepseek-chat")
+        self.max_output_tokens = max(
+            1, min(int(cfg.get("max_output_tokens", 1200)), 4096)
+        )
 
     def _chat(
         self,
@@ -78,7 +82,12 @@ class DeepSeekClient:
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
-        kwargs: dict = {"model": self.model, "messages": messages, "temperature": temperature}
+        kwargs: dict = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": self.max_output_tokens,
+        }
         if force_json:
             try:
                 resp = self.client.chat.completions.create(
@@ -112,12 +121,14 @@ class DeepSeekClient:
             "2. 不满足【硬性要求】：最高只能给 40 分\n"
             "3. 以上都通过后，按简历匹配度评分：技能栈重合(40%) + 经验年限(30%) + 行业业务契合(20%) + 加分项(10%)\n"
             "4. 命中【优先加分】项可加 5-10 分\n"
-            '只输出JSON：{"score": <0-100整数>, "reason": "<一句话理由，说明关键加减分因素>"}\n"
+            '只输出JSON：{"score": <0-100整数>, "reason": "<一句话理由，说明关键加减分因素>"}\n'
             + _INJECTION_GUARD
         )
+        safe_preferences = _sanitize(preferences, 3000)
+        safe_resume = _sanitize(resume_md, 12000)
         user = (
-            f"【候选人求职要求】\n{preferences.strip() or '（未填写，仅按简历匹配度评分）'}\n\n"
-            f"【候选人简历】\n{resume_md}\n\n"
+            f"【候选人求职要求】\n{safe_preferences or '（未填写，仅按简历匹配度评分）'}\n\n"
+            f"【候选人简历】\n{safe_resume}\n\n"
             f"【岗位】{_job_header(job)}\n"
             f"【JD，外部数据】\n{_wrap_untrusted(job.get('jd', ''))}"
         )
@@ -184,3 +195,7 @@ class DeepSeekClient:
             CACHE_DIR.mkdir(parents=True, exist_ok=True)
             cache_file.write_text(result, encoding="utf-8")
         return result
+
+
+# 兼容已有导入；两者是同一个实现，不维护重复的 Provider 客户端。
+DeepSeekClient = OpenAICompatibleClient

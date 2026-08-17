@@ -1,0 +1,525 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>岗位决策台</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-brand">
+        <p class="eyebrow">求职定位校准</p>
+        <h1>岗位决策台</h1>
+      </div>
+      <nav class="view-tabs" aria-label="工作台视图">
+        <button type="button" class="active" data-view-target="calibration" aria-selected="true">简历校准</button>
+        <button type="button" data-view-target="review" aria-selected="false">岗位审阅</button>
+        <button type="button" data-view-target="matching" aria-selected="false">匹配校准</button>
+        <button type="button" data-view-target="boundary" aria-selected="false">边界复核</button>
+        <button type="button" data-view-target="learning" aria-selected="false">学习雷达</button>
+      </nav>
+      <div class="progress-block" aria-live="polite">
+        <strong id="progressText">0 / 60</strong>
+        <span>已决定</span>
+        <div class="progress-track"><span id="progressBar"></span></div>
+      </div>
+    </header>
+
+    <main class="calibration-view" id="calibrationView">
+      <header class="calibration-header">
+        <div>
+          <p class="section-label">简历事实 × 岗位样本 × 审阅反馈</p>
+          <h2>从简历建立个人匹配基线</h2>
+          <p id="calibrationScope">选择本地简历后，系统会重新提取能力证据并校准现有岗位。</p>
+        </div>
+        <span id="calibrationAsOf"></span>
+      </header>
+
+      <section class="resume-intake" aria-labelledby="resumeIntakeHeading">
+        <div>
+          <p class="section-label">本地输入</p>
+          <h3 id="resumeIntakeHeading">选择 Markdown 或纯文本简历</h3>
+          <p id="resumeFileName">尚未选择文件</p>
+        </div>
+        <div class="resume-actions">
+          <label class="file-action" for="resumeFile">选择简历</label>
+          <input id="resumeFile" type="file" accept=".md,.markdown,.txt,text/markdown,text/plain">
+          <button type="button" class="primary-action" id="calibrateResumeButton" disabled>1. 本地校准</button>
+          <button type="button" class="secondary-action" id="collectResumeJobsButton" disabled>2. 按画像采集</button>
+        </div>
+        <p class="calibration-status" id="calibrationStatus" role="status"></p>
+      </section>
+
+      <section class="calibration-metrics" aria-label="简历校准概览">
+        <div><strong id="calibrationSkillCount">0</strong><span>已证实能力</span></div>
+        <div><strong id="calibrationLocalJobs">0</strong><span>本地岗位</span></div>
+        <div><strong id="calibrationReviewedJobs">0</strong><span>偏好样本</span></div>
+        <div><strong id="calibrationUnknownCount">0</strong><span>待确认</span></div>
+      </section>
+
+      <div class="calibration-grid">
+        <section class="calibration-section profile-section" aria-labelledby="resumeProfileHeading">
+          <div class="calibration-section-heading">
+            <div><p class="section-label">简历证据</p><h3 id="resumeProfileHeading">系统确认了什么</h3></div>
+            <span id="resumeProfileVersion"></span>
+          </div>
+          <dl class="profile-summary" id="profileSummary"></dl>
+          <div class="resume-skill-list" id="resumeSkillList">
+            <p class="list-empty">完成校准后显示能力和对应简历原文。</p>
+          </div>
+        </section>
+
+        <section class="calibration-section collection-section" aria-labelledby="collectionPlanHeading">
+          <div class="calibration-section-heading">
+            <div><p class="section-label">自动收集范围</p><h3 id="collectionPlanHeading">根据简历寻找什么岗位</h3></div>
+          </div>
+          <div class="query-list" id="collectionQueries"></div>
+          <p class="collection-state" id="externalCollectionState"></p>
+          <p class="collection-boundary">采集会使用已登录的招聘平台会话，只读取岗位与公司信息，不投递、不沟通、不调用模型。</p>
+        </section>
+
+        <section class="calibration-section preference-section" aria-labelledby="preferenceHeading">
+          <div class="calibration-section-heading">
+            <div><p class="section-label">行为校准</p><h3 id="preferenceHeading">系统学到的软偏好</h3></div>
+          </div>
+          <div class="preference-list" id="preferenceSignals">
+            <p class="list-empty">审阅岗位后，系统会在这里展示带证据的偏好。</p>
+          </div>
+        </section>
+
+        <section class="calibration-section unknown-section" aria-labelledby="unknownHeading">
+          <div class="calibration-section-heading">
+            <div><p class="section-label">需要本人决定</p><h3 id="unknownHeading">待确认</h3></div>
+          </div>
+          <div class="unknown-list" id="calibrationUnknowns"></div>
+        </section>
+      </div>
+      <div class="calibration-error" id="calibrationError" role="alert"></div>
+    </main>
+
+    <main class="workspace" id="reviewView" hidden>
+      <aside class="queue-pane" aria-label="岗位队列">
+        <div class="pane-heading">
+          <div>
+            <p class="section-label">校准样本</p>
+            <h2>岗位队列</h2>
+          </div>
+          <span class="count" id="visibleCount">0</span>
+        </div>
+        <div class="filters" id="filters" aria-label="决策状态筛选">
+          <button type="button" class="active" data-filter="all">全部</button>
+          <button type="button" data-filter="unreviewed">未决</button>
+          <button type="button" data-filter="want">想投</button>
+          <button type="button" data-filter="maybe">再看</button>
+          <button type="button" data-filter="reject">放弃</button>
+        </div>
+        <div class="job-list" id="jobList" aria-live="polite">
+          <p class="loading">正在读取本地岗位...</p>
+        </div>
+      </aside>
+
+      <article class="detail-pane" id="detailPane">
+        <div class="empty-state" id="detailEmpty">
+          <strong>选择一个岗位</strong>
+          <span>系统初判、证据和完整 JD 会显示在这里。</span>
+        </div>
+        <div id="detailContent" hidden>
+          <header class="job-header">
+            <div>
+              <div class="bucket-line">
+                <span class="bucket" id="sampleBucket"></span>
+                <span class="tier" id="fitTier"></span>
+              </div>
+              <h2 id="jobTitle"></h2>
+              <p id="companyLine"></p>
+            </div>
+            <a id="sourceLink" class="source-link" target="_blank" rel="noreferrer">查看原岗位</a>
+          </header>
+
+          <dl class="job-meta" id="jobMeta"></dl>
+
+          <section class="company-profile" id="companyProfile" aria-labelledby="companyProfileHeading">
+            <div class="section-row company-profile-heading">
+              <div>
+                <p class="section-label">公司画像</p>
+                <h3 id="companyProfileHeading">规模与工商信息</h3>
+              </div>
+              <span id="companyCollectedAt"></span>
+            </div>
+            <dl class="company-profile-grid">
+              <div><dt>规模</dt><dd id="companySize"></dd></div>
+              <div><dt>行业</dt><dd id="companyIndustry"></dd></div>
+              <div><dt>融资</dt><dd id="companyFinancing"></dd></div>
+              <div><dt>成立年限</dt><dd id="companyAge"></dd></div>
+              <div class="company-wide"><dt>工商主体</dt><dd id="companyLegalName"></dd></div>
+              <div><dt>经营状态</dt><dd id="companyStatus"></dd></div>
+              <div><dt>注册资本</dt><dd id="companyCapital"></dd></div>
+            </dl>
+          </section>
+
+          <section class="analysis-section" aria-labelledby="analysisHeading">
+            <div class="section-row analysis-heading">
+              <div>
+                <p class="section-label">系统初判</p>
+                <h3 id="analysisHeading">先看这六项</h3>
+              </div>
+              <span class="analysis-version" id="analysisVersion"></span>
+            </div>
+
+            <div class="analysis-grid">
+              <div class="analysis-item">
+                <div class="analysis-title"><strong>岗位方向</strong><span id="directionValue"></span></div>
+                <ul id="directionEvidence"></ul>
+              </div>
+              <div class="analysis-item">
+                <div class="analysis-title"><strong>技术匹配</strong><span id="technicalMatchValue"></span></div>
+                <ul id="technicalMatchEvidence"></ul>
+              </div>
+              <div class="analysis-item">
+                <div class="analysis-title"><strong>业务 / FDE 价值</strong><span id="businessValue"></span></div>
+                <ul id="businessEvidence"></ul>
+              </div>
+              <div class="analysis-item">
+                <div class="analysis-title"><strong>当前可投性</strong><span id="attainabilityValue"></span></div>
+                <ul id="attainabilityEvidence"></ul>
+              </div>
+              <div class="analysis-item">
+                <div class="analysis-title"><strong>薪资可达性</strong><span id="salaryReachabilityValue"></span></div>
+                <ul id="salaryEvidence"></ul>
+              </div>
+              <div class="analysis-item">
+                <div class="analysis-title"><strong>用工关系</strong><span id="employmentRiskValue"></span></div>
+                <ul id="employmentEvidence"></ul>
+              </div>
+            </div>
+
+            <div class="risk-line" id="riskLine" hidden>
+              <strong>风险</strong>
+              <div class="chips" id="riskChips"></div>
+            </div>
+          </section>
+
+          <section class="jd-section" aria-labelledby="jdHeading">
+            <div class="section-row">
+              <div>
+                <p class="section-label">原始信息</p>
+                <h3 id="jdHeading">完整 JD</h3>
+              </div>
+              <span id="jdLength"></span>
+            </div>
+            <div class="jd-text" id="jdText"></div>
+          </section>
+        </div>
+      </article>
+
+      <aside class="decision-pane" aria-label="你的决定">
+        <form id="decisionForm">
+          <div class="decision-heading">
+            <div>
+              <p class="section-label">你的决定</p>
+              <h2>这条要不要投</h2>
+            </div>
+            <div class="decision-actions">
+              <button type="button" class="quick-reject" id="quickReject">直接放弃</button>
+              <span class="save-state" id="saveState"></span>
+            </div>
+          </div>
+
+          <fieldset>
+            <legend>投递意向</legend>
+            <div class="segmented interest-control">
+              <label><input type="radio" name="interest" value="want" required><span>想投</span></label>
+              <label><input type="radio" name="interest" value="maybe"><span>再看</span></label>
+              <label><input type="radio" name="interest" value="reject"><span>放弃</span></label>
+            </div>
+          </fieldset>
+
+          <label class="field-label" for="rejectionReason">放弃原因 <small>可选</small></label>
+          <select id="rejectionReason" name="rejection_reason">
+            <option value="">未填写</option>
+            <option value="role_mismatch">方向不匹配</option>
+            <option value="pure_java">偏纯 Java / 传统后端</option>
+            <option value="seniority">经验门槛过高</option>
+            <option value="salary">薪资与阶段不匹配</option>
+            <option value="employment">用工关系风险</option>
+            <option value="onsite">驻场 / 出差不接受</option>
+            <option value="stale">岗位已过时</option>
+            <option value="other">其他</option>
+          </select>
+
+          <label class="field-label" for="note">个人备注 <small>可选</small></label>
+          <textarea id="note" name="note" rows="4" placeholder="记录值得确认的团队、业务或工作方式"></textarea>
+
+          <label class="learning-toggle" for="learningIntent">
+            <input type="checkbox" id="learningIntent" name="learning_intent">
+            <span>加入学习雷达</span>
+          </label>
+
+          <p class="form-error" id="formError" role="alert"></p>
+          <button class="primary-action" id="saveButton" type="submit">保存并看下一条</button>
+        </form>
+
+        <details class="correction-panel" id="correctionPanel">
+          <summary>系统判断有误</summary>
+          <form id="correctionForm">
+            <label class="field-label" for="correctionCategory">需要纠正</label>
+            <select id="correctionCategory" name="category" required>
+              <option value="">选择判断项</option>
+              <option value="direction">岗位方向</option>
+              <option value="technical_match">技术匹配</option>
+              <option value="business_value">业务 / FDE 价值</option>
+              <option value="attainability">当前可投性</option>
+              <option value="salary_reachability">薪资可达性</option>
+              <option value="employment_risk">用工关系</option>
+              <option value="other">其他</option>
+            </select>
+
+            <label class="field-label" for="correctionNote">纠正说明</label>
+            <textarea id="correctionNote" name="note" rows="3" required placeholder="写下判断不准确的地方"></textarea>
+            <p class="form-error" id="correctionError" role="alert"></p>
+            <div class="correction-footer">
+              <span class="save-state" id="correctionState"></span>
+              <button type="submit" class="secondary-action" id="correctionButton">提交纠错</button>
+            </div>
+          </form>
+        </details>
+      </aside>
+    </main>
+
+    <main class="matching-view" id="matchingView" hidden>
+      <header class="matching-header">
+        <div>
+          <p class="section-label">个人档案 × 完整 JD</p>
+          <h2>匹配校准</h2>
+          <p id="matchScope">正在读取版本化匹配预览...</p>
+        </div>
+        <span id="matchVersion"></span>
+      </header>
+
+      <section class="match-metrics" aria-label="匹配预览概览">
+        <button type="button" class="active" data-match-filter="all">
+          <strong id="matchTotal">0</strong><span>全部岗位</span>
+        </button>
+        <button type="button" data-match-filter="priority">
+          <strong id="matchPriority">0</strong><span>优先投</span>
+        </button>
+        <button type="button" data-match-filter="challenge">
+          <strong id="matchChallenge">0</strong><span>挑战投</span>
+        </button>
+        <button type="button" data-match-filter="not_fit">
+          <strong id="matchNotFit">0</strong><span>当前不建议投</span>
+        </button>
+        <button type="button" data-match-filter="changed">
+          <strong id="matchConflicts">0</strong><span>新旧判断冲突</span>
+        </button>
+      </section>
+
+      <div class="matching-workspace">
+        <aside class="match-queue" aria-label="匹配岗位队列">
+          <div class="match-queue-heading">
+            <div>
+              <p class="section-label">当前筛选</p>
+              <h3 id="matchFilterTitle">全部岗位</h3>
+            </div>
+            <span class="count" id="matchVisibleCount">0</span>
+          </div>
+          <div class="match-job-list" id="matchJobList" aria-live="polite">
+            <p class="loading">正在读取匹配结果...</p>
+          </div>
+        </aside>
+
+        <article class="match-detail" id="matchDetail">
+          <div class="empty-state" id="matchDetailEmpty">
+            <strong>选择一个匹配结果</strong>
+            <span>岗位门槛、简历证据、能力缺口和版本变化会显示在这里。</span>
+          </div>
+          <div id="matchDetailContent" hidden>
+            <header class="match-detail-header">
+              <div>
+                <div class="match-badges">
+                  <span id="matchRecommendation"></span>
+                  <span id="matchInformation"></span>
+                  <span id="matchChanged" hidden>判断有变化</span>
+                </div>
+                <h2 id="matchJobTitle"></h2>
+                <p id="matchCompanyLine"></p>
+              </div>
+              <div class="match-score-block">
+                <strong id="matchScore">0</strong>
+                <span id="matchConfidence">置信度 0%</span>
+              </div>
+            </header>
+
+            <dl class="match-meta" id="matchMeta"></dl>
+
+            <section class="version-comparison" aria-labelledby="versionComparisonHeading">
+              <div class="section-row">
+                <div>
+                  <p class="section-label">版本变化</p>
+                  <h3 id="versionComparisonHeading">v1 与 v2</h3>
+                </div>
+                <button type="button" class="text-action" id="openReviewJob">回到原审阅</button>
+              </div>
+              <div class="comparison-line">
+                <div><span>旧判断</span><strong id="previousMatch"></strong></div>
+                <span aria-hidden="true">→</span>
+                <div><span>当前判断</span><strong id="currentMatch"></strong></div>
+              </div>
+            </section>
+
+            <section class="match-evidence-section" id="hardRequirementsSection">
+              <div class="section-row">
+                <div><p class="section-label">资格门槛</p><h3>不符合项</h3></div>
+                <span id="hardRequirementCount"></span>
+              </div>
+              <div class="match-evidence-list" id="hardRequirements"></div>
+            </section>
+
+            <section class="match-evidence-section">
+              <div class="section-row">
+                <div><p class="section-label">能力证据</p><h3>为什么值得投</h3></div>
+                <span id="matchStrengthCount"></span>
+              </div>
+              <div class="match-evidence-list" id="matchStrengths"></div>
+            </section>
+
+            <section class="match-evidence-section">
+              <div class="section-row">
+                <div><p class="section-label">能力缺口</p><h3>挑战在哪里</h3></div>
+                <span id="matchGapCount"></span>
+              </div>
+              <div class="match-evidence-list" id="matchGaps"></div>
+            </section>
+
+            <section class="match-evidence-section" id="preferenceSignalsSection" hidden>
+              <div class="section-row">
+                <div><p class="section-label">行为校准</p><h3>偏好如何影响结果</h3></div>
+                <span id="matchPreferenceCount"></span>
+              </div>
+              <div class="match-evidence-list" id="matchPreferenceSignals"></div>
+            </section>
+
+            <section class="match-evidence-section" id="matchUncertaintySection">
+              <div class="section-row">
+                <div><p class="section-label">信息质量</p><h3>仍需确认</h3></div>
+              </div>
+              <ul class="uncertainty-list" id="matchUncertainties"></ul>
+            </section>
+
+            <section class="match-jd-section">
+              <div class="section-row">
+                <div><p class="section-label">原始信息</p><h3>完整 JD</h3></div>
+              </div>
+              <div class="jd-text" id="matchJdText"></div>
+            </section>
+          </div>
+          <div class="matching-error" id="matchingError" role="alert"></div>
+        </article>
+      </div>
+    </main>
+
+    <main class="boundary-view" id="boundaryView" hidden>
+      <header class="boundary-header">
+        <div>
+          <p class="section-label">系统判断 × 你的决定</p>
+          <h2>边界复核</h2>
+          <p id="boundaryScope">正在从已审岗位中选择高信息样本...</p>
+        </div>
+        <span id="boundaryVersion"></span>
+      </header>
+
+      <section class="boundary-metrics" aria-label="边界复核概览">
+        <div><strong id="boundarySelected">0</strong><span>本轮样本</span></div>
+        <div><strong id="boundaryStrong">0</strong><span>本轮强冲突</span></div>
+        <div><strong id="boundarySoft">0</strong><span>本轮软冲突</span></div>
+        <div><strong id="boundaryInformation">0</strong><span>本轮信息不全</span></div>
+        <div><strong id="boundaryLearning">0</strong><span>本轮学习信号</span></div>
+      </section>
+
+      <div class="boundary-workspace">
+        <aside class="boundary-insight-pane" aria-labelledby="boundaryInsightHeading">
+          <div class="boundary-section-heading">
+            <div>
+              <p class="section-label">优先检查</p>
+              <h3 id="boundaryInsightHeading">可能的误判模式</h3>
+            </div>
+          </div>
+          <div class="boundary-insights" id="boundaryInsights"></div>
+          <div class="boundary-rule-gate" id="boundaryRuleGate"></div>
+        </aside>
+
+        <section class="boundary-sample-pane" aria-labelledby="boundarySampleHeading">
+          <div class="boundary-section-heading">
+            <div>
+              <p class="section-label">第二轮校准集</p>
+              <h3 id="boundarySampleHeading">三档对照样本</h3>
+            </div>
+            <span>每档最多 10 条</span>
+          </div>
+          <div class="boundary-groups" id="boundaryGroups">
+            <p class="loading">正在建立复核样本...</p>
+          </div>
+        </section>
+      </div>
+      <div class="boundary-error" id="boundaryError" role="alert"></div>
+    </main>
+
+    <main class="learning-view" id="learningView" hidden>
+      <header class="learning-header">
+        <div>
+          <p class="section-label">个人能力 × 岗位需求</p>
+          <h2>学习雷达</h2>
+          <p id="learningScope">正在读取本地岗位快照...</p>
+        </div>
+        <span id="learningAsOf"></span>
+      </header>
+
+      <section class="learning-metrics" aria-label="学习雷达概览">
+        <div><strong id="learningTargetJobs">0</strong><span>目标岗位</span></div>
+        <div><strong id="learningReviewedJobs">0</strong><span>已审岗位</span></div>
+        <div><strong id="learningNoteCount">0</strong><span>学习备注</span></div>
+        <div><strong id="learningDemandCount">0</strong><span>需求主题</span></div>
+      </section>
+
+      <div class="learning-columns">
+        <section class="learning-section priority-section" aria-labelledby="priorityHeading">
+          <div class="learning-section-heading">
+            <div>
+              <p class="section-label">你的优先级</p>
+              <h3 id="priorityHeading">先补这些能力</h3>
+            </div>
+          </div>
+          <div id="learningPriorities" class="priority-list">
+            <p class="loading">正在分析备注...</p>
+          </div>
+        </section>
+
+        <section class="learning-section demand-section" aria-labelledby="demandHeading">
+          <div class="learning-section-heading">
+            <div>
+              <p class="section-label">当前快照</p>
+              <h3 id="demandHeading">目标岗位需求</h3>
+            </div>
+          </div>
+          <div id="marketDemands" class="demand-list"></div>
+        </section>
+      </div>
+
+      <section class="learning-section note-section" aria-labelledby="noteSignalsHeading">
+        <div class="learning-section-heading note-heading">
+          <div>
+            <p class="section-label">备注回看</p>
+            <h3 id="noteSignalsHeading">系统读到了什么</h3>
+          </div>
+          <div class="note-summary" id="noteSummary"></div>
+        </div>
+        <div id="noteSignals" class="note-signal-list"></div>
+      </section>
+
+      <div class="learning-error" id="learningError" role="alert"></div>
+    </main>
+    <script src="/app.js" defer></script>
+  </body>
+</html>
