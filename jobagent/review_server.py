@@ -102,6 +102,26 @@ class ReviewHttpServer(ThreadingHTTPServer):
         finally:
             self.calibration_operation_lock.release()
 
+    def confirm_preferences(self, payload: dict) -> dict:
+        if not self.calibration_operation_lock.acquire(blocking=False):
+            if self.collection_snapshot().get("status") == "running":
+                raise ReviewValidationError("岗位采集正在运行，请等待当前任务结束")
+            raise ReviewValidationError("简历校准正在运行，请等待当前任务结束")
+        try:
+            store = ReviewStore(self.db_path)
+            try:
+                return store.confirm_preferences(
+                    payload,
+                    candidate_id=str(payload.get("candidate_id") or "local-candidate"),
+                    analysis_version=str(
+                        payload.get("analysis_version") or "resume-match-v1"
+                    ),
+                )
+            finally:
+                store.close()
+        finally:
+            self.calibration_operation_lock.release()
+
     def _run_resume_collection(self, payload: dict) -> None:
         try:
             dashboard = self.collection_runner(
@@ -233,6 +253,19 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         request_url = urlsplit(self.path)
         path = request_url.path
         query = parse_qs(request_url.query)
+        if path == "/api/calibration/preferences":
+            try:
+                content_length = int(self.headers.get("Content-Length", "0"))
+                if content_length > 64_000:
+                    raise ReviewValidationError("偏好设置内容过大")
+                payload = json.loads(self.rfile.read(content_length) or b"{}")
+                if not isinstance(payload, dict):
+                    raise ReviewValidationError("提交内容格式不正确")
+                dashboard = self.server.confirm_preferences(payload)
+                self._send_json(HTTPStatus.OK, dashboard)
+            except (ValueError, json.JSONDecodeError, ReviewValidationError) as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
         sample_name = str(query.get("sample_name", ["positioning-v1"])[0])
         platform = str(query.get("platform", [""])[0]) or None
         if not path.startswith("/api/jobs/"):

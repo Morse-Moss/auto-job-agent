@@ -16,6 +16,7 @@ from jobagent.config import ROOT as PROJECT_ROOT
 from jobagent.calibration import (
     build_calibration_dashboard,
     calibrate_resume,
+    confirm_preference_settings,
     extract_resume_profile,
     infer_preference_calibration,
 )
@@ -278,6 +279,102 @@ class PreferenceCalibrationTests(unittest.TestCase):
 
         signal_ids = {item["id"] for item in calibration["signals"]}
         self.assertNotIn("track:rag_engineering", signal_ids)
+
+    def test_confirmed_preferences_create_a_new_version_and_are_reused(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "jobs.db"
+            create_calibration_db(db_path)
+            initial = calibrate_resume(
+                db_path,
+                RESUME_TEXT,
+                filename="resume.md",
+                candidate_id="candidate-demo",
+                analysis_version="resume-match-v1",
+                as_of=date(2026, 8, 13),
+            )
+
+            updated = confirm_preference_settings(
+                db_path,
+                {
+                    "target_tracks": ["fde", "agent_engineering"],
+                    "hard_constraints": {
+                        "maximum_required_experience_years": 3,
+                        "reject_third_party": True,
+                        "reject_dispatch": False,
+                        "reject_long_term_overseas": True,
+                    },
+                },
+                candidate_id="candidate-demo",
+                analysis_version="resume-match-v1",
+            )
+
+            self.assertNotEqual(
+                initial["profile"]["version"], updated["profile"]["version"]
+            )
+            self.assertEqual(
+                updated["profile"]["target_tracks"],
+                ["agent_engineering", "fde"],
+            )
+            self.assertEqual(
+                updated["profile"]["hard_constraints"],
+                {
+                    "maximum_required_experience_years": 3,
+                    "reject_third_party": True,
+                    "reject_long_term_overseas": True,
+                },
+            )
+            self.assertEqual(
+                updated["confirmed_preferences"]["settings"]["target_tracks"],
+                ["agent_engineering", "fde"],
+            )
+            self.assertEqual(updated["match"]["total"], 4)
+            self.assertIn("reviewed_jobs", updated["alignment"])
+
+            reloaded = calibrate_resume(
+                db_path,
+                RESUME_TEXT,
+                filename="resume.md",
+                candidate_id="candidate-demo",
+                analysis_version="resume-match-v1",
+                as_of=date(2026, 8, 13),
+            )
+            self.assertEqual(
+                reloaded["profile"]["version"], updated["profile"]["version"]
+            )
+            self.assertEqual(
+                reloaded["profile"]["hard_constraints"]["maximum_required_experience_years"],
+                3,
+            )
+
+            connection = sqlite3.connect(db_path)
+            try:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM job_decisions"
+                    ).fetchone()[0],
+                    4,
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM candidate_preference_settings"
+                    ).fetchone()[0],
+                    1,
+                )
+            finally:
+                connection.close()
+
+    def test_confirmed_preferences_reject_unknown_tracks(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "jobs.db"
+            create_calibration_db(db_path)
+            calibrate_resume(db_path, RESUME_TEXT, candidate_id="candidate-demo")
+
+            with self.assertRaises(ValueError):
+                confirm_preference_settings(
+                    db_path,
+                    {"target_tracks": ["made_up_track"], "hard_constraints": {}},
+                    candidate_id="candidate-demo",
+                )
 
 
 class ResumeCalibrationFlowTests(unittest.TestCase):
@@ -761,6 +858,55 @@ class ResumeDrivenCollectionTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=2)
 
+    def test_loopback_api_confirms_preferences_and_returns_recalculated_dashboard(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "jobs.db"
+            create_calibration_db(db_path)
+            server = create_server(db_path, host="127.0.0.1", port=0)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_port}"
+            try:
+                calibration_request = Request(
+                    f"{base_url}/api/calibration",
+                    data=json.dumps(
+                        {"resume_text": RESUME_TEXT, "filename": "resume.md"}
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(calibration_request) as response:
+                    self.assertEqual(response.status, 200)
+
+                preference_request = Request(
+                    f"{base_url}/api/calibration/preferences",
+                    data=json.dumps(
+                        {
+                            "target_tracks": ["fde", "agent_engineering"],
+                            "hard_constraints": {
+                                "maximum_required_experience_years": 3,
+                                "reject_long_term_overseas": True,
+                            },
+                        }
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="PUT",
+                )
+                with urlopen(preference_request) as response:
+                    payload = json.load(response)
+                self.assertEqual(response.status, 200)
+                self.assertEqual(payload["profile"]["target_tracks"], ["agent_engineering", "fde"])
+                self.assertEqual(
+                    payload["profile"]["hard_constraints"]["maximum_required_experience_years"],
+                    3,
+                )
+                self.assertEqual(payload["match"]["total"], 4)
+                self.assertIsNotNone(payload["confirmed_preferences"])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
 
 class ResumeCalibrationCliTests(unittest.TestCase):
     def test_cli_calibrates_configured_resume_without_ai_or_browser(self):
@@ -843,8 +989,35 @@ class ResumeCalibrationUiContractTests(unittest.TestCase):
         self.assertIn('id="calibrationView"', page)
         self.assertIn('id="resumeFile"', page)
         self.assertIn("待确认", page)
+        self.assertIn('id="preferenceConfirmation"', page)
         self.assertIn("/api/calibration", script)
+        self.assertIn("/api/calibration/preferences", script)
+        self.assertIn("confirmed_preferences", script)
+        self.assertIn("confirmedRecord?.version", script)
+        self.assertIn("alignment", script)
         self.assertIn("file.text()", script)
+
+    def test_preference_confirmation_uses_inferred_defaults_and_locks_during_work(self):
+        script = (PROJECT_ROOT / "review_ui" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("renderPreferenceConfirmation", script)
+        self.assertIn("preference_calibration", script)
+        self.assertIn('signal.dimension === "track"', script)
+        self.assertIn("setPreferenceFormDisabled", script)
+        self.assertIn("state.collectionRunning", script)
+        self.assertIn("previous_strong_conflicts", script)
+        self.assertIn("strong_conflicts", script)
+
+    def test_preference_confirmation_submits_explicit_settings_only(self):
+        script = (PROJECT_ROOT / "review_ui" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn('name="target_tracks"', script)
+        self.assertIn('method: "PUT"', script)
+        self.assertIn("maximum_required_experience_years", script)
+        self.assertIn("reject_third_party", script)
+        self.assertIn("reject_dispatch", script)
+        self.assertIn("reject_long_term_overseas", script)
+        self.assertIn("invalidateMatchResults()", script)
 
     def test_workbench_exposes_non_blocking_resume_driven_collection(self):
         page = (PROJECT_ROOT / "review_ui" / "index.html").read_text(encoding="utf-8")

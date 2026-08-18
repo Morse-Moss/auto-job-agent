@@ -260,6 +260,16 @@ def _requirement(
     }
 
 
+def _is_negated_requirement(evidence: str) -> bool:
+    return bool(
+        re.search(
+            r"(?:无需|不需要|不要求|不涉及|不必|非必须|无须)[^。！？!?;；\n]{0,40}",
+            evidence,
+            re.I,
+        )
+    )
+
+
 def _information_state(job: dict, jd: str) -> tuple[str, tuple[str, ...], float]:
     uncertainties: list[str] = []
     if len(jd) < 100:
@@ -452,6 +462,8 @@ def analyze_job_match(job: dict, profile: dict) -> JobMatchAnalysis:
         if candidate_aliases.intersection(topic_aliases):
             continue
         evidence = _first_evidence(text, topic["patterns"])
+        if _is_negated_requirement(evidence):
+            continue
         required = _matches(evidence, (r"必须", r"精通", r"熟练", r"要求", r"具备", r"至少", r"核心", r"需"))
         if topic["id"] not in gap_ids:
             gaps.append(
@@ -533,6 +545,10 @@ def analyze_job_match(job: dict, profile: dict) -> JobMatchAnalysis:
             recommendation = "challenge"
         else:
             recommendation = "not_fit"
+
+        if information_status == "insufficient" and recommendation == "priority":
+            recommendation = "challenge"
+            score = min(score, 74)
 
     return JobMatchAnalysis(
         track=track,

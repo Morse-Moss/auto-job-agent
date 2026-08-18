@@ -96,6 +96,57 @@
           <div class="unknown-list" id="calibrationUnknowns"></div>
         </section>
       </div>
+
+      <section class="preference-confirmation" id="preferenceConfirmation" aria-labelledby="preferenceConfirmationHeading" hidden>
+        <div class="preference-confirmation-heading">
+          <div>
+            <p class="section-label">本人确认</p>
+            <h3 id="preferenceConfirmationHeading">确认个人边界</h3>
+          </div>
+          <div class="preference-confirmation-meta">
+            <span id="preferenceVersion"></span>
+            <span id="preferenceAlignment" aria-live="polite"></span>
+          </div>
+        </div>
+        <form id="preferenceForm">
+          <p class="preference-confirmation-hint" id="preferenceConfirmationHint">
+            默认值来自简历事实和审阅信号；确认后才会参与岗位筛选，不会改写已有决定或备注。
+          </p>
+          <div class="preference-form-grid">
+            <fieldset class="preference-track-fieldset">
+              <legend>重点方向</legend>
+              <div id="preferenceTrackOptions" class="preference-track-options"></div>
+            </fieldset>
+            <div class="preference-boundary-fields">
+              <label class="field-label" for="maximumExperience">
+                最高接受经验要求 <small>留空表示不设边界</small>
+              </label>
+              <select id="maximumExperience" name="maximum_required_experience_years">
+                <option value="">不设置</option>
+                <option value="1">1 年</option>
+                <option value="3">3 年</option>
+                <option value="5">5 年</option>
+                <option value="8">8 年</option>
+                <option value="10">10 年</option>
+              </select>
+
+              <fieldset class="preference-toggle-fieldset">
+                <legend>不接受的边界</legend>
+                <label><input type="checkbox" id="rejectThirdParty">第三方代招</label>
+                <label><input type="checkbox" id="rejectDispatch">外包或劳务派遣</label>
+                <label><input type="checkbox" id="rejectLongTermOverseas">长期海外派驻</label>
+              </fieldset>
+            </div>
+          </div>
+          <div class="preference-form-footer">
+            <p class="form-error" id="preferenceFormError" role="alert"></p>
+            <div>
+              <span class="save-state" id="preferenceSaveState" aria-live="polite"></span>
+              <button type="submit" class="primary-action" id="savePreferencesButton">确认并重算</button>
+            </div>
+          </div>
+        </form>
+      </section>
       <div class="calibration-error" id="calibrationError" role="alert"></div>
     </main>
 

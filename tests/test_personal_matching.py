@@ -140,7 +140,7 @@ class PersonalMatchDecisionTests(unittest.TestCase):
         )
 
         self.assertEqual(result.track, "ai_product_delivery")
-        self.assertEqual(result.recommendation, "priority")
+        self.assertEqual(result.recommendation, "challenge")
         self.assertFalse(result.hard_requirements)
         self.assertGreaterEqual(len(result.strengths), 3)
 
@@ -176,6 +176,39 @@ class PersonalMatchDecisionTests(unittest.TestCase):
         self.assertEqual(result.information_status, "insufficient")
         self.assertTrue(result.uncertainties)
         self.assertLess(result.confidence, 0.7)
+
+    def test_information_insufficient_never_recommends_priority(self):
+        result = analyze_job_match(
+            {
+                "title": "AI Agent 应用工程师",
+                "jd_text": "负责 Agent、RAG、Python、FastAPI 应用开发。",
+                "education_raw": "本科",
+                "experience_raw": "1-3年",
+                "location": "上海",
+                "salary_raw": "15-25K",
+                "company": "样例公司",
+            },
+            candidate_profile(),
+        )
+
+        self.assertEqual(result.information_status, "insufficient")
+        self.assertNotEqual(result.recommendation, "priority")
+
+    def test_negated_skill_requirement_does_not_create_a_learning_gap(self):
+        result = analyze_job_match(
+            {
+                "title": "AI 应用工程师",
+                "jd_text": "负责 AI 应用开发，无需模型部署与推理经验。",
+                "education_raw": "本科",
+                "experience_raw": "1-3年",
+                "location": "上海",
+                "salary_raw": "15-25K",
+                "company": "样例公司",
+            },
+            candidate_profile(),
+        )
+
+        self.assertFalse(any(item["id"] == "model_serving" for item in result.gaps))
 
     def test_alternative_languages_do_not_make_go_a_hard_requirement(self):
         result = analyze_job_match(
@@ -605,14 +638,14 @@ class MatchPreviewApiTests(unittest.TestCase):
                     dashboard = json.load(response)
                 self.assertEqual(dashboard["snapshot"]["analysis_version"], "match-v2.0")
                 self.assertEqual(dashboard["snapshot"]["total"], 1)
-                self.assertEqual(dashboard["snapshot"]["priority"], 1)
+                self.assertEqual(dashboard["snapshot"]["priority"], 0)
                 self.assertEqual(dashboard["snapshot"]["conflicts"], 1)
                 self.assertEqual(dashboard["jobs"][0]["previous_fit_tier"], "exclude")
                 self.assertTrue(dashboard["jobs"][0]["changed"])
 
                 with urlopen(f"{base_url}/api/matches/job-1") as response:
                     detail = json.load(response)["match"]
-                self.assertEqual(detail["recommendation"], "priority")
+                self.assertEqual(detail["recommendation"], "challenge")
                 self.assertEqual(detail["decision"]["interest"], "want")
                 self.assertTrue(detail["strengths"])
                 self.assertIn("jd_evidence", detail["strengths"][0])

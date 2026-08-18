@@ -11,6 +11,8 @@ const state = {
   calibratedResumeText: "",
   calibratedFilename: "",
   collectionRunning: false,
+  calibrationRunning: false,
+  preferenceSaving: false,
   learning: null,
   matching: null,
   matchFilter: "all",
@@ -73,6 +75,17 @@ const analysisFields = [
 ];
 
 const DEFAULT_SAMPLE_NAME = "positioning-v1";
+const preferenceTrackOrder = [
+  "fde",
+  "agent_engineering",
+  "rag_engineering",
+  "ai_application",
+  "solution_delivery",
+  "ai_product_delivery",
+  "pure_java",
+  "product",
+  "sales",
+];
 
 const elements = {
   list: document.querySelector("#jobList"),
@@ -101,6 +114,18 @@ const elements = {
   collectionQueries: document.querySelector("#collectionQueries"),
   preferenceSignals: document.querySelector("#preferenceSignals"),
   calibrationUnknowns: document.querySelector("#calibrationUnknowns"),
+  preferenceConfirmation: document.querySelector("#preferenceConfirmation"),
+  preferenceForm: document.querySelector("#preferenceForm"),
+  preferenceTrackOptions: document.querySelector("#preferenceTrackOptions"),
+  maximumExperience: document.querySelector("#maximumExperience"),
+  rejectThirdParty: document.querySelector("#rejectThirdParty"),
+  rejectDispatch: document.querySelector("#rejectDispatch"),
+  rejectLongTermOverseas: document.querySelector("#rejectLongTermOverseas"),
+  preferenceFormError: document.querySelector("#preferenceFormError"),
+  preferenceSaveState: document.querySelector("#preferenceSaveState"),
+  savePreferencesButton: document.querySelector("#savePreferencesButton"),
+  preferenceVersion: document.querySelector("#preferenceVersion"),
+  preferenceAlignment: document.querySelector("#preferenceAlignment"),
   reviewView: document.querySelector("#reviewView"),
   learningView: document.querySelector("#learningView"),
   learningPriorities: document.querySelector("#learningPriorities"),
@@ -170,6 +195,171 @@ function createTextElement(tag, className, text) {
 function invalidateMatchResults() {
   state.matching = null;
   state.boundary = null;
+}
+
+function inferredPreferenceTracks(profile, signals) {
+  const tracks = new Set(
+    (profile?.target_tracks || []).filter((track) => preferenceTrackOrder.includes(track)),
+  );
+  (signals || [])
+    .filter((signal) => signal.dimension === "track" && signal.direction === "prefer")
+    .forEach((signal) => {
+      if (preferenceTrackOrder.includes(signal.value)) tracks.add(signal.value);
+    });
+  return preferenceTrackOrder.filter((track) => tracks.has(track));
+}
+
+function formatPreferenceAlignment(alignment, confirmed) {
+  const current = Number(alignment?.strong_conflicts || 0);
+  if (!confirmed) return `当前强冲突 ${current} 个，确认后重新计算`;
+  const previous = Number(alignment?.previous_strong_conflicts);
+  if (Number.isFinite(previous)) {
+    return previous === current
+      ? `强冲突 ${current} 个（与上版一致）`
+      : `强冲突 ${previous} → ${current}`;
+  }
+  return `当前强冲突 ${current} 个`;
+}
+
+function setPreferenceFormDisabled(disabled) {
+  if (!elements.preferenceForm) return;
+  elements.preferenceForm.querySelectorAll("input, select, button").forEach((control) => {
+    control.disabled = disabled;
+  });
+  if (state.preferenceSaving) {
+    elements.preferenceSaveState.textContent = "正在保存偏好并重算岗位...";
+    elements.savePreferencesButton.textContent = "重算中";
+  } else if (state.collectionRunning) {
+    elements.preferenceSaveState.textContent = "岗位采集中，暂不可确认偏好。";
+    elements.savePreferencesButton.textContent = "等待采集结束";
+  } else if (state.calibrationRunning) {
+    elements.preferenceSaveState.textContent = "简历校准中，暂不可确认偏好。";
+    elements.savePreferencesButton.textContent = "等待校准结束";
+  } else {
+    elements.savePreferencesButton.textContent = "确认并重算";
+  }
+}
+
+function syncPreferenceTrackState() {
+  elements.preferenceTrackOptions
+    .querySelectorAll(".preference-track-option")
+    .forEach((option) => {
+      const input = option.querySelector("input");
+      option.classList.toggle("selected", Boolean(input?.checked));
+    });
+}
+
+function renderPreferenceConfirmation(dashboard) {
+  const profile = dashboard.profile;
+  if (!profile) {
+    elements.preferenceConfirmation.hidden = true;
+    return;
+  }
+
+  const preferences = dashboard.preference_calibration || {};
+  const confirmedRecord = dashboard.confirmed_preferences || null;
+  const confirmed = confirmedRecord?.settings || null;
+  const inferredTracks = inferredPreferenceTracks(profile, preferences.signals);
+  const selectedTracks = new Set(
+    (confirmed?.target_tracks?.length ? confirmed.target_tracks : inferredTracks),
+  );
+  const constraints = confirmed?.hard_constraints || {};
+
+  elements.preferenceConfirmation.hidden = false;
+  elements.preferenceTrackOptions.replaceChildren();
+  preferenceTrackOrder.forEach((track) => {
+    const option = document.createElement("label");
+    option.className = "preference-track-option";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.name = "target_tracks";
+    input.value = track;
+    input.checked = selectedTracks.has(track);
+    input.dataset.inferred = String(!confirmedRecord && inferredTracks.includes(track));
+    const text = document.createElement("span");
+    text.textContent = labels.tracks[track] || track;
+    option.append(input, text);
+    elements.preferenceTrackOptions.append(option);
+  });
+  syncPreferenceTrackState();
+
+  elements.maximumExperience.value = constraints.maximum_required_experience_years
+    ? String(constraints.maximum_required_experience_years)
+    : "";
+  elements.rejectThirdParty.checked = Boolean(constraints.reject_third_party);
+  elements.rejectDispatch.checked = Boolean(constraints.reject_dispatch);
+  elements.rejectLongTermOverseas.checked = Boolean(constraints.reject_long_term_overseas);
+  elements.preferenceVersion.textContent = confirmedRecord?.version
+    ? `已确认 ${confirmedRecord.version}`
+    : "尚未确认 · 默认值仅供参考";
+  elements.preferenceAlignment.textContent = formatPreferenceAlignment(
+    dashboard.alignment || {},
+    Boolean(confirmedRecord),
+  );
+  elements.preferenceFormError.textContent = "";
+  if (!state.preferenceSaving) elements.preferenceSaveState.textContent = "";
+  setPreferenceFormDisabled(state.collectionRunning || state.calibrationRunning || state.preferenceSaving);
+}
+
+function preferencePayload() {
+  const targetTracks = Array.from(
+    elements.preferenceForm.querySelectorAll('input[name="target_tracks"]:checked'),
+  ).map((input) => input.value);
+  const maximum = elements.maximumExperience.value;
+  return {
+    target_tracks: targetTracks,
+    hard_constraints: {
+      ...(maximum ? { maximum_required_experience_years: Number(maximum) } : {}),
+      reject_third_party: elements.rejectThirdParty.checked,
+      reject_dispatch: elements.rejectDispatch.checked,
+      reject_long_term_overseas: elements.rejectLongTermOverseas.checked,
+    },
+  };
+}
+
+async function savePreferences(event) {
+  event.preventDefault();
+  if (
+    !state.calibration?.profile
+    || state.collectionRunning
+    || state.calibrationRunning
+    || state.preferenceSaving
+  ) return;
+  const payload = preferencePayload();
+  elements.preferenceFormError.textContent = "";
+  if (!payload.target_tracks.length) {
+    elements.preferenceFormError.textContent = "请至少选择一个重点方向。";
+    elements.preferenceTrackOptions.querySelector("input")?.focus();
+    return;
+  }
+
+  state.preferenceSaving = true;
+  setPreferenceFormDisabled(true);
+  try {
+    const profile = state.calibration.profile;
+    const dashboard = await fetchJson("/api/calibration/preferences", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ...payload,
+        candidate_id: profile.profile_id,
+        analysis_version: state.calibration.match?.analysis_version || "resume-match-v1",
+      }),
+    });
+    invalidateMatchResults("preferences");
+    clearLearningCache();
+    renderCalibrationDashboard(dashboard);
+    elements.calibrationStatus.textContent = `偏好已确认，${dashboard.match?.total || 0} 个岗位已按新版本重算。`;
+    elements.preferenceSaveState.textContent = formatPreferenceAlignment(
+      dashboard.alignment || {},
+      true,
+    );
+  } catch (error) {
+    elements.preferenceFormError.textContent = `${error.message} 当前结果未改变。`;
+  } finally {
+    state.preferenceSaving = false;
+    setPreferenceFormDisabled(state.collectionRunning || state.calibrationRunning);
+  }
 }
 
 function renderCalibrationDashboard(dashboard) {
@@ -264,6 +454,11 @@ function renderCalibrationDashboard(dashboard) {
     article.append(createTextElement("h4", "", item.label), createTextElement("p", "", item.reason));
     elements.calibrationUnknowns.append(article);
   });
+  renderPreferenceConfirmation(dashboard);
+}
+
+function clearLearningCache() {
+  state.learning = null;
 }
 
 async function loadCalibrationDashboard(force = false) {
@@ -284,6 +479,8 @@ async function calibrateSelectedResume() {
   if (!file) return;
   elements.calibrationError.textContent = "";
   elements.calibrationStatus.textContent = "正在提取简历证据并重算岗位匹配...";
+  state.calibrationRunning = true;
+  setPreferenceFormDisabled(true);
   elements.calibrateResumeButton.disabled = true;
   elements.calibrateResumeButton.textContent = "校准中";
   try {
@@ -302,6 +499,8 @@ async function calibrateSelectedResume() {
     elements.calibrationError.textContent = `${error.message} 请检查简历内容后重试。`;
     elements.calibrationStatus.textContent = "";
   } finally {
+    state.calibrationRunning = false;
+    setPreferenceFormDisabled(state.collectionRunning || state.preferenceSaving);
     elements.calibrateResumeButton.disabled = state.collectionRunning || !file;
     elements.calibrateResumeButton.textContent = "1. 本地校准";
   }
@@ -315,6 +514,7 @@ function setCollectionRunning(running) {
   elements.calibrateResumeButton.disabled = running || !elements.resumeFile.files?.[0];
   elements.collectResumeJobsButton.disabled = running || !state.calibratedResumeText;
   elements.collectResumeJobsButton.textContent = running ? "采集中" : "2. 按画像采集";
+  setPreferenceFormDisabled(running || state.calibrationRunning || state.preferenceSaving);
 }
 
 async function pollCollectionStatus() {
@@ -1201,6 +1401,8 @@ document.querySelector("#openReviewJob").addEventListener("click", (event) => {
 
 elements.decisionForm.addEventListener("submit", saveDecision);
 elements.correctionForm.addEventListener("submit", saveCorrection);
+elements.preferenceForm.addEventListener("submit", savePreferences);
+elements.preferenceTrackOptions.addEventListener("change", syncPreferenceTrackState);
 document.querySelectorAll('[name="interest"]').forEach((input) => input.addEventListener("change", updateSaveAction));
 document.querySelector("#quickReject").addEventListener("click", () => {
   const reject = elements.decisionForm.querySelector('[name="interest"][value="reject"]');

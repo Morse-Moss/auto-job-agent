@@ -11,7 +11,11 @@ from pathlib import Path
 
 from jobagent.analysis import parse_salary
 from jobagent.learning import build_learning_dashboard, note_requests_learning
-from jobagent.calibration import build_calibration_dashboard, calibrate_resume
+from jobagent.calibration import (
+    build_calibration_dashboard,
+    calibrate_resume,
+    confirm_preference_settings,
+)
 from jobagent.boundary import REVIEWED_DECISIONS_SAMPLE, build_boundary_dashboard
 from jobagent.matching import (
     build_match_dashboard,
@@ -860,6 +864,24 @@ class ReviewStore:
                 self.db_path,
                 resume_text,
                 filename=filename,
+                candidate_id=candidate_id,
+                analysis_version=analysis_version,
+            )
+        finally:
+            self.conn = sqlite3.connect(self.db_path)
+            self.conn.row_factory = sqlite3.Row
+
+    def confirm_preferences(
+        self,
+        payload: dict,
+        candidate_id: str = "local-candidate",
+        analysis_version: str = "resume-match-v1",
+    ) -> dict:
+        self.conn.close()
+        try:
+            return confirm_preference_settings(
+                self.db_path,
+                payload,
                 candidate_id=candidate_id,
                 analysis_version=analysis_version,
             )
