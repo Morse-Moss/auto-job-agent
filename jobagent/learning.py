@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 import sqlite3
 
+from jobagent.freshness import live_job_condition
+
 
 TOPICS = (
     {
@@ -143,7 +145,7 @@ def _excerpt(note: str, limit: int = 150) -> str:
 
 def build_learning_dashboard(connection: sqlite3.Connection) -> dict:
     jobs = connection.execute(
-        """
+        f"""
         SELECT d.job_id, d.title, d.company, d.jd_text, d.skills_json,
                d.collected_at, a.fit_tier, a.relevance_score
           FROM job_details d
@@ -151,6 +153,7 @@ def build_learning_dashboard(connection: sqlite3.Connection) -> dict:
             ON a.platform = d.platform AND a.job_id = d.job_id
          WHERE d.detail_status = 'collected'
            AND COALESCE(d.jd_text, '') <> ''
+           AND {live_job_condition('d')}
          ORDER BY a.relevance_score DESC, d.job_id
         """
     ).fetchall()
@@ -183,7 +186,7 @@ def build_learning_dashboard(connection: sqlite3.Connection) -> dict:
     market_demands.sort(key=lambda item: (-item["job_count"], item["name"]))
 
     note_rows = connection.execute(
-        """
+        f"""
         SELECT d.platform, d.job_id, d.title, d.company, d.jd_text,
                decision.note, decision.learning_intent,
                COALESCE(
@@ -217,6 +220,7 @@ def build_learning_dashboard(connection: sqlite3.Connection) -> dict:
           JOIN job_details d
             ON d.platform = decision.platform AND d.job_id = decision.job_id
          WHERE TRIM(COALESCE(decision.note, '')) <> ''
+           AND {live_job_condition('d')}
          ORDER BY decision.decided_at, d.job_id
         """
     ).fetchall()

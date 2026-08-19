@@ -16,6 +16,7 @@
       <nav class="view-tabs" aria-label="工作台视图">
         <button type="button" class="active" data-view-target="calibration" aria-selected="true">简历校准</button>
         <button type="button" data-view-target="review" aria-selected="false">岗位审阅</button>
+        <button type="button" data-view-target="freshness" aria-selected="false">更新监管</button>
         <button type="button" data-view-target="matching" aria-selected="false">匹配校准</button>
         <button type="button" data-view-target="boundary" aria-selected="false">边界复核</button>
         <button type="button" data-view-target="learning" aria-selected="false">学习雷达</button>
@@ -339,6 +340,80 @@
       </aside>
     </main>
 
+    <main class="freshness-view" id="freshnessView" hidden>
+      <header class="freshness-header">
+        <div>
+          <p class="section-label">岗位价值 × 最近证据 × 刷新周期</p>
+          <h2>JD 更新监管</h2>
+          <p id="freshnessScope">正在计算岗位的新鲜度与刷新顺序...</p>
+        </div>
+        <span id="freshnessAsOf"></span>
+      </header>
+
+      <section class="freshness-metrics" aria-label="岗位新鲜度概览">
+        <button type="button" data-freshness-filter="all">
+          <strong id="freshnessTotal">0</strong><span>全部岗位</span>
+        </button>
+        <button type="button" class="active" data-freshness-filter="detail_due">
+          <strong id="freshnessDetailDue">0</strong><span>JD 超期</span>
+        </button>
+        <button type="button" data-freshness-filter="retry_due">
+          <strong id="freshnessRetryDue">0</strong><span>详情重试</span>
+        </button>
+        <button type="button" data-freshness-filter="scan_attention">
+          <strong id="freshnessScanAttention">0</strong><span>列表复扫</span>
+        </button>
+        <button type="button" data-freshness-filter="detail_missing">
+          <strong id="freshnessDetailMissing">0</strong><span>待补 JD</span>
+        </button>
+        <button type="button" data-freshness-filter="closed">
+          <strong id="freshnessClosed">0</strong><span>明确关闭</span>
+        </button>
+      </section>
+
+      <div class="freshness-workspace">
+        <aside class="refresh-plan-pane" aria-labelledby="refreshPlanHeading">
+          <div class="freshness-section-heading">
+            <div>
+              <p class="section-label">建议批次</p>
+              <h3 id="refreshPlanHeading">下一批先检查</h3>
+            </div>
+            <span>前 10 个</span>
+          </div>
+          <div id="refreshPlan" class="refresh-plan-list">
+            <p class="loading">正在生成刷新顺序...</p>
+          </div>
+          <p class="freshness-boundary">这里只生成离线计划。页面加载不会访问招聘平台，也不会把登录失败或验证码判成岗位关闭。</p>
+        </aside>
+
+        <section class="freshness-inventory" aria-labelledby="freshnessInventoryHeading">
+          <div class="freshness-section-heading inventory-heading">
+            <div>
+              <p class="section-label">证据清单</p>
+              <h3 id="freshnessInventoryHeading">岗位状态</h3>
+            </div>
+            <span id="freshnessVisibleCount">0</span>
+          </div>
+          <div id="freshnessJobList" class="freshness-job-list" aria-live="polite">
+            <p class="loading">正在读取岗位状态...</p>
+          </div>
+        </section>
+      </div>
+      <section class="freshness-tracks" aria-labelledby="roleTrackHeading">
+        <div class="freshness-section-heading">
+          <div>
+            <p class="section-label">公司方向</p>
+            <h3 id="roleTrackHeading">岗位方向是否还在招聘</h3>
+          </div>
+          <span>保留历史岗位与备注</span>
+        </div>
+        <div id="roleTrackList" class="role-track-list" aria-live="polite">
+          <p class="loading">正在整理公司岗位方向...</p>
+        </div>
+      </section>
+      <div class="freshness-error" id="freshnessError" role="alert"></div>
+    </main>
+
     <main class="matching-view" id="matchingView" hidden>
       <header class="matching-header">
         <div>
@@ -346,7 +421,11 @@
           <h2>匹配校准</h2>
           <p id="matchScope">正在读取版本化匹配预览...</p>
         </div>
-        <span id="matchVersion"></span>
+        <div class="matching-header-actions">
+          <span id="matchVersion"></span>
+          <button type="button" class="secondary-action" id="refreshStaleMatchesButton">重算 JD 已变化岗位</button>
+          <span class="save-state" id="refreshStaleMatchesState" role="status"></span>
+        </div>
       </header>
 
       <section class="match-metrics" aria-label="匹配预览概览">
@@ -364,6 +443,9 @@
         </button>
         <button type="button" data-match-filter="changed">
           <strong id="matchConflicts">0</strong><span>新旧判断冲突</span>
+        </button>
+        <button type="button" data-match-filter="stale">
+          <strong id="matchStaleCount">0</strong><span>JD 待重算</span>
         </button>
       </section>
 
@@ -393,6 +475,8 @@
                   <span id="matchRecommendation"></span>
                   <span id="matchInformation"></span>
                   <span id="matchChanged" hidden>判断有变化</span>
+                  <span id="matchStale" hidden>JD 变化，待重算</span>
+                  <span id="matchRefreshChanged" hidden>重算后有变化</span>
                 </div>
                 <h2 id="matchJobTitle"></h2>
                 <p id="matchCompanyLine"></p>
@@ -417,6 +501,31 @@
                 <div><span>旧判断</span><strong id="previousMatch"></strong></div>
                 <span aria-hidden="true">→</span>
                 <div><span>当前判断</span><strong id="currentMatch"></strong></div>
+              </div>
+            </section>
+
+            <section class="refresh-comparison" id="refreshComparison" aria-labelledby="refreshComparisonHeading" hidden>
+              <div class="section-row">
+                <div>
+                  <p class="section-label">本次 JD 重算</p>
+                  <h3 id="refreshComparisonHeading">重算前后</h3>
+                </div>
+                <span id="refreshComparisonMeta"></span>
+              </div>
+              <div class="comparison-line">
+                <div><span>重算前</span><strong id="previousRefreshMatch"></strong></div>
+                <span aria-hidden="true">→</span>
+                <div><span>当前</span><strong id="currentRefreshMatch"></strong></div>
+              </div>
+              <div class="refresh-evidence-changes" id="refreshEvidenceChanges" hidden>
+                <div class="refresh-change-column" id="refreshAddedColumn" hidden>
+                  <h4>JD 新增影响</h4>
+                  <ul id="refreshAddedEvidence"></ul>
+                </div>
+                <div class="refresh-change-column" id="refreshRemovedColumn" hidden>
+                  <h4>JD 移除影响</h4>
+                  <ul id="refreshRemovedEvidence"></ul>
+                </div>
               </div>
             </section>
 

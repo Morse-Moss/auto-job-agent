@@ -20,6 +20,8 @@ const state = {
   selectedMatchPlatform: null,
   matchDetailRequest: 0,
   boundary: null,
+  freshness: null,
+  freshnessFilter: "due",
 };
 
 const labels = {
@@ -62,6 +64,24 @@ const labels = {
     sufficient: "信息较完整",
     partial: "部分信息缺失",
     insufficient: "信息不足",
+  },
+  freshness: {
+    active: "有效",
+    aging: "超过周期",
+    stale: "扫描未见",
+    closed: "明确关闭",
+    inaccessible: "暂不可访问",
+    archived: "已归档",
+    detail_due: "JD 超期",
+    retry_due: "详情重试",
+    scan_attention: "列表复扫",
+    detail_missing: "待补 JD",
+  },
+  roleTracks: {
+    active: "仍在招聘",
+    dormant: "方向沉寂",
+    sunset: "方向停止",
+    archived: "已归档",
   },
 };
 
@@ -138,11 +158,18 @@ const elements = {
   matchDetailEmpty: document.querySelector("#matchDetailEmpty"),
   matchDetailContent: document.querySelector("#matchDetailContent"),
   matchingError: document.querySelector("#matchingError"),
+  refreshStaleMatchesButton: document.querySelector("#refreshStaleMatchesButton"),
+  refreshStaleMatchesState: document.querySelector("#refreshStaleMatchesState"),
   boundaryView: document.querySelector("#boundaryView"),
   boundaryInsights: document.querySelector("#boundaryInsights"),
   boundaryGroups: document.querySelector("#boundaryGroups"),
   boundaryRuleGate: document.querySelector("#boundaryRuleGate"),
   boundaryError: document.querySelector("#boundaryError"),
+  freshnessView: document.querySelector("#freshnessView"),
+  freshnessJobList: document.querySelector("#freshnessJobList"),
+  freshnessVisibleCount: document.querySelector("#freshnessVisibleCount"),
+  refreshPlan: document.querySelector("#refreshPlan"),
+  freshnessError: document.querySelector("#freshnessError"),
 };
 
 async function fetchJson(url, options) {
@@ -689,6 +716,7 @@ function filteredMatches() {
   const jobs = state.matching?.jobs || [];
   if (state.matchFilter === "all") return jobs;
   if (state.matchFilter === "changed") return jobs.filter((job) => job.changed);
+  if (state.matchFilter === "stale") return jobs.filter((job) => job.match_stale);
   return jobs.filter((job) => job.recommendation === state.matchFilter);
 }
 
@@ -700,6 +728,7 @@ function renderMatchQueue() {
     challenge: "挑战投",
     not_fit: "当前不建议投",
     changed: "新旧判断冲突",
+    stale: "JD 待重算",
   };
   document.querySelector("#matchFilterTitle").textContent = filterLabels[state.matchFilter];
   elements.matchVisibleCount.textContent = String(jobs.length);
@@ -731,6 +760,8 @@ function renderMatchQueue() {
       createTextElement("span", "", job.experience_raw || "经验未提供"),
     );
     if (job.changed) meta.append(createTextElement("span", "match-change-flag", "v1→v2"));
+    if (job.match_stale) meta.append(createTextElement("span", "match-change-flag", "JD 待重算"));
+    if (job.refresh_changed) meta.append(createTextElement("span", "match-change-flag", "重算有变化"));
     button.append(top, title, company, meta);
     button.addEventListener("click", () => selectMatch(job.job_id, job.platform));
     elements.matchJobList.append(button);
@@ -743,20 +774,21 @@ function renderMatchingDashboard(dashboard) {
   if (!snapshot) {
     document.querySelector("#matchScope").textContent = dashboard.empty_message || "尚未生成匹配预览。";
     document.querySelector("#matchVersion").textContent = "";
-    ["matchTotal", "matchPriority", "matchChallenge", "matchNotFit", "matchConflicts"]
+    ["matchTotal", "matchPriority", "matchChallenge", "matchNotFit", "matchConflicts", "matchStaleCount"]
       .forEach((id) => { document.querySelector(`#${id}`).textContent = "0"; });
     renderMatchQueue();
     elements.matchDetailEmpty.querySelector("strong").textContent = "尚未生成 v2 匹配预览";
     elements.matchDetailEmpty.querySelector("span").textContent = dashboard.empty_message || "请先生成本地预览。";
     return;
   }
-  document.querySelector("#matchScope").textContent = `${snapshot.profile_id} · ${snapshot.total} 个岗位 · ${snapshot.insufficient} 个信息不足`;
+  document.querySelector("#matchScope").textContent = `${snapshot.profile_id} · ${snapshot.total} 个岗位 · ${snapshot.insufficient} 个信息不足 · ${snapshot.recently_refreshed || 0} 条有重算记录`;
   document.querySelector("#matchVersion").textContent = `${snapshot.analysis_version} / ${snapshot.profile_version}`;
   document.querySelector("#matchTotal").textContent = String(snapshot.total);
   document.querySelector("#matchPriority").textContent = String(snapshot.priority);
   document.querySelector("#matchChallenge").textContent = String(snapshot.challenge);
   document.querySelector("#matchNotFit").textContent = String(snapshot.not_fit);
   document.querySelector("#matchConflicts").textContent = String(snapshot.conflicts);
+  document.querySelector("#matchStaleCount").textContent = String(snapshot.stale || 0);
   renderMatchQueue();
 }
 
@@ -783,6 +815,34 @@ function renderEvidenceCards(containerId, values, emptyText) {
   });
 }
 
+function renderRefreshComparison(comparison) {
+  const container = document.querySelector("#refreshEvidenceChanges");
+  const addedColumn = document.querySelector("#refreshAddedColumn");
+  const removedColumn = document.querySelector("#refreshRemovedColumn");
+  const addedList = document.querySelector("#refreshAddedEvidence");
+  const removedList = document.querySelector("#refreshRemovedEvidence");
+  if (!container || !addedColumn || !removedColumn || !addedList || !removedList) return;
+  const added = [
+    ...(comparison?.hard_requirements_added || []).map((item) => `硬门槛：${item.label || item.id}`),
+    ...(comparison?.gaps_added || []).map((item) => `能力缺口：${item.label || item.id}`),
+    ...(comparison?.uncertainties_added || []).map((item) => `待确认：${item}`),
+  ];
+  const removed = [
+    ...(comparison?.hard_requirements_removed || []).map((item) => `硬门槛：${item.label || item.id}`),
+    ...(comparison?.gaps_removed || []).map((item) => `能力缺口：${item.label || item.id}`),
+    ...(comparison?.uncertainties_removed || []).map((item) => `待确认：${item}`),
+  ];
+  const renderList = (list, values) => {
+    list.replaceChildren();
+    values.forEach((value) => list.append(createTextElement("li", "", value)));
+  };
+  renderList(addedList, added);
+  renderList(removedList, removed);
+  addedColumn.hidden = !added.length;
+  removedColumn.hidden = !removed.length;
+  container.hidden = !(added.length || removed.length);
+}
+
 function renderMatchDetail(match) {
   elements.matchDetailEmpty.hidden = true;
   elements.matchDetailContent.hidden = false;
@@ -794,6 +854,28 @@ function renderMatchDetail(match) {
   information.className = `information-label ${match.information_status}`;
   information.textContent = labels.information[match.information_status] || match.information_status;
   document.querySelector("#matchChanged").hidden = !match.changed;
+  document.querySelector("#matchStale").hidden = !match.match_stale;
+  document.querySelector("#matchRefreshChanged").hidden = !match.refresh_changed;
+  const refreshComparison = document.querySelector("#refreshComparison");
+  const previousRefreshMatch = document.querySelector("#previousRefreshMatch");
+  const currentRefreshMatch = document.querySelector("#currentRefreshMatch");
+  const refreshComparisonMeta = document.querySelector("#refreshComparisonMeta");
+  if (match.previous_match) {
+    const previous = match.previous_match;
+    refreshComparison.hidden = false;
+    previousRefreshMatch.textContent = `${labels.recommendations[previous.recommendation] || previous.recommendation} · ${previous.score} 分`;
+    currentRefreshMatch.textContent = `${labels.recommendations[match.recommendation] || match.recommendation} · ${match.score} 分`;
+    refreshComparisonMeta.textContent = previous.captured_at
+      ? `重算于 ${formatFreshnessTime(previous.captured_at)}`
+      : "";
+    renderRefreshComparison(match.refresh_comparison);
+  } else {
+    refreshComparison.hidden = true;
+    previousRefreshMatch.textContent = "";
+    currentRefreshMatch.textContent = "";
+    refreshComparisonMeta.textContent = "";
+    renderRefreshComparison(null);
+  }
   document.querySelector("#matchJobTitle").textContent = match.title || "未命名岗位";
   document.querySelector("#matchCompanyLine").textContent = match.company || "公司信息缺失";
   document.querySelector("#matchScore").textContent = String(match.score ?? 0);
@@ -880,6 +962,30 @@ async function loadMatchingDashboard() {
     }
   } catch (error) {
     elements.matchingError.textContent = `${error.message} 请确认本地匹配预览已经生成。`;
+  }
+}
+
+async function refreshStaleMatches() {
+  if (!elements.refreshStaleMatchesButton) return;
+  elements.refreshStaleMatchesButton.disabled = true;
+  elements.refreshStaleMatchesState.textContent = "正在重算...";
+  elements.matchingError.textContent = "";
+  try {
+    const result = await fetchJson("/api/matches/refresh-stale", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ limit: 20 }),
+    });
+    elements.refreshStaleMatchesState.textContent = result.refreshed
+      ? `已重算 ${result.refreshed} 条，剩余 ${result.remaining} 条`
+      : "没有可重算岗位";
+    state.matching = null;
+    await loadMatchingDashboard();
+  } catch (error) {
+    elements.refreshStaleMatchesState.textContent = "";
+    elements.matchingError.textContent = `${error.message} 当前匹配结果未改变。`;
+  } finally {
+    elements.refreshStaleMatchesButton.disabled = false;
   }
 }
 
@@ -1041,17 +1147,185 @@ async function loadBoundaryDashboard(force = false) {
   }
 }
 
+function formatFreshnessTime(value) {
+  if (!value) return "尚未检查";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function filteredFreshnessJobs() {
+  const jobs = state.freshness?.jobs || [];
+  if (state.freshnessFilter === "all") return jobs;
+  if (["detail_due", "retry_due", "scan_attention", "detail_missing"].includes(state.freshnessFilter)) {
+    return jobs.filter((job) => job.refresh_attention === state.freshnessFilter);
+  }
+  if (state.freshnessFilter === "closed") {
+    return jobs.filter((job) => ["closed", "archived"].includes(job.lifecycle_state));
+  }
+  return jobs.filter((job) => job.lifecycle_state === state.freshnessFilter);
+}
+
+function createFreshnessStatus(job) {
+  return createTextElement(
+    "span",
+    `freshness-status ${job.lifecycle_state}`,
+    labels.freshness[job.lifecycle_state] || job.lifecycle_state,
+  );
+}
+
+function freshnessAction(job) {
+  return {
+    detail_due: "重新获取详情",
+    retry_due: "重试详情",
+    scan_attention: "重新扫描列表",
+    detail_missing: "补采完整 JD",
+  }[job.refresh_attention] || "无需动作";
+}
+
+function renderRefreshPlan(plan) {
+  elements.refreshPlan.replaceChildren();
+  plan.slice(0, 10).forEach((job, index) => {
+    const row = document.createElement("article");
+    row.className = "refresh-plan-item";
+    const number = createTextElement("span", "refresh-plan-number", String(index + 1).padStart(2, "0"));
+    const body = document.createElement("div");
+    const heading = document.createElement("div");
+    heading.className = "refresh-plan-heading";
+    heading.append(createTextElement("h4", "", job.title || "未命名岗位"), createFreshnessStatus(job));
+    body.append(
+      heading,
+      createTextElement("p", "", `${job.company || "公司信息缺失"} · ${freshnessAction(job)}`),
+      createTextElement("small", "", `距最近有效证据 ${job.age_days} 天 · 建议周期 ${job.ttl_days} 天`),
+    );
+    row.append(number, body);
+    elements.refreshPlan.append(row);
+  });
+  if (!plan.length) {
+    elements.refreshPlan.append(createTextElement("p", "list-empty", "还没有可安排的岗位。"));
+  }
+}
+
+function renderFreshnessJobs() {
+  const jobs = filteredFreshnessJobs();
+  elements.freshnessVisibleCount.textContent = `${jobs.length} 个`;
+  elements.freshnessJobList.replaceChildren();
+  jobs.forEach((job) => {
+    const row = document.createElement("article");
+    row.className = "freshness-job-item";
+    const heading = document.createElement("div");
+    heading.className = "freshness-job-heading";
+    const title = document.createElement("div");
+    title.append(
+      createTextElement("h4", "", job.title || "未命名岗位"),
+      createTextElement("p", "", job.company || "公司信息缺失"),
+    );
+    heading.append(title, createFreshnessStatus(job));
+    if (job.scan_state && job.scan_state !== "listed") {
+      heading.append(createTextElement("span", `freshness-scan ${job.scan_state}`,
+        job.scan_state === "likely_closed" ? "连续两轮未见" : "本轮未见"));
+    }
+
+    const evidence = document.createElement("dl");
+    evidence.className = "freshness-evidence";
+    [
+      ["最近 JD 证据", job.has_detail
+        ? formatFreshnessTime(job.last_success_at || job.collected_at)
+        : "尚未采集完整 JD"],
+      ["刷新周期", `${job.ttl_days} 天`],
+      ["当前间隔", `${job.age_days} 天`],
+      ["下一步", freshnessAction(job)],
+    ].forEach(([name, value]) => {
+      const wrapper = document.createElement("div");
+      wrapper.append(createTextElement("dt", "", name), createTextElement("dd", "", value));
+      evidence.append(wrapper);
+    });
+    row.append(heading, evidence);
+    if (job.last_error) row.append(createTextElement("p", "freshness-last-error", job.last_error));
+    if (job.source_url) {
+      const source = document.createElement("a");
+      source.className = "freshness-source-link";
+      source.href = job.source_url;
+      source.target = "_blank";
+      source.rel = "noreferrer";
+      source.textContent = "查看原职位";
+      row.append(source);
+    }
+    elements.freshnessJobList.append(row);
+  });
+  if (!jobs.length) {
+    elements.freshnessJobList.append(createTextElement("p", "list-empty", "这个状态下没有岗位。"));
+  }
+}
+
+function renderRoleTracks(roleTracks) {
+  const container = document.querySelector("#roleTrackList");
+  if (!container) return;
+  container.replaceChildren();
+  (roleTracks?.tracks || []).forEach((track) => {
+    const row = document.createElement("article");
+    row.className = "role-track-item";
+    const heading = document.createElement("div");
+    heading.className = "role-track-heading";
+    heading.append(
+      createTextElement("h4", "", `${track.company_name || "未知公司"} · ${track.role_family}`),
+      createTextElement("span", `role-track-status ${track.status}`,
+        labels.roleTracks[track.status] || track.status),
+    );
+    row.append(heading, createTextElement("p", "", `${track.job_count} 个历史岗位 · ${track.closed_job_count} 个已明确关闭`));
+    if (track.age_days != null) row.append(createTextElement("small", "", `最近出现 ${track.age_days} 天前`));
+    container.append(row);
+  });
+  if (!(roleTracks?.tracks || []).length) container.append(createTextElement("p", "list-empty", "还没有公司岗位方向记录。"));
+}
+
+function renderFreshnessDashboard(dashboard) {
+  state.freshness = dashboard;
+  const summary = dashboard.summary || {};
+  document.querySelector("#freshnessTotal").textContent = String(summary.total || 0);
+  document.querySelector("#freshnessDetailDue").textContent = String(summary.detail_due || 0);
+  document.querySelector("#freshnessRetryDue").textContent = String(summary.retry_due || 0);
+  document.querySelector("#freshnessScanAttention").textContent = String(summary.scan_attention || 0);
+  document.querySelector("#freshnessDetailMissing").textContent = String(summary.detail_missing || 0);
+  document.querySelector("#freshnessClosed").textContent = String((summary.closed || 0) + (summary.archived || 0));
+  document.querySelector("#freshnessScope").textContent = `${summary.live || 0} 个岗位仍在实时范围，${summary.due || 0} 个有明确下一步`;
+  document.querySelector("#freshnessAsOf").textContent = `截至 ${formatFreshnessTime(summary.as_of)}`;
+  renderRefreshPlan(dashboard.refresh_plan || []);
+  renderFreshnessJobs();
+  renderRoleTracks(dashboard.role_tracks || {});
+}
+
+async function loadFreshnessDashboard(force = false) {
+  elements.freshnessError.textContent = "";
+  if (state.freshness && !force) {
+    renderFreshnessDashboard(state.freshness);
+    return;
+  }
+  try {
+    renderFreshnessDashboard(await fetchJson("/api/freshness"));
+  } catch (error) {
+    elements.freshnessError.textContent = `${error.message} 请确认本地岗位数据库可读。`;
+  }
+}
+
 async function switchView(view) {
   state.view = view;
   const calibration = view === "calibration";
   const learning = view === "learning";
   const matching = view === "matching";
   const boundary = view === "boundary";
+  const freshness = view === "freshness";
   elements.calibrationView.hidden = !calibration;
-  elements.reviewView.hidden = calibration || learning || matching || boundary;
+  elements.reviewView.hidden = calibration || learning || matching || boundary || freshness;
   elements.learningView.hidden = !learning;
   elements.matchingView.hidden = !matching;
   elements.boundaryView.hidden = !boundary;
+  elements.freshnessView.hidden = !freshness;
   document.querySelectorAll("[data-view-target]").forEach((button) => {
     const active = button.dataset.viewTarget === view;
     button.classList.toggle("active", active);
@@ -1061,6 +1335,7 @@ async function switchView(view) {
   if (learning) await loadLearningDashboard();
   if (matching) await loadMatchingDashboard();
   if (boundary) await loadBoundaryDashboard();
+  if (freshness) await loadFreshnessDashboard();
 }
 
 function renderQueue() {
@@ -1362,6 +1637,16 @@ document.querySelector(".view-tabs").addEventListener("click", (event) => {
   if (button) switchView(button.dataset.viewTarget);
 });
 
+document.querySelector(".freshness-metrics").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-freshness-filter]");
+  if (!button) return;
+  state.freshnessFilter = button.dataset.freshnessFilter;
+  document.querySelectorAll("[data-freshness-filter]").forEach((item) => {
+    item.classList.toggle("active", item === button);
+  });
+  renderFreshnessJobs();
+});
+
 elements.noteSignals.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-job-id]");
   if (!button) return;
@@ -1402,6 +1687,7 @@ document.querySelector("#openReviewJob").addEventListener("click", (event) => {
 elements.decisionForm.addEventListener("submit", saveDecision);
 elements.correctionForm.addEventListener("submit", saveCorrection);
 elements.preferenceForm.addEventListener("submit", savePreferences);
+elements.refreshStaleMatchesButton?.addEventListener("click", refreshStaleMatches);
 elements.preferenceTrackOptions.addEventListener("change", syncPreferenceTrackState);
 document.querySelectorAll('[name="interest"]').forEach((input) => input.addEventListener("change", updateSaveAction));
 document.querySelector("#quickReject").addEventListener("click", () => {

@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import urllib.parse
 from dataclasses import dataclass
+from collections.abc import Iterable
 
 from playwright.sync_api import TimeoutError as PWTimeout
 from playwright.sync_api import sync_playwright
@@ -38,6 +39,7 @@ class CollectionResult:
     total: int
     status: str
     error: str | None = None
+    scanned_sources: int = 0
 
 
 class BossCollector:
@@ -135,6 +137,270 @@ class BossCollector:
             error=error,
         )
 
+    @staticmethod
+    def _bounded_job_ids(job_ids: Iterable[str], max_jobs: int = 20) -> list[str]:
+        limit = max(0, int(max_jobs))
+        if limit == 0:
+            return []
+        result: list[str] = []
+        seen: set[str] = set()
+        for value in job_ids:
+            job_id = str(value or "").strip()
+            if not job_id or job_id in seen:
+                continue
+            seen.add(job_id)
+            result.append(job_id)
+            if len(result) >= limit:
+                break
+        return result
+
+    def refresh(self, job_ids: Iterable[str], max_jobs: int = 20) -> CollectionResult:
+        """Refresh a bounded list of existing details through the read-only Boss page."""
+        selected = self._bounded_job_ids(job_ids, max_jobs=max_jobs)
+        run_id = self.store.start_run(target_count=len(selected), source="boss-refresh")
+        if not selected:
+            self.store.finish_run(run_id, "sample_completed", records_collected=0)
+            return CollectionResult(run_id, 0, self.store.detail_inventory_count(), "sample_completed")
+
+        status = "stopped"
+        error: str | None = None
+        refreshed = 0
+        own_pages = []
+        original_page = None
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.connect_over_cdp(
+                    self.boss_cfg.get("cdp_endpoint", "http://127.0.0.1:17332"),
+                    timeout=15_000,
+                )
+                if not browser.contexts:
+                    raise RuntimeError("CDP 浏览器没有可用的 BrowserContext")
+                context = browser.contexts[0]
+                try:
+                    original_page = next(
+                        (
+                            page
+                            for page in context.pages
+                            if "zhipin.com" in (page.url or "")
+                            and not BossPlatform._is_security_url(page.url)
+                        ),
+                        None,
+                    )
+                    detail_page = context.new_page()
+                    own_pages.append(detail_page)
+                    self._navigate(detail_page, BASE_URL)
+                    self._require_login(detail_page)
+                    if original_page:
+                        original_page.bring_to_front()
+
+                    for job_id in selected:
+                        row = self.store.get_detail(job_id)
+                        if row is None:
+                            continue
+                        job = dict(row)
+                        job["source"] = "boss-refresh"
+                        job["source_key"] = job.get("source_key") or "refresh"
+                        job["jd"] = job.get("jd_text") or ""
+                        try:
+                            detail = self._load_detail_page(detail_page, job)
+                            detail_status = detail.pop("_detail_status", "collected")
+                            message = detail.pop("_detail_message", "")
+                            if detail_status == "closed":
+                                detail["jd"] = job.get("jd_text") or ""
+                                self.store.save_observation(detail, run_id)
+                                self.store.save_detail(
+                                    detail,
+                                    run_id,
+                                    detail_status="closed",
+                                    error=message,
+                                )
+                            else:
+                                if not (detail.get("jd") or "").strip():
+                                    raise RuntimeError("JD text is empty")
+                                self.store.save_observation(detail, run_id)
+                                self.store.save_detail(detail, run_id)
+                            refreshed += 1
+                        except BossSecurityCheck:
+                            raise
+                        except Exception as exc:
+                            self.store.save_failure(
+                                job,
+                                run_id,
+                                f"{type(exc).__name__}: {exc}",
+                            )
+                        self._wait(detail_page, self._refresh_delay())
+                    status = "completed"
+                finally:
+                    for page in reversed(own_pages):
+                        try:
+                            page.close()
+                        except Exception:
+                            pass
+                    if original_page:
+                        try:
+                            original_page.bring_to_front()
+                        except Exception:
+                            pass
+        except BossSecurityCheck as exc:
+            status = "security_check"
+            error = str(exc)
+        except Exception as exc:
+            status = "stopped"
+            error = f"{type(exc).__name__}: {exc}"
+
+        self.store.finish_run(run_id, status, error, records_collected=refreshed)
+        return CollectionResult(
+            run_id=run_id,
+            collected=refreshed,
+            total=self.store.detail_inventory_count(),
+            status=status,
+            error=error,
+        )
+
+    def scan_coverage(
+        self,
+        source: str = "all",
+        max_pages: int = 10,
+        max_sources: int | None = None,
+    ) -> CollectionResult:
+        """Scan result lists only and record missing jobs after complete source scans."""
+        run_id = self.store.start_run(target_count=0, source="boss-scan-coverage")
+        own_pages = []
+        original_page = None
+        status = "stopped"
+        error: str | None = None
+        scanned_sources = 0
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.connect_over_cdp(
+                    self.boss_cfg.get("cdp_endpoint", "http://127.0.0.1:17332"),
+                    timeout=15_000,
+                )
+                if not browser.contexts:
+                    raise RuntimeError("CDP 浏览器没有可用的 BrowserContext")
+                context = browser.contexts[0]
+                original_page = next(
+                    (page for page in context.pages if "zhipin.com" in (page.url or "")
+                     and not BossPlatform._is_security_url(page.url)),
+                    None,
+                )
+                list_page = context.new_page()
+                own_pages.append(list_page)
+                if source in ("all", "favorites"):
+                    scanned_sources += self._scan_favorites_coverage(list_page, run_id, max_pages)
+                if source in ("all", "search"):
+                    scanned_sources += self._scan_search_coverage(
+                        list_page, run_id, max_pages, max_sources=max_sources
+                    )
+                status = "completed"
+        except BossSecurityCheck as exc:
+            status, error = "security_check", str(exc)
+        except Exception as exc:
+            status, error = "stopped", f"{type(exc).__name__}: {exc}"
+        finally:
+            for page in reversed(own_pages):
+                try:
+                    page.close()
+                except Exception:
+                    pass
+            if original_page:
+                try:
+                    original_page.bring_to_front()
+                except Exception:
+                    pass
+        self.store.finish_run(run_id, status, error, records_collected=0)
+        return CollectionResult(
+            run_id, 0, self.store.detail_inventory_count(), status, error, scanned_sources
+        )
+
+    def _scan_favorites_coverage(self, page, run_id: str, max_pages: int) -> int:
+        self._navigate(page, FAVORITES_URL)
+        self._require_login(page)
+        favorite_tab = page.locator(FAVORITE_TAB)
+        favorite_tab.wait_for(state="visible", timeout=15_000)
+        if "current" not in (favorite_tab.get_attribute("class") or ""):
+            favorite_tab.click()
+            self._wait(page, self._navigation_delay())
+        seen_ids: set[str] = set()
+        page_number = 1
+        while page_number <= max_pages:
+            BossPlatform._assert_page_safe(page)
+            cards = page.locator(FAVORITE_CARD)
+            cards.first.wait_for(state="visible", timeout=15_000)
+            count = cards.count()
+            for index in range(count):
+                job = self._favorite_card(cards.nth(index), page_number)
+                if job.get("job_id"):
+                    seen_ids.add(str(job["job_id"]))
+                    self.store.save_observation(job, run_id)
+            next_button = page.locator(".options-pages a:has(i.ui-icon-arrow-right)").last
+            if next_button.count() == 0 or "disabled" in (next_button.get_attribute("class") or ""):
+                self.store.finalize_scan("favorites", seen_ids, run_id)
+                return 1
+            previous_first = self._first_job_id(cards)
+            next_button.click()
+            self._wait(page, self._navigation_delay())
+            if self._first_job_id(page.locator(FAVORITE_CARD)) == previous_first:
+                raise RuntimeError("Favorites pagination did not advance")
+            page_number += 1
+        return 0
+
+    def _scan_search_coverage(
+        self,
+        page,
+        run_id: str,
+        max_pages: int,
+        *,
+        max_sources: int | None = None,
+    ) -> int:
+        keywords = self.collection_cfg.get("keywords") or self.boss_cfg.get("keywords") or []
+        cities = self.collection_cfg.get("cities") or [self.boss_cfg.get("city", "上海")]
+        max_jobs = int(self.collection_cfg.get("max_jobs_per_source", 45))
+        scanned = 0
+        attempted = 0
+        for city in cities:
+            city_code = CITY_CODES.get(city)
+            if not city_code:
+                continue
+            for keyword in keywords:
+                if max_sources is not None and attempted >= max_sources:
+                    return scanned
+                attempted += 1
+                source_key = f"search:{city}:{keyword}"
+                url = f"{BASE_URL}/web/geek/jobs?query={urllib.parse.quote(str(keyword))}&city={city_code}"
+                self._navigate(page, url)
+                self._require_login(page)
+                seen_ids: set[str] = set()
+                completed = False
+                for page_number in range(1, max_pages + 1):
+                    BossPlatform._assert_page_safe(page)
+                    cards = page.locator(SELECTORS["job_card"])
+                    try:
+                        cards.first.wait_for(state="visible", timeout=15_000)
+                    except PWTimeout:
+                        BossPlatform._assert_page_safe(page)
+                        completed = True
+                        break
+                    count = min(cards.count(), max_jobs)
+                    for index in range(count):
+                        job = self._search_card(cards.nth(index), city, str(keyword), index)
+                        if job.get("job_id"):
+                            seen_ids.add(str(job["job_id"]))
+                            self.store.save_observation(job, run_id)
+                    next_button = page.locator(".options-pages a:has(i.ui-icon-arrow-right)").last
+                    if next_button.count() == 0 or "disabled" in (next_button.get_attribute("class") or ""):
+                        completed = True
+                        break
+                    previous_first = self._first_job_id(cards)
+                    next_button.click()
+                    self._wait(page, self._navigation_delay())
+                    if self._first_job_id(page.locator(SELECTORS["job_card"])) == previous_first:
+                        raise RuntimeError("Search pagination did not advance")
+                if completed:
+                    self.store.finalize_scan(source_key, seen_ids, run_id)
+                    scanned += 1
+        return scanned
+
     def _collect_favorites(self, list_page, detail_page, run_id: str, target: int) -> None:
         self._navigate(list_page, FAVORITES_URL)
         self._require_login(list_page)
@@ -145,6 +411,7 @@ class BossCollector:
             self._wait(list_page, self._navigation_delay())
 
         page_number = 1
+        seen_ids: set[str] = set()
         while self.store.detail_inventory_count() < target:
             BossPlatform._assert_page_safe(list_page)
             cards = list_page.locator(FAVORITE_CARD)
@@ -159,6 +426,7 @@ class BossCollector:
                 job = self._favorite_card(card, page_number)
                 if not job.get("job_id"):
                     continue
+                seen_ids.add(str(job["job_id"]))
                 self.store.save_observation(job, run_id)
                 self.store.update_cursor(source_key, page_number, index, "running")
                 if self.store.has_collected_detail(job["job_id"]):
@@ -178,6 +446,7 @@ class BossCollector:
                 next_button.get_attribute("class") or ""
             ):
                 self.store.update_cursor(source_key, page_number, count, "exhausted")
+                self.store.finalize_scan(source_key, seen_ids, run_id)
                 return
             previous_first = self._first_job_id(cards)
             next_button.click()
@@ -215,6 +484,7 @@ class BossCollector:
                     continue
 
                 count = min(cards.count(), max_jobs)
+                seen_ids: set[str] = set()
                 for index in range(count):
                     if self.store.detail_inventory_count() >= target:
                         return
@@ -222,6 +492,7 @@ class BossCollector:
                     job = self._search_card(card, city, str(keyword), index)
                     if not job.get("job_id"):
                         continue
+                    seen_ids.add(str(job["job_id"]))
                     self.store.save_observation(job, run_id)
                     self.store.update_cursor(source_key, 1, index, "running")
                     if self.store.has_collected_detail(job["job_id"]):
@@ -234,6 +505,7 @@ class BossCollector:
                     if self.store.detail_inventory_count() < target:
                         self._wait(page, self._detail_delay())
                 self.store.update_cursor(source_key, 1, count, "exhausted")
+                self.store.finalize_scan(source_key, seen_ids, run_id)
 
     def _collect_one(self, job: dict, run_id: str, loader) -> None:
         try:
@@ -268,6 +540,12 @@ class BossCollector:
             BossPlatform._assert_page_safe(page)
         self._wait(page, self._detail_settle_delay())
         return self._detail_result(page, job, payload)
+
+    def _refresh_delay(self):
+        return self.collection_cfg.get(
+            "detail_delay_range_seconds",
+            self.collection_cfg.get("refresh_delay_range_seconds", [12, 20]),
+        )
 
     def _load_search_detail(self, page, card, job: dict) -> dict:
         payload = None
@@ -305,6 +583,12 @@ class BossCollector:
             result["detail_text"] = page.locator("body").inner_text(timeout=5_000)[:30_000]
         except PWTimeout:
             result["detail_text"] = ""
+        body_text = str(result.get("detail_text") or "")
+        closed_markers = ("职位已关闭", "职位不存在", "该职位已下线", "招聘已结束")
+        marker = next((value for value in closed_markers if value in body_text), "")
+        if marker:
+            result["_detail_status"] = "closed"
+            result["_detail_message"] = marker
         return result
 
     @staticmethod

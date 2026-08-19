@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from jobagent.freshness import live_job_condition, migrate_freshness_schema, sync_legacy_freshness
+
 
 @dataclass(frozen=True)
 class SalaryInfo:
@@ -284,12 +286,14 @@ def run_analysis(db_path: str | Path, output_dir: str | Path) -> AnalysisResult:
     target.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(database)
     connection.row_factory = sqlite3.Row
+    migrate_freshness_schema(connection)
+    sync_legacy_freshness(connection)
     _create_analysis_table(connection)
     connection.execute("DELETE FROM job_positioning_analysis")
     rows = [
         dict(row)
         for row in connection.execute(
-            "SELECT * FROM job_details WHERE detail_status = 'collected'"
+            f"SELECT * FROM job_details WHERE detail_status = 'collected' AND {live_job_condition('job_details')}"
         )
     ]
     analyzed_at = _now()

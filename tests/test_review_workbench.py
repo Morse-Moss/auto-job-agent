@@ -397,6 +397,24 @@ class ReviewMigrationTests(unittest.TestCase):
 
 
 class DecisionPersistenceTests(unittest.TestCase):
+    def test_revising_decision_preserves_previous_note_in_history(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "jobs.db"
+            create_fixture_db(db_path)
+            store = ReviewStore(db_path)
+            try:
+                store.ensure_sample("positioning-v1", quotas={"favorites": 1})
+                job_id = store.list_jobs()[0]["job_id"]
+                store.save_decision(job_id, {"interest": "maybe", "note": "先补 RAG"})
+                store.save_decision(job_id, {"interest": "want", "note": "能力已补齐"})
+                history = store.conn.execute(
+                    "SELECT interest, note FROM job_decision_history WHERE job_id = ? ORDER BY id",
+                    (job_id,),
+                ).fetchall()
+                self.assertEqual([tuple(row) for row in history], [("maybe", "先补 RAG")])
+            finally:
+                store.close()
+
     def test_reject_decision_needs_only_interest(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "jobs.db"
@@ -1033,6 +1051,73 @@ class ReviewApiTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=2)
 
+    def test_freshness_api_returns_read_only_inventory_and_refresh_plan(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "jobs.db"
+            create_fixture_db(db_path)
+            server = create_server(db_path, host="127.0.0.1", port=0)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with urlopen(
+                    f"http://127.0.0.1:{server.server_port}/api/freshness"
+                ) as response:
+                    payload = json.load(response)
+                self.assertEqual(payload["summary"]["total"], 24)
+                self.assertEqual(len(payload["jobs"]), 24)
+                self.assertEqual(len(payload["refresh_plan"]), 24)
+                self.assertTrue(payload["role_tracks"]["tracks"])
+                self.assertIn("scan_state", payload["jobs"][0])
+                self.assertIn(payload["jobs"][0]["lifecycle_state"], {"active", "aging"})
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_freshness_api_includes_observation_only_inventory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "jobs.db"
+            create_fixture_db(db_path)
+            connection = sqlite3.connect(db_path)
+            connection.execute(
+                """
+                CREATE TABLE job_observations (
+                  platform TEXT NOT NULL, job_id TEXT NOT NULL, source TEXT NOT NULL,
+                  source_run_id TEXT NOT NULL, source_page INTEGER NOT NULL,
+                  source_url TEXT NOT NULL, title TEXT, location TEXT, salary_raw TEXT,
+                  experience_raw TEXT, education_raw TEXT, company TEXT, industry TEXT,
+                  financing TEXT, company_size TEXT, recruiter_name TEXT,
+                  recruiter_role TEXT, card_text TEXT, collected_at TEXT NOT NULL,
+                  PRIMARY KEY(platform, job_id)
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO job_observations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "boss", "card-only", "boss-search", "scan-1", 1,
+                    "https://example.invalid/card-only", "卡片岗位", "上海", "20-30K",
+                    "1-3年", "本科", "公司", "人工智能", "A轮", "20-99人", "HR",
+                    "招聘", "卡片岗位", "2026-08-18T00:00:00+08:00",
+                ),
+            )
+            connection.commit()
+            connection.close()
+            server = create_server(db_path, host="127.0.0.1", port=0)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with urlopen(f"http://127.0.0.1:{server.server_port}/api/freshness") as response:
+                    payload = json.load(response)
+                self.assertEqual(payload["summary"]["total"], 25)
+                self.assertEqual(payload["summary"]["detail_missing"], 1)
+                card = next(job for job in payload["jobs"] if job["job_id"] == "card-only")
+                self.assertEqual(card["refresh_attention"], "detail_missing")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
     def test_boundary_api_is_read_only_and_returns_calibration_report(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "jobs.db"
@@ -1332,6 +1417,30 @@ class ReviewUiContractTests(unittest.TestCase):
         self.assertIn("renderLearningDashboard", script)
         self.assertIn("company_profile", script)
 
+    def test_ui_exposes_read_only_freshness_governance_view(self):
+        page = (PROJECT_ROOT / "review_ui" / "index.html").read_text(encoding="utf-8")
+        script = (PROJECT_ROOT / "review_ui" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("更新监管", page)
+        self.assertIn('id="freshnessView"', page)
+        self.assertIn('id="freshnessJobList"', page)
+        self.assertIn('id="roleTrackList"', page)
+        self.assertIn("/api/freshness", script)
+        self.assertIn("renderRoleTracks", script)
+        self.assertIn("renderFreshnessDashboard", script)
+        self.assertIn('id="freshnessDetailDue"', page)
+        self.assertIn('id="freshnessRetryDue"', page)
+        self.assertIn('id="freshnessScanAttention"', page)
+        self.assertIn('id="freshnessDetailMissing"', page)
+        self.assertIn('data-freshness-filter="detail_due"', page)
+        self.assertIn('data-freshness-filter="retry_due"', page)
+        self.assertIn('data-freshness-filter="scan_attention"', page)
+        self.assertIn('data-freshness-filter="detail_missing"', page)
+        self.assertIn("重试详情", script)
+        self.assertIn("重新扫描列表", script)
+        self.assertIn("补采完整 JD", script)
+        self.assertNotIn('fetchJson("/api/freshness", {', script)
+
     def test_ui_exposes_versioned_match_calibration_view(self):
         page = (PROJECT_ROOT / "review_ui" / "index.html").read_text(encoding="utf-8")
         script = (PROJECT_ROOT / "review_ui" / "app.js").read_text(encoding="utf-8")
@@ -1345,6 +1454,19 @@ class ReviewUiContractTests(unittest.TestCase):
         self.assertIn("renderMatchDetail", script)
         self.assertIn("information_status", script)
         self.assertIn("previous_fit_tier", script)
+        self.assertIn('id="matchStale"', page)
+        self.assertIn('data-match-filter="stale"', page)
+        self.assertIn("JD 变化，待重算", page)
+        self.assertIn("match_stale", script)
+        self.assertIn('id="matchRefreshChanged"', page)
+        self.assertIn('id="refreshComparison"', page)
+        self.assertIn('id="refreshEvidenceChanges"', page)
+        self.assertIn("previous_match", script)
+        self.assertIn("hard_requirements_added", script)
+        self.assertIn("renderRefreshComparison", script)
+        self.assertIn("重算前", page)
+        self.assertIn('id="refreshStaleMatchesButton"', page)
+        self.assertIn("/api/matches/refresh-stale", script)
 
     def test_ui_exposes_boundary_calibration_report(self):
         page = (PROJECT_ROOT / "review_ui" / "index.html").read_text(encoding="utf-8")

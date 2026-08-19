@@ -86,6 +86,113 @@ class CollectionStoreTests(unittest.TestCase):
             self.assertEqual(store.detail_inventory_count(), 2)
             store.close()
 
+    def test_failed_refresh_preserves_last_successful_jd(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = CollectionStore(Path(temp_dir) / "jobs.db")
+            run_id = store.start_run(target_count=1)
+            job = {
+                "platform": "boss",
+                "source": "boss-search",
+                "source_key": "search:上海:AI Agent",
+                "source_page": 1,
+                "job_id": "stable-job",
+                "source_url": "https://example.invalid/stable-job",
+                "title": "Stable",
+                "company": "Example",
+                "jd": "原始 JD 正文",
+            }
+            store.save_detail(job, run_id)
+            store.save_failure({**job, "jd": ""}, run_id, "CAPTCHA required")
+            detail = store.get_detail("stable-job")
+            self.assertEqual(detail["jd_text"], "原始 JD 正文")
+            self.assertEqual(detail["detail_status"], "failed")
+            store.close()
+
+    def test_finalize_scan_marks_inventory_jobs_missing_from_source(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = CollectionStore(Path(temp_dir) / "jobs.db")
+            run_id = store.start_run(target_count=1)
+            base = {
+                "platform": "boss",
+                "source": "boss-search",
+                "source_key": "search:上海:AI Agent",
+                "source_page": 1,
+                "company": "Example",
+            }
+            store.save_detail({**base, "job_id": "still-listed", "source_url": "https://example.invalid/1", "title": "Listed", "jd": "JD"}, run_id)
+            store.save_detail({**base, "job_id": "missing", "source_url": "https://example.invalid/2", "title": "Missing", "jd": "JD"}, run_id)
+            store.finalize_scan(base["source_key"], {"still-listed"}, run_id, observed_at="2026-08-19T00:00:00+08:00")
+            row = store.conn.execute(
+                "SELECT scan_state, scan_miss_count FROM job_freshness WHERE job_id = 'missing'"
+            ).fetchone()
+            self.assertEqual(row["scan_state"], "unseen")
+            self.assertEqual(row["scan_miss_count"], 1)
+            store.close()
+
+    def test_closed_refresh_preserves_last_successful_jd(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = CollectionStore(Path(temp_dir) / "jobs.db")
+            run_id = store.start_run(target_count=1)
+            job = {
+                "platform": "boss",
+                "source": "boss-search",
+                "source_key": "search:上海:AI Agent",
+                "source_page": 1,
+                "job_id": "closed-job",
+                "source_url": "https://example.invalid/closed-job",
+                "title": "Closed",
+                "company": "Example",
+                "jd": "原始 JD 正文",
+            }
+            store.save_detail(job, run_id)
+            store.save_detail(
+                {**job, "jd": "", "detail_text": "职位已关闭"},
+                run_id,
+                detail_status="closed",
+                error="职位已关闭",
+            )
+            detail = store.get_detail("closed-job")
+            self.assertEqual(detail["jd_text"], "原始 JD 正文")
+            self.assertEqual(detail["detail_status"], "closed")
+            store.close()
+
+    def test_detail_write_failure_rolls_back_freshness_event(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = CollectionStore(Path(temp_dir) / "jobs.db")
+            run_id = store.start_run(target_count=1)
+            job = {
+                "platform": "boss",
+                "source": "boss-search",
+                "source_key": "search:上海:AI Agent",
+                "source_page": 1,
+                "job_id": "atomic-job",
+                "source_url": "https://example.invalid/atomic-job",
+                "title": "Atomic",
+                "company": "Example",
+                "jd": "原始 JD",
+            }
+            store.save_detail(job, run_id)
+            before = store.conn.execute(
+                "SELECT COUNT(*) FROM job_refresh_events WHERE job_id = 'atomic-job'"
+            ).fetchone()[0]
+            store.conn.execute(
+                """
+                CREATE TRIGGER reject_atomic_update
+                BEFORE UPDATE ON job_details
+                WHEN OLD.job_id = 'atomic-job'
+                BEGIN
+                  SELECT RAISE(FAIL, 'forced detail failure');
+                END;
+                """
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                store.save_detail({**job, "jd": "更新 JD"}, run_id)
+            after = store.conn.execute(
+                "SELECT COUNT(*) FROM job_refresh_events WHERE job_id = 'atomic-job'"
+            ).fetchone()[0]
+            self.assertEqual(after, before)
+            store.close()
+
     def test_collect_only_config_does_not_require_an_ai_key(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.yaml"
@@ -97,6 +204,15 @@ class CollectionStoreTests(unittest.TestCase):
                 cfg = config_module.load_config(require_ai=False)
 
         self.assertEqual(cfg["collection"]["target"], 300)
+
+    def test_refresh_delay_uses_detail_delay_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            collector = BossCollector(
+                {"collection": {"detail_delay_range_seconds": [35, 65]}},
+                CollectionStore(Path(temp_dir) / "jobs.db"),
+            )
+            self.assertEqual(collector._refresh_delay(), [35, 65])
+            collector.store.close()
 
     def test_existing_detail_schema_is_migrated_without_losing_rows(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -145,8 +261,40 @@ class CollectionStoreTests(unittest.TestCase):
             self.assertIn("labels_json", store.get_detail("existing").keys())
             store.close()
 
+    def test_scan_coverage_cli_uses_dedicated_read_only_scan(self):
+        result = SimpleNamespace(status="completed", scanned_sources=8, error=None)
+        with patch.object(main_module, "BossCollector") as collector_cls, patch.object(
+            main_module, "load_config", return_value={"collection": {"db_path": "output/jobagent.db"}}
+        ), patch.object(main_module.CollectionStore, "close"), patch.object(
+            main_module, "resolve_project_path", side_effect=lambda value: Path(value)
+        ), patch("sys.argv", ["main.py", "--scan-coverage", "--scan-source", "search"]):
+            collector_cls.return_value.scan_coverage.return_value = result
+            main_module.main()
+            collector_cls.return_value.scan_coverage.assert_called_once_with(source="search", max_sources=8)
+
 
 class CollectionClassificationTests(unittest.TestCase):
+    def test_detail_result_marks_closed_even_when_page_still_contains_jd(self):
+        page = Mock()
+        page.locator.return_value.inner_text.return_value = (
+            "职位已关闭\n职位描述\n负责 Agent 与 RAG 应用交付"
+        )
+        result = BossCollector._detail_result(
+            page,
+            {"platform": "boss", "job_id": "closed-with-jd"},
+            {
+                "zpData": {
+                    "jobInfo": {
+                        "encryptId": "closed-with-jd",
+                        "postDescription": "负责 Agent 与 RAG 应用交付",
+                    }
+                }
+            },
+        )
+
+        self.assertEqual(result["_detail_status"], "closed")
+        self.assertEqual(result["_detail_message"], "职位已关闭")
+
     def test_search_card_fallback_decodes_salary_and_recovers_company(self):
         card = normalize_search_card(
             {
@@ -224,6 +372,44 @@ class CollectionClassificationTests(unittest.TestCase):
 
 
 class CollectionCliTests(unittest.TestCase):
+    def test_refresh_due_uses_bounded_refresh_without_ai(self):
+        cfg = {
+            "boss": {"cdp_endpoint": "http://127.0.0.1:17332"},
+            "collection": {"db_path": "jobs.db", "target": 300},
+        }
+        board = {
+            "refresh_plan": [
+                {"job_id": "job-1", "refresh_due": True},
+                {"job_id": "job-2", "refresh_due": True},
+                {"job_id": "job-3", "refresh_due": False},
+            ]
+        }
+        result = SimpleNamespace(collected=2, total=3, status="completed", error=None)
+        collector = Mock()
+        collector.refresh.return_value = result
+        collection_store = Mock()
+
+        with (
+            patch.object(main_module, "load_config", return_value=cfg),
+            patch.object(main_module, "OpenAICompatibleClient") as ai,
+            patch.object(main_module, "ResumeManager") as resume,
+            patch.object(main_module, "create_provider") as knowledge,
+            patch.object(main_module, "Store") as application_store,
+            patch.object(main_module, "CollectionStore", return_value=collection_store),
+            patch.object(main_module, "build_freshness_dashboard", return_value=board),
+            patch.object(main_module, "BossCollector", return_value=collector),
+            patch("builtins.print"),
+            patch("sys.argv", ["main.py", "--refresh-due", "--refresh-target", "2"]),
+        ):
+            main_module.main()
+
+        ai.assert_not_called()
+        resume.assert_not_called()
+        knowledge.assert_not_called()
+        application_store.assert_not_called()
+        collector.refresh.assert_called_once_with(["job-1", "job-2"], max_jobs=2)
+        collection_store.close.assert_called_once()
+
     def test_collect_only_never_constructs_ai_resume_or_knowledge_provider(self):
         cfg = {
             "boss": {"cdp_endpoint": "http://127.0.0.1:17332"},
@@ -256,6 +442,12 @@ class CollectionCliTests(unittest.TestCase):
 
 
 class CollectionBrowserLifecycleTests(unittest.TestCase):
+    def test_refresh_ids_are_deduplicated_and_bounded(self):
+        self.assertEqual(
+            BossCollector._bounded_job_ids(["job-1", "job-1", "job-2"], max_jobs=2),
+            ["job-1", "job-2"],
+        )
+
     def test_collector_uses_all_detail_records_for_target_without_opening_browser(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = CollectionStore(Path(temp_dir) / "jobs.db")

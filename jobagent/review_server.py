@@ -12,6 +12,7 @@ from typing import Callable
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from jobagent.resume_collection import collect_resume_market_data
+from jobagent.matching import refresh_stale_matches
 from jobagent.review import (
     ReviewStore,
     ReviewValidationError,
@@ -171,6 +172,9 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/learning":
             self._learning_dashboard()
             return
+        if path == "/api/freshness":
+            self._freshness_dashboard()
+            return
         if path == "/api/boundary-calibration":
             self._boundary_dashboard()
             return
@@ -209,6 +213,24 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlsplit(self.path).path
+        if path == "/api/matches/refresh-stale":
+            try:
+                content_length = int(self.headers.get("Content-Length", "0"))
+                if content_length > 64_000:
+                    raise ReviewValidationError("刷新范围设置过大")
+                payload = json.loads(self.rfile.read(content_length) or b"{}")
+                if not isinstance(payload, dict):
+                    raise ReviewValidationError("提交内容格式不正确")
+                limit = int(payload.get("limit") or 20)
+                if limit < 1 or limit > 100:
+                    raise ReviewValidationError("单次最多重算 100 条岗位")
+                self._send_json(
+                    HTTPStatus.OK,
+                    refresh_stale_matches(self.server.db_path, limit=limit),
+                )
+            except (ValueError, json.JSONDecodeError, ReviewValidationError) as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
         if path not in {"/api/calibration", "/api/calibration/collect"}:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "接口不存在"})
             return
@@ -343,6 +365,13 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         store = ReviewStore(self.server.db_path)
         try:
             self._send_json(HTTPStatus.OK, store.learning_dashboard())
+        finally:
+            store.close()
+
+    def _freshness_dashboard(self) -> None:
+        store = ReviewStore(self.server.db_path)
+        try:
+            self._send_json(HTTPStatus.OK, store.freshness_dashboard())
         finally:
             store.close()
 

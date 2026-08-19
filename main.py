@@ -14,6 +14,7 @@ from jobagent.config import load_config, resolve_project_path
 from jobagent.ai import OpenAICompatibleClient
 from jobagent.analysis import run_analysis
 from jobagent.collection import CollectionStore
+from jobagent.freshness import build_freshness_dashboard
 from jobagent.calibration import calibrate_resume
 from jobagent.knowledge import create_provider
 from jobagent.matching import load_candidate_profile, run_match_preview
@@ -49,6 +50,34 @@ def main() -> None:
     parser.add_argument("--platform", default="boss", choices=list(PLATFORMS))
     parser.add_argument("--dry-run", action="store_true", help="只做 AI 打分，不实际打招呼")
     parser.add_argument("--collect-only", action="store_true", help="只采集岗位与 JD，不调用 AI 或沟通")
+    parser.add_argument(
+        "--refresh-due",
+        action="store_true",
+        help="只读复核 freshness 计划中的到期旧岗位，不调用 AI 或沟通",
+    )
+    parser.add_argument(
+        "--refresh-target",
+        type=int,
+        default=10,
+        help="本轮最多复核的旧岗位数量，默认 10",
+    )
+    parser.add_argument(
+        "--scan-coverage",
+        action="store_true",
+        help="只扫描招聘列表覆盖范围并记录未见岗位，不打开详情页",
+    )
+    parser.add_argument(
+        "--scan-source",
+        choices=("all", "favorites", "search"),
+        default="all",
+        help="覆盖扫描来源，默认收藏与搜索",
+    )
+    parser.add_argument(
+        "--scan-limit",
+        type=int,
+        default=8,
+        help="本轮最多扫描的搜索来源数量，默认 8",
+    )
     parser.add_argument(
         "--review-jobs",
         action="store_true",
@@ -96,6 +125,8 @@ def main() -> None:
 
     offline_only = (
         args.collect_only
+        or args.refresh_due
+        or args.scan_coverage
         or args.analyze_collection
         or args.review_jobs
         or args.match_preview
@@ -112,6 +143,54 @@ def main() -> None:
             config=cfg,
             analysis_output_dir=resolve_project_path(args.analysis_output),
         )
+        return
+    if args.refresh_due:
+        collection_cfg = cfg.get("collection") or {}
+        collection_store = CollectionStore(
+            resolve_project_path(collection_cfg.get("db_path", "output/jobagent.db"))
+        )
+        try:
+            board = build_freshness_dashboard(collection_store.conn)
+            target = max(0, int(args.refresh_target))
+            job_ids = [
+                str(job["job_id"])
+                for job in board["refresh_plan"]
+                if job.get("refresh_due")
+            ][:target]
+            if not job_ids:
+                print("没有到期岗位需要复核")
+                return
+            print(BROWSER_RISK_WARNING)
+            collector = BossCollector(cfg, collection_store)
+            result = collector.refresh(job_ids, max_jobs=target)
+            print(
+                f"复核结束：成功 {result.collected}，本地岗位库 {result.total}，"
+                f"状态 {result.status}"
+            )
+            if result.error:
+                print(f"停止原因：{result.error}")
+        finally:
+            collection_store.close()
+        return
+    if args.scan_coverage:
+        collection_cfg = cfg.get("collection") or {}
+        collection_store = CollectionStore(
+            resolve_project_path(collection_cfg.get("db_path", "output/jobagent.db"))
+        )
+        try:
+            print(BROWSER_RISK_WARNING)
+            result = BossCollector(cfg, collection_store).scan_coverage(
+                source=args.scan_source,
+                max_sources=max(1, int(args.scan_limit)),
+            )
+            print(
+                f"覆盖扫描结束：完整来源 {result.scanned_sources}，"
+                f"岗位库 {getattr(result, 'total', collection_store.detail_inventory_count())}，状态 {result.status}"
+            )
+            if result.error:
+                print(f"停止原因：{result.error}")
+        finally:
+            collection_store.close()
         return
     if args.analyze_collection:
         collection_cfg = cfg.get("collection") or {}

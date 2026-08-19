@@ -17,6 +17,12 @@ from jobagent.calibration import (
     confirm_preference_settings,
 )
 from jobagent.boundary import REVIEWED_DECISIONS_SAMPLE, build_boundary_dashboard
+from jobagent.freshness import (
+    build_freshness_dashboard,
+    live_job_condition,
+    migrate_freshness_schema,
+    sync_legacy_freshness,
+)
 from jobagent.matching import (
     build_match_dashboard,
     get_match_detail,
@@ -361,6 +367,17 @@ def migrate_review_schema(connection: sqlite3.Connection) -> None:
           decided_at TEXT NOT NULL,
           PRIMARY KEY(platform, job_id)
         );
+        CREATE TABLE IF NOT EXISTS job_decision_history (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          platform TEXT NOT NULL,
+          job_id TEXT NOT NULL,
+          interest TEXT NOT NULL,
+          rejection_reason TEXT NOT NULL DEFAULT '',
+          note TEXT NOT NULL DEFAULT '',
+          learning_intent INTEGER,
+          decided_at TEXT NOT NULL,
+          superseded_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS job_corrections (
           platform TEXT NOT NULL,
           job_id TEXT NOT NULL,
@@ -384,6 +401,8 @@ def migrate_review_schema(connection: sqlite3.Connection) -> None:
             """
         )
     migrate_matching_schema(connection)
+    migrate_freshness_schema(connection)
+    sync_legacy_freshness(connection)
     connection.execute(
         """
         INSERT INTO job_decisions (
@@ -406,6 +425,7 @@ def migrate_review_database(db_path: str | Path) -> Path:
     if not path.is_file():
         raise ReviewValidationError(f"岗位数据库不存在：{path}")
     connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
     try:
         migrate_review_schema(connection)
     finally:
@@ -468,7 +488,7 @@ class ReviewStore:
             raise ReviewValidationError("样本分层配置无效")
 
         candidates = self.conn.execute(
-            """
+            f"""
             SELECT d.platform, d.job_id, d.source_key, a.fit_tier,
                    a.track, a.relevance_score
             FROM job_details d
@@ -476,6 +496,7 @@ class ReviewStore:
               ON a.platform = d.platform AND a.job_id = d.job_id
             WHERE d.detail_status = 'collected'
               AND COALESCE(d.jd_text, '') <> ''
+              AND {live_job_condition('d')}
             """
         ).fetchall()
         selected_ids: set[tuple[str, str]] = set()
@@ -511,7 +532,7 @@ class ReviewStore:
 
     def list_jobs(self, sample_name: str = "positioning-v1") -> list[dict]:
         rows = self.conn.execute(
-            """
+            f"""
             SELECT s.position, s.sample_bucket, d.platform, d.job_id, d.title,
                    d.company, d.salary_raw, d.location, d.experience_raw,
                    d.source_key, a.fit_tier, a.track, a.relevance_score,
@@ -524,6 +545,7 @@ class ReviewStore:
             LEFT JOIN job_decisions decision
               ON decision.platform = d.platform AND decision.job_id = d.job_id
             WHERE s.sample_name = ?
+              AND {live_job_condition('d')}
             ORDER BY s.position
             """,
             (sample_name,),
@@ -758,6 +780,22 @@ class ReviewStore:
         job = self._sample_job(job_id, sample_name, platform=platform)
         decided_at = _now()
         with self.conn:
+            previous = self.conn.execute(
+                "SELECT * FROM job_decisions WHERE platform = ? AND job_id = ?",
+                (job["platform"], job_id),
+            ).fetchone()
+            if previous:
+                self.conn.execute(
+                    """INSERT INTO job_decision_history (
+                         platform, job_id, interest, rejection_reason, note,
+                         learning_intent, decided_at, superseded_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        previous["platform"], previous["job_id"], previous["interest"],
+                        previous["rejection_reason"], previous["note"],
+                        previous["learning_intent"], previous["decided_at"], decided_at,
+                    ),
+                )
             self.conn.execute(
                 """
                 INSERT INTO job_decisions (
@@ -839,6 +877,9 @@ class ReviewStore:
     def learning_dashboard(self) -> dict:
         return build_learning_dashboard(self.conn)
 
+    def freshness_dashboard(self, now: str | None = None) -> dict:
+        return build_freshness_dashboard(self.conn, now=now)
+
     def match_dashboard(self) -> dict:
         return build_match_dashboard(self.conn)
 
@@ -901,6 +942,11 @@ class ReviewStore:
             LEFT JOIN job_decisions decision
               ON decision.platform = s.platform AND decision.job_id = s.job_id
             WHERE s.sample_name = ?
+              AND NOT EXISTS (
+                SELECT 1 FROM job_freshness jf
+                 WHERE jf.platform = s.platform AND jf.job_id = s.job_id
+                   AND jf.evidence_state IN ('closed', 'archived')
+              )
             """,
             (sample_name,),
         ).fetchone()

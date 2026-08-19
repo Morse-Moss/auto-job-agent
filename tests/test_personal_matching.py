@@ -6,12 +6,14 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 import main as main_module
 from jobagent.matching import (
     analyze_job_match,
+    build_match_dashboard,
     migrate_matching_schema,
+    refresh_stale_matches,
     normalize_text,
     run_match_preview,
 )
@@ -537,6 +539,58 @@ def create_preview_database(path: Path) -> None:
 
 
 class MatchPersistenceTests(unittest.TestCase):
+    def test_refresh_stale_matches_updates_only_changed_jobs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "jobs.db"
+            create_preview_database(db_path)
+            run_match_preview(db_path, candidate_profile(), "match-v2.0")
+            connection = sqlite3.connect(db_path)
+            connection.execute(
+                "UPDATE job_details SET jd_text = jd_text || ' 新增 Kubernetes 门槛' WHERE job_id = 'job-1'"
+            )
+            connection.commit()
+            connection.close()
+
+            result = refresh_stale_matches(db_path, limit=1)
+            self.assertEqual(result["refreshed"], 1)
+            self.assertEqual(result["remaining"], 0)
+            connection = sqlite3.connect(db_path)
+            connection.row_factory = sqlite3.Row
+            try:
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM job_match_history").fetchone()[0],
+                    1,
+                )
+                row = connection.execute(
+                    "SELECT jd_content_hash FROM job_match_analyses WHERE job_id = 'job-1'"
+                ).fetchone()
+                self.assertTrue(row["jd_content_hash"])
+                job = build_match_dashboard(connection)["jobs"][0]
+                self.assertFalse(job["match_stale"])
+                self.assertIn("previous_match", job)
+                self.assertTrue(job["previous_match"]["recommendation"])
+                self.assertIn("refresh_changed", job)
+            finally:
+                connection.close()
+
+    def test_jd_content_change_marks_existing_match_stale_without_recomputing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "jobs.db"
+            create_preview_database(db_path)
+            run_match_preview(db_path, candidate_profile(), "match-v2.0")
+            connection = sqlite3.connect(db_path)
+            connection.row_factory = sqlite3.Row
+            connection.execute(
+                "UPDATE job_details SET jd_text = jd_text || ' 必须熟练阅读电路原理图，识别常见 MCU 型号，深入理解 MCU 硬件架构。' WHERE job_id = 'job-1'"
+            )
+            connection.commit()
+            try:
+                dashboard = build_match_dashboard(connection)
+            finally:
+                connection.close()
+            self.assertTrue(dashboard["jobs"][0]["match_stale"])
+            self.assertEqual(dashboard["snapshot"]["stale"], 1)
+
     def test_profile_and_match_versions_coexist_without_touching_v1_or_decision(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "jobs.db"
@@ -650,6 +704,51 @@ class MatchPreviewApiTests(unittest.TestCase):
                 self.assertTrue(detail["strengths"])
                 self.assertIn("jd_evidence", detail["strengths"][0])
                 self.assertEqual(detail["company"], "示例公司")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_api_refreshes_stale_matches_only_after_explicit_post(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "jobs.db"
+            create_preview_database(db_path)
+            run_match_preview(db_path, candidate_profile(), "match-v2.0")
+            connection = sqlite3.connect(db_path)
+            connection.execute(
+                "UPDATE job_details SET jd_text = jd_text || ' 必须熟练阅读电路原理图，识别常见 MCU 型号，深入理解 MCU 硬件架构。' WHERE job_id = 'job-1'"
+            )
+            connection.commit()
+            connection.close()
+            server = create_server(db_path, host="127.0.0.1", port=0)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_port}"
+            try:
+                request = Request(
+                    f"http://127.0.0.1:{server.server_port}/api/matches/refresh-stale",
+                    data=json.dumps({"limit": 1}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(request) as response:
+                    payload = json.load(response)
+                self.assertEqual(payload["refreshed"], 1)
+                self.assertEqual(payload["remaining"], 0)
+                with urlopen(f"http://127.0.0.1:{server.server_port}/api/matches") as response:
+                    dashboard = json.load(response)
+                self.assertEqual(dashboard["snapshot"]["recently_refreshed"], 1)
+                self.assertIsNotNone(dashboard["jobs"][0]["previous_match"])
+
+                with urlopen(f"{base_url}/api/matches/job-1") as response:
+                    detail = json.load(response)["match"]
+                comparison = detail["refresh_comparison"]
+                self.assertEqual(
+                    [item["id"] for item in comparison["hard_requirements_added"]],
+                    ["mcu_hardware"],
+                )
+                self.assertEqual(comparison["hard_requirements_removed"], [])
+                self.assertIn("score_delta", comparison)
             finally:
                 server.shutdown()
                 server.server_close()

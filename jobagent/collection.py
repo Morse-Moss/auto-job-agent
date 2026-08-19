@@ -7,6 +7,14 @@ import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+
+from jobagent.freshness import (
+    mark_detail_result,
+    mark_observation_seen,
+    mark_scan_missing,
+    migrate_freshness_schema,
+    sync_legacy_freshness,
+)
 from urllib.parse import urlsplit, urlunsplit
 
 
@@ -253,6 +261,8 @@ class CollectionStore:
                 "finished_count": "INTEGER",
             },
         )
+        migrate_freshness_schema(self.conn)
+        sync_legacy_freshness(self.conn)
         self.conn.commit()
 
     def _add_columns(self, table: str, columns: dict[str, str]) -> None:
@@ -276,10 +286,21 @@ class CollectionStore:
         self.conn.commit()
         return run_id
 
-    def finish_run(self, run_id: str, status: str, error: str | None = None) -> None:
+    def finish_run(
+        self,
+        run_id: str,
+        status: str,
+        error: str | None = None,
+        records_collected: int | None = None,
+    ) -> None:
         row = self.get_run(run_id)
         starting_count = int(row["starting_count"] or 0) if row else 0
         finished_count = self.detail_inventory_count()
+        records = (
+            max(0, finished_count - starting_count)
+            if records_collected is None
+            else max(0, int(records_collected))
+        )
         self.conn.execute(
             """
             UPDATE detail_collection_runs
@@ -289,7 +310,7 @@ class CollectionStore:
             """,
             (
                 _now(),
-                max(0, finished_count - starting_count),
+                records,
                 status,
                 error,
                 finished_count,
@@ -326,8 +347,9 @@ class CollectionStore:
             job.get("card_text", ""),
             _now(),
         )
-        self.conn.execute(
-            """
+        try:
+            self.conn.execute(
+                """
             INSERT INTO job_observations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(platform, job_id) DO UPDATE SET
               title=excluded.title,
@@ -340,16 +362,36 @@ class CollectionStore:
               recruiter_role=excluded.recruiter_role,
               card_text=excluded.card_text,
               collected_at=excluded.collected_at
-            """,
-            values,
-        )
-        self.conn.commit()
+                """,
+                values,
+            )
+            mark_observation_seen(self.conn, job, run_id, commit=False)
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
 
-    def save_detail(self, job: dict, run_id: str, detail_status: str = "collected") -> None:
+    def save_detail(
+        self,
+        job: dict,
+        run_id: str,
+        detail_status: str = "collected",
+        error: str = "",
+    ) -> None:
         now = _now()
         labels = classify_job(job)
-        self.conn.execute(
-            """
+        try:
+            mark_detail_result(
+                self.conn,
+                job,
+                run_id,
+                detail_status,
+                error=error,
+                observed_at=now,
+                commit=False,
+            )
+            self.conn.execute(
+                """
             INSERT INTO job_details (
               platform, job_id, source_run_id, source_url, source_page,
               title, company, detail_status, jd_text, detail_text, collected_at,
@@ -365,8 +407,8 @@ class CollectionStore:
               title=excluded.title,
               company=excluded.company,
               detail_status=excluded.detail_status,
-              jd_text=excluded.jd_text,
-              detail_text=excluded.detail_text,
+              jd_text=CASE WHEN excluded.detail_status IN ('failed', 'closed') AND job_details.detail_status = 'collected' THEN job_details.jd_text ELSE excluded.jd_text END,
+              detail_text=CASE WHEN excluded.detail_status IN ('failed', 'closed') AND job_details.detail_status = 'collected' THEN job_details.detail_text ELSE excluded.detail_text END,
               source_key=excluded.source_key,
               salary_raw=excluded.salary_raw,
               location=excluded.location,
@@ -378,14 +420,14 @@ class CollectionStore:
               recruiter_name=excluded.recruiter_name,
               recruiter_role=excluded.recruiter_role,
               recruiter_active=excluded.recruiter_active,
-              skills_json=excluded.skills_json,
-              welfare_json=excluded.welfare_json,
-              labels_json=excluded.labels_json,
+              skills_json=CASE WHEN excluded.detail_status IN ('failed', 'closed') AND job_details.detail_status = 'collected' THEN job_details.skills_json ELSE excluded.skills_json END,
+              welfare_json=CASE WHEN excluded.detail_status IN ('failed', 'closed') AND job_details.detail_status = 'collected' THEN job_details.welfare_json ELSE excluded.welfare_json END,
+              labels_json=CASE WHEN excluded.detail_status IN ('failed', 'closed') AND job_details.detail_status = 'collected' THEN job_details.labels_json ELSE excluded.labels_json END,
               last_error=NULL,
               attempt_count=job_details.attempt_count + 1,
               updated_at=excluded.updated_at
-            """,
-            (
+                """,
+                (
                 job.get("platform", "boss"),
                 job["job_id"],
                 run_id,
@@ -414,18 +456,51 @@ class CollectionStore:
                 None,
                 1,
                 now,
-            ),
-        )
-        self.conn.commit()
+                ),
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def save_failure(self, job: dict, run_id: str, error: str) -> None:
         failed = {**job, "jd": "", "detail_text": job.get("detail_text", "")}
-        self.save_detail(failed, run_id, detail_status="failed")
+        self.save_detail(failed, run_id, detail_status="failed", error=error)
         self.conn.execute(
             "UPDATE job_details SET last_error = ? WHERE platform = ? AND job_id = ?",
             (str(error)[:1000], job.get("platform", "boss"), job["job_id"]),
         )
         self.conn.commit()
+
+    def finalize_scan(
+        self,
+        source_key: str,
+        listed_job_ids: set[str],
+        run_id: str,
+        *,
+        observed_at: str | None = None,
+    ) -> None:
+        """Record one completed source scan without deleting absent jobs."""
+        rows = self.conn.execute(
+            "SELECT * FROM job_details WHERE source_key = ?",
+            (source_key,),
+        ).fetchall()
+        listed_ids = {str(job_id) for job_id in listed_job_ids}
+        try:
+            for row in rows:
+                if str(row["job_id"]) in listed_ids:
+                    continue
+                mark_scan_missing(
+                    self.conn,
+                    dict(row),
+                    run_id,
+                    observed_at=observed_at,
+                    commit=False,
+                )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def update_cursor(
         self, source_key: str, page_number: int, item_index: int, status: str

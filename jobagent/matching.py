@@ -11,8 +11,15 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
+from jobagent.freshness import (
+    jd_content_hash,
+    live_job_condition,
+    migrate_freshness_schema,
+    sync_legacy_freshness,
+)
 
-MATCH_SCHEMA_VERSION = 3
+
+MATCH_SCHEMA_VERSION = 5
 RECOMMENDATIONS = {"priority", "challenge", "not_fit"}
 EDUCATION_RANKS = {
     "unknown": 0,
@@ -582,6 +589,7 @@ def migrate_matching_schema(connection: sqlite3.Connection) -> None:
           platform TEXT NOT NULL,
           job_id TEXT NOT NULL,
           analyzed_at TEXT NOT NULL,
+          jd_content_hash TEXT,
           recommendation TEXT NOT NULL CHECK(recommendation IN ('priority', 'challenge', 'not_fit')),
           track TEXT NOT NULL,
           score INTEGER NOT NULL,
@@ -597,6 +605,30 @@ def migrate_matching_schema(connection: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_job_match_latest
           ON job_match_analyses(profile_id, profile_version, analysis_version, recommendation, score DESC);
+        CREATE TABLE IF NOT EXISTS job_match_history (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          analysis_version TEXT NOT NULL,
+          profile_id TEXT NOT NULL,
+          profile_version TEXT NOT NULL,
+          platform TEXT NOT NULL,
+          job_id TEXT NOT NULL,
+          captured_at TEXT NOT NULL,
+          analyzed_at TEXT NOT NULL,
+          jd_content_hash TEXT,
+          recommendation TEXT NOT NULL,
+          track TEXT NOT NULL,
+          score INTEGER NOT NULL,
+          confidence REAL NOT NULL,
+          information_status TEXT NOT NULL,
+          hard_requirements_json TEXT NOT NULL,
+          strengths_json TEXT NOT NULL,
+          gaps_json TEXT NOT NULL,
+          uncertainties_json TEXT NOT NULL,
+          preference_signals_json TEXT NOT NULL DEFAULT '[]',
+          source TEXT NOT NULL DEFAULT 'incremental_refresh'
+        );
+        CREATE INDEX IF NOT EXISTS idx_job_match_history_latest
+          ON job_match_history(analysis_version, profile_id, profile_version, platform, job_id, id DESC);
         """
     )
     match_columns = {
@@ -608,6 +640,10 @@ def migrate_matching_schema(connection: sqlite3.Connection) -> None:
             ALTER TABLE job_match_analyses
             ADD COLUMN preference_signals_json TEXT NOT NULL DEFAULT '[]'
             """
+        )
+    if "jd_content_hash" not in match_columns:
+        connection.execute(
+            "ALTER TABLE job_match_analyses ADD COLUMN jd_content_hash TEXT"
         )
     current_version = connection.execute("PRAGMA user_version").fetchone()[0]
     if current_version < MATCH_SCHEMA_VERSION:
@@ -687,6 +723,8 @@ def run_match_preview(
     connection.row_factory = sqlite3.Row
     try:
         migrate_matching_schema(connection)
+        migrate_freshness_schema(connection)
+        sync_legacy_freshness(connection)
         profile_id, profile_version = _save_profile(connection, profile)
         previous: dict[tuple[str, str], sqlite3.Row] = {}
         if _table_exists(connection, "job_positioning_analysis"):
@@ -697,9 +735,10 @@ def run_match_preview(
                 )
             }
         rows = connection.execute(
-            """
+            f"""
             SELECT * FROM job_details
             WHERE detail_status = 'collected' AND COALESCE(jd_text, '') <> ''
+              AND {live_job_condition('job_details')}
             ORDER BY platform, job_id
             """
         ).fetchall()
@@ -723,15 +762,16 @@ def run_match_preview(
                     """
                     INSERT INTO job_match_analyses (
                       analysis_version, profile_id, profile_version, platform, job_id,
-                      analyzed_at, recommendation, track, score, confidence,
+                      analyzed_at, jd_content_hash, recommendation, track, score, confidence,
                       information_status, hard_requirements_json, strengths_json,
                       gaps_json, uncertainties_json, preference_signals_json, previous_fit_tier,
                       previous_relevance_score
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(
                       analysis_version, profile_id, profile_version, platform, job_id
                     ) DO UPDATE SET
                       analyzed_at = excluded.analyzed_at,
+                      jd_content_hash = excluded.jd_content_hash,
                       recommendation = excluded.recommendation,
                       track = excluded.track,
                       score = excluded.score,
@@ -752,6 +792,7 @@ def run_match_preview(
                         row["platform"],
                         row["job_id"],
                         analyzed_at,
+                        jd_content_hash(row["jd_text"]),
                         result.recommendation,
                         result.track,
                         result.score,
@@ -774,6 +815,137 @@ def run_match_preview(
             profile_version=profile_version,
             distribution={key: int(distribution.get(key, 0)) for key in sorted(RECOMMENDATIONS)},
         )
+    finally:
+        connection.close()
+
+
+def refresh_stale_matches(
+    db_path: str | Path,
+    *,
+    limit: int = 20,
+) -> dict:
+    """Recompute only match rows whose canonical JD hash no longer matches."""
+    database = Path(db_path).resolve()
+    if not database.is_file():
+        raise ValueError(f"岗位数据库不存在：{database}")
+    max_rows = max(0, int(limit))
+    connection = sqlite3.connect(database)
+    connection.row_factory = sqlite3.Row
+    try:
+        migrate_matching_schema(connection)
+        migrate_freshness_schema(connection)
+        sync_legacy_freshness(connection)
+        snapshot = _latest_snapshot(connection)
+        if snapshot is None:
+            raise ValueError("尚未生成匹配预览，请先运行匹配预览")
+        profile_row = connection.execute(
+            "SELECT profile_json FROM candidate_profiles WHERE profile_id = ? AND profile_version = ?",
+            (snapshot["profile_id"], snapshot["profile_version"]),
+        ).fetchone()
+        if profile_row is None:
+            raise ValueError("匹配快照对应的候选人档案无法读取，请重新生成匹配预览")
+        try:
+            profile = json.loads(profile_row["profile_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("候选人档案不是有效 JSON，请重新生成匹配预览") from exc
+
+        rows = connection.execute(
+            f"""
+            SELECT match.*, d.*
+              FROM job_match_analyses match
+              JOIN job_details d
+                ON d.platform = match.platform AND d.job_id = match.job_id
+             WHERE match.analysis_version = ?
+               AND match.profile_id = ?
+               AND match.profile_version = ?
+               AND {live_job_condition('d')}
+             ORDER BY match.analyzed_at, match.job_id"""
+            , (
+                snapshot["analysis_version"],
+                snapshot["profile_id"],
+                snapshot["profile_version"],
+            ),
+        ).fetchall()
+        stale_rows = [
+            row for row in rows
+            if not row["jd_content_hash"]
+            or row["jd_content_hash"] != jd_content_hash(row["jd_text"])
+        ]
+        selected = stale_rows[:max_rows]
+        refreshed_at = _now()
+        with connection:
+            for row in selected:
+                result = analyze_job_match(dict(row), profile)
+                connection.execute(
+                    """
+                    INSERT INTO job_match_history (
+                      analysis_version, profile_id, profile_version, platform, job_id,
+                      captured_at, analyzed_at, jd_content_hash, recommendation, track,
+                      score, confidence, information_status, hard_requirements_json,
+                      strengths_json, gaps_json, uncertainties_json, preference_signals_json,
+                      source
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        row["analysis_version"],
+                        row["profile_id"],
+                        row["profile_version"],
+                        row["platform"],
+                        row["job_id"],
+                        refreshed_at,
+                        row["analyzed_at"],
+                        row["jd_content_hash"],
+                        row["recommendation"],
+                        row["track"],
+                        row["score"],
+                        row["confidence"],
+                        row["information_status"],
+                        row["hard_requirements_json"],
+                        row["strengths_json"],
+                        row["gaps_json"],
+                        row["uncertainties_json"],
+                        row["preference_signals_json"],
+                        "incremental_refresh",
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE job_match_analyses
+                       SET analyzed_at = ?, jd_content_hash = ?, recommendation = ?,
+                           track = ?, score = ?, confidence = ?, information_status = ?,
+                           hard_requirements_json = ?, strengths_json = ?, gaps_json = ?,
+                           uncertainties_json = ?, preference_signals_json = ?
+                     WHERE analysis_version = ? AND profile_id = ? AND profile_version = ?
+                       AND platform = ? AND job_id = ?
+                    """,
+                    (
+                        refreshed_at,
+                        jd_content_hash(row["jd_text"]),
+                        result.recommendation,
+                        result.track,
+                        result.score,
+                        result.confidence,
+                        result.information_status,
+                        json.dumps(result.hard_requirements, ensure_ascii=False),
+                        json.dumps(result.strengths, ensure_ascii=False),
+                        json.dumps(result.gaps, ensure_ascii=False),
+                        json.dumps(result.uncertainties, ensure_ascii=False),
+                        json.dumps(result.preference_signals, ensure_ascii=False),
+                        snapshot["analysis_version"],
+                        snapshot["profile_id"],
+                        snapshot["profile_version"],
+                        row["platform"],
+                        row["job_id"],
+                    ),
+                )
+        return {
+            "analysis_version": snapshot["analysis_version"],
+            "profile_id": snapshot["profile_id"],
+            "profile_version": snapshot["profile_version"],
+            "refreshed": len(selected),
+            "refreshed_job_ids": [row["job_id"] for row in selected],
+            "remaining": max(0, len(stale_rows) - len(selected)),
+        }
     finally:
         connection.close()
 
@@ -801,8 +973,138 @@ def _recommendation_changed(previous_fit_tier: str, recommendation: str) -> bool
     return bool(previous_group and previous_group != recommendation)
 
 
+def _latest_match_history(
+    connection: sqlite3.Connection,
+    *,
+    analysis_version: str,
+    profile_id: str,
+    profile_version: str,
+) -> dict[tuple[str, str], dict]:
+    rows = connection.execute(
+        """
+        SELECT history.*
+          FROM job_match_history history
+          JOIN (
+            SELECT platform, job_id, MAX(id) AS latest_id
+              FROM job_match_history
+             WHERE analysis_version = ? AND profile_id = ? AND profile_version = ?
+             GROUP BY platform, job_id
+          ) latest ON latest.latest_id = history.id
+        """,
+        (analysis_version, profile_id, profile_version),
+    ).fetchall()
+    return {(row["platform"], row["job_id"]): dict(row) for row in rows}
+
+
+def _comparison_item(value: object) -> dict:
+    if not isinstance(value, dict):
+        return {"id": str(value)}
+    return {
+        key: value[key]
+        for key in ("id", "label", "severity", "jd_evidence", "candidate_evidence")
+        if value.get(key) not in (None, "")
+    }
+
+
+def _evidence_diff(previous: object, current: object) -> tuple[list[dict], list[dict]]:
+    previous_items = _json_list(previous)
+    current_items = _json_list(current)
+
+    def key(value: object) -> str:
+        if isinstance(value, dict):
+            return str(value.get("id") or value.get("label") or "").casefold()
+        return str(value).casefold()
+
+    previous_by_key = {key(value): value for value in previous_items if key(value)}
+    current_by_key = {key(value): value for value in current_items if key(value)}
+    added = [
+        _comparison_item(current_by_key[item_key])
+        for item_key in current_by_key.keys() - previous_by_key.keys()
+    ]
+    removed = [
+        _comparison_item(previous_by_key[item_key])
+        for item_key in previous_by_key.keys() - current_by_key.keys()
+    ]
+    sort_key = lambda value: (str(value.get("label") or value.get("id") or ""), str(value.get("id") or ""))
+    return sorted(added, key=sort_key), sorted(removed, key=sort_key)
+
+
+def _text_diff(previous: object, current: object) -> tuple[list[str], list[str]]:
+    previous_values = {str(value) for value in _json_list(previous) if str(value)}
+    current_values = {str(value) for value in _json_list(current) if str(value)}
+    return sorted(current_values - previous_values), sorted(previous_values - current_values)
+
+
+def _attach_refresh_comparison(item: dict, history: dict | None) -> dict:
+    if history is None:
+        item["previous_match"] = None
+        item["refresh_changed"] = False
+        return item
+    previous = {
+        "captured_at": history["captured_at"],
+        "analyzed_at": history["analyzed_at"],
+        "jd_content_hash": history["jd_content_hash"],
+        "recommendation": history["recommendation"],
+        "track": history["track"],
+        "score": history["score"],
+        "confidence": history["confidence"],
+        "information_status": history["information_status"],
+    }
+    item["previous_match"] = previous
+    scalar_changed = any(
+        item.get(field) != previous[field]
+        for field in ("recommendation", "track", "score", "confidence", "information_status")
+    )
+    comparison = {
+        "recommendation_changed": item.get("recommendation") != previous["recommendation"],
+        "track_changed": item.get("track") != previous["track"],
+        "score_delta": int(item.get("score") or 0) - int(previous["score"] or 0),
+        "confidence_delta": round(
+            float(item.get("confidence") or 0) - float(previous["confidence"] or 0),
+            2,
+        ),
+        "information_status_changed": item.get("information_status") != previous["information_status"],
+        "hard_requirements_added": [],
+        "hard_requirements_removed": [],
+        "gaps_added": [],
+        "gaps_removed": [],
+        "uncertainties_added": [],
+        "uncertainties_removed": [],
+    }
+    evidence_fields = {
+        "hard_requirements": "hard_requirements_json",
+        "gaps": "gaps_json",
+        "uncertainties": "uncertainties_json",
+    }
+    if any(field in item for field in evidence_fields.values()):
+        for name, current_field in evidence_fields.items():
+            added, removed = (
+                _text_diff(history[f"{name}_json"], item.get(current_field))
+                if name == "uncertainties"
+                else _evidence_diff(history[f"{name}_json"], item.get(current_field))
+            )
+            comparison[f"{name}_added"] = added
+            comparison[f"{name}_removed"] = removed
+    comparison["changed"] = scalar_changed or any(
+        comparison[key]
+        for key in (
+            "hard_requirements_added",
+            "hard_requirements_removed",
+            "gaps_added",
+            "gaps_removed",
+            "uncertainties_added",
+            "uncertainties_removed",
+        )
+    )
+    item["refresh_comparison"] = comparison
+    item["refresh_changed"] = comparison["changed"]
+    return item
+
+
 def build_match_dashboard(connection: sqlite3.Connection) -> dict:
     migrate_matching_schema(connection)
+    migrate_freshness_schema(connection)
+    sync_legacy_freshness(connection)
     snapshot = _latest_snapshot(connection)
     if snapshot is None:
         return {
@@ -812,9 +1114,10 @@ def build_match_dashboard(connection: sqlite3.Connection) -> dict:
         }
 
     rows = connection.execute(
-        """
-        SELECT match.platform, match.job_id, match.recommendation, match.track,
-               match.score, match.confidence, match.information_status,
+        f"""
+         SELECT match.platform, match.job_id, match.recommendation, match.track,
+                match.score, match.confidence, match.information_status,
+                match.jd_content_hash, d.jd_text,
                match.previous_fit_tier, match.previous_relevance_score,
                d.title, d.company, d.salary_raw, d.location, d.experience_raw,
                decision.interest, decision.decided_at
@@ -826,6 +1129,7 @@ def build_match_dashboard(connection: sqlite3.Connection) -> dict:
         WHERE match.analysis_version = ?
           AND match.profile_id = ?
           AND match.profile_version = ?
+          AND {live_job_condition('d')}
         ORDER BY
           CASE match.recommendation
             WHEN 'priority' THEN 0
@@ -846,8 +1150,18 @@ def build_match_dashboard(connection: sqlite3.Connection) -> dict:
     counts: Counter[str] = Counter()
     conflicts = 0
     decision_conflicts = 0
+    history = _latest_match_history(
+        connection,
+        analysis_version=snapshot["analysis_version"],
+        profile_id=snapshot["profile_id"],
+        profile_version=snapshot["profile_version"],
+    )
     for row in rows:
         item = dict(row)
+        item["match_stale"] = (
+            not item.get("jd_content_hash")
+            or item["jd_content_hash"] != jd_content_hash(item.get("jd_text"))
+        )
         item["changed"] = _recommendation_changed(
             item["previous_fit_tier"], item["recommendation"]
         )
@@ -858,6 +1172,7 @@ def build_match_dashboard(connection: sqlite3.Connection) -> dict:
         elif item.get("interest") == "want" and item["recommendation"] == "not_fit":
             decision_conflicts += 1
         item["reviewed"] = item.get("decided_at") is not None
+        _attach_refresh_comparison(item, history.get((item["platform"], item["job_id"])))
         counts[item["recommendation"]] += 1
         jobs.append(item)
 
@@ -876,6 +1191,9 @@ def build_match_dashboard(connection: sqlite3.Connection) -> dict:
             ),
             "conflicts": conflicts,
             "decision_conflicts": decision_conflicts,
+            "stale": sum(item["match_stale"] for item in jobs),
+            "recently_refreshed": sum(item["previous_match"] is not None for item in jobs),
+            "refresh_changed": sum(item["refresh_changed"] for item in jobs),
         },
         "jobs": jobs,
         "empty_message": "",
@@ -928,6 +1246,20 @@ def get_match_detail(
     if row is None:
         return None
     result = dict(row)
+    result["match_stale"] = (
+        not result.get("jd_content_hash")
+        or result["jd_content_hash"] != jd_content_hash(result.get("jd_text"))
+    )
+    history = _latest_match_history(
+        connection,
+        analysis_version=snapshot["analysis_version"],
+        profile_id=snapshot["profile_id"],
+        profile_version=snapshot["profile_version"],
+    )
+    _attach_refresh_comparison(
+        result,
+        history.get((result["platform"], result["job_id"])),
+    )
     for field, target in (
         ("hard_requirements_json", "hard_requirements"),
         ("strengths_json", "strengths"),
