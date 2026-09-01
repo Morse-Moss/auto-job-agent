@@ -8,6 +8,7 @@ from jobagent.freshness import (
     build_freshness_dashboard,
     build_role_track_dashboard,
     classify_refresh_attention,
+    refresh_action_for_job,
     mark_detail_result,
     mark_observation_seen,
     mark_scan_missing,
@@ -136,6 +137,25 @@ class FreshnessStateTests(unittest.TestCase):
             classify_refresh_attention({"lifecycle_state": "active", "scan_state": "listed", "has_detail": False}),
             "detail_missing",
         )
+
+    def test_refresh_action_separates_detail_refresh_from_coverage_scan(self):
+        self.assertEqual(
+            refresh_action_for_job({"refresh_attention": "detail_due"}),
+            "detail_refresh",
+        )
+        self.assertEqual(
+            refresh_action_for_job({"refresh_attention": "retry_due"}),
+            "detail_refresh",
+        )
+        self.assertEqual(
+            refresh_action_for_job({"refresh_attention": "detail_missing"}),
+            "detail_refresh",
+        )
+        self.assertEqual(
+            refresh_action_for_job({"refresh_attention": "scan_attention"}),
+            "coverage_scan",
+        )
+        self.assertIsNone(refresh_action_for_job({"refresh_attention": None}))
 
     def test_dashboard_includes_observation_only_jobs_as_missing_detail(self):
         with tempfile.TemporaryDirectory() as temp_dir:

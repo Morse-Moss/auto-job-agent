@@ -824,7 +824,7 @@ def refresh_stale_matches(
     *,
     limit: int = 20,
 ) -> dict:
-    """Recompute only match rows whose canonical JD hash no longer matches."""
+    """Refresh match rows missing a JD baseline or whose canonical JD changed."""
     database = Path(db_path).resolve()
     if not database.is_file():
         raise ValueError(f"岗位数据库不存在：{database}")
@@ -849,12 +849,21 @@ def refresh_stale_matches(
         except (TypeError, json.JSONDecodeError) as exc:
             raise ValueError("候选人档案不是有效 JSON，请重新生成匹配预览") from exc
 
+        decision_join = ""
+        decision_select = "NULL AS decision_interest"
+        if _table_exists(connection, "job_decisions"):
+            decision_join = (
+                "LEFT JOIN job_decisions decision ON "
+                "decision.platform = match.platform AND decision.job_id = match.job_id"
+            )
+            decision_select = "decision.interest AS decision_interest"
         rows = connection.execute(
             f"""
-            SELECT match.*, d.*
+            SELECT match.*, d.*, {decision_select}
               FROM job_match_analyses match
               JOIN job_details d
                 ON d.platform = match.platform AND d.job_id = match.job_id
+              {decision_join}
              WHERE match.analysis_version = ?
                AND match.profile_id = ?
                AND match.profile_version = ?
@@ -867,14 +876,21 @@ def refresh_stale_matches(
             ),
         ).fetchall()
         stale_rows = [
-            row for row in rows
-            if not row["jd_content_hash"]
-            or row["jd_content_hash"] != jd_content_hash(row["jd_text"])
+            (row, _match_refresh_reason(row["jd_content_hash"], row["jd_text"]))
+            for row in rows
         ]
+        stale_rows = [(row, reason) for row, reason in stale_rows if reason]
+        stale_rows.sort(
+            key=lambda item: (
+                _refresh_priority(item[0]["decision_interest"], item[0]["recommendation"])[0],
+                -int(item[0]["score"] or 0),
+                str(item[0]["job_id"]),
+            )
+        )
         selected = stale_rows[:max_rows]
         refreshed_at = _now()
         with connection:
-            for row in selected:
+            for row, _reason in selected:
                 result = analyze_job_match(dict(row), profile)
                 connection.execute(
                     """
@@ -943,7 +959,13 @@ def refresh_stale_matches(
             "profile_id": snapshot["profile_id"],
             "profile_version": snapshot["profile_version"],
             "refreshed": len(selected),
-            "refreshed_job_ids": [row["job_id"] for row in selected],
+            "baseline_initialized": sum(
+                reason == "baseline_pending" for _row, reason in selected
+            ),
+            "jd_changed_refreshed": sum(
+                reason == "jd_changed" for _row, reason in selected
+            ),
+            "refreshed_job_ids": [row["job_id"] for row, _reason in selected],
             "remaining": max(0, len(stale_rows) - len(selected)),
         }
     finally:
@@ -971,6 +993,36 @@ def _recommendation_changed(previous_fit_tier: str, recommendation: str) -> bool
         "exclude": "not_fit",
     }.get(str(previous_fit_tier or ""), "")
     return bool(previous_group and previous_group != recommendation)
+
+
+def _match_refresh_reason(stored_hash: object, jd_text: object) -> str | None:
+    """Explain whether a match needs its first JD baseline or a real JD refresh."""
+    if not str(stored_hash or "").strip():
+        return "baseline_pending"
+    if str(stored_hash) != jd_content_hash(str(jd_text or "")):
+        return "jd_changed"
+    return None
+
+
+def _refresh_priority(interest: object, recommendation: object) -> tuple[int, str]:
+    """Rank stale matches by the user's explicit intent before model output."""
+    user_interest = str(interest or "").strip()
+    fit = str(recommendation or "").strip()
+    if user_interest == "want":
+        if fit == "priority":
+            return 1, "想投且匹配为优先投"
+        if fit == "challenge":
+            return 2, "想投但匹配为挑战投"
+        return 3, "想投但当前不建议投"
+    if user_interest == "maybe":
+        if fit == "priority":
+            return 4, "再看且匹配为优先投"
+        if fit == "challenge":
+            return 5, "再看且匹配为挑战投"
+        return 6, "再看但当前不建议投"
+    if not user_interest and fit in {"priority", "challenge"}:
+        return 6, "未审阅的匹配岗位"
+    return 7, "已放弃或当前不建议投"
 
 
 def _latest_match_history(
@@ -1056,6 +1108,11 @@ def _attach_refresh_comparison(item: dict, history: dict | None) -> dict:
         for field in ("recommendation", "track", "score", "confidence", "information_status")
     )
     comparison = {
+        "refresh_kind": (
+            "baseline_initialization"
+            if not str(history["jd_content_hash"] or "").strip()
+            else "jd_changed"
+        ),
         "recommendation_changed": item.get("recommendation") != previous["recommendation"],
         "track_changed": item.get("track") != previous["track"],
         "score_delta": int(item.get("score") or 0) - int(previous["score"] or 0),
@@ -1158,10 +1215,13 @@ def build_match_dashboard(connection: sqlite3.Connection) -> dict:
     )
     for row in rows:
         item = dict(row)
-        item["match_stale"] = (
-            not item.get("jd_content_hash")
-            or item["jd_content_hash"] != jd_content_hash(item.get("jd_text"))
+        item["refresh_priority"], item["refresh_priority_reason"] = _refresh_priority(
+            item.get("interest"), item.get("recommendation")
         )
+        item["match_refresh_reason"] = _match_refresh_reason(
+            item.get("jd_content_hash"), item.get("jd_text")
+        )
+        item["match_stale"] = item["match_refresh_reason"] is not None
         item["changed"] = _recommendation_changed(
             item["previous_fit_tier"], item["recommendation"]
         )
@@ -1192,6 +1252,14 @@ def build_match_dashboard(connection: sqlite3.Connection) -> dict:
             "conflicts": conflicts,
             "decision_conflicts": decision_conflicts,
             "stale": sum(item["match_stale"] for item in jobs),
+            "baseline_pending": sum(
+                item["match_refresh_reason"] == "baseline_pending"
+                for item in jobs
+            ),
+            "jd_changed": sum(
+                item["match_refresh_reason"] == "jd_changed"
+                for item in jobs
+            ),
             "recently_refreshed": sum(item["previous_match"] is not None for item in jobs),
             "refresh_changed": sum(item["refresh_changed"] for item in jobs),
         },
@@ -1246,10 +1314,13 @@ def get_match_detail(
     if row is None:
         return None
     result = dict(row)
-    result["match_stale"] = (
-        not result.get("jd_content_hash")
-        or result["jd_content_hash"] != jd_content_hash(result.get("jd_text"))
+    result["refresh_priority"], result["refresh_priority_reason"] = _refresh_priority(
+        result.get("decision_interest"), result.get("recommendation")
     )
+    result["match_refresh_reason"] = _match_refresh_reason(
+        result.get("jd_content_hash"), result.get("jd_text")
+    )
+    result["match_stale"] = result["match_refresh_reason"] is not None
     history = _latest_match_history(
         connection,
         analysis_version=snapshot["analysis_version"],

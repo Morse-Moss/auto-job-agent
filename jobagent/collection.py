@@ -181,6 +181,7 @@ class CollectionStore:
               platform TEXT NOT NULL,
               job_id TEXT NOT NULL,
               source TEXT NOT NULL,
+              source_key TEXT,
               source_run_id TEXT NOT NULL,
               source_page INTEGER NOT NULL,
               source_url TEXT NOT NULL,
@@ -230,6 +231,12 @@ class CollectionStore:
               updated_at TEXT NOT NULL
             );
             """
+        )
+        self._add_columns(
+            "job_observations",
+            {
+                "source_key": "TEXT",
+            },
         )
         self._add_columns(
             "job_details",
@@ -330,6 +337,7 @@ class CollectionStore:
             job.get("platform", "boss"),
             job["job_id"],
             job.get("source", "boss-search"),
+            job.get("source_key") or job.get("source", "boss-search"),
             run_id,
             int(job.get("source_page", 1)),
             source_url,
@@ -350,8 +358,18 @@ class CollectionStore:
         try:
             self.conn.execute(
                 """
-            INSERT INTO job_observations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            INSERT INTO job_observations (
+              platform, job_id, source, source_key, source_run_id, source_page,
+              source_url, title, location, salary_raw, experience_raw,
+              education_raw, company, industry, financing, company_size,
+              recruiter_name, recruiter_role, card_text, collected_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(platform, job_id) DO UPDATE SET
+              source=excluded.source,
+              source_key=excluded.source_key,
+              source_run_id=excluded.source_run_id,
+              source_page=excluded.source_page,
+              source_url=excluded.source_url,
               title=excluded.title,
               location=excluded.location,
               salary_raw=excluded.salary_raw,
@@ -527,6 +545,55 @@ class CollectionStore:
         return self.conn.execute(
             "SELECT * FROM job_details WHERE platform = 'boss' AND job_id = ?", (job_id,)
         ).fetchone()
+
+    def get_refresh_target(self, job_id: str):
+        """Return a detail-shaped row for an existing detail or card observation."""
+        normalized_id = str(job_id or "").strip()
+        if not normalized_id:
+            return None
+        detail = self.get_detail(normalized_id)
+        if detail is not None:
+            return detail
+        observation = self.conn.execute(
+            "SELECT * FROM job_observations WHERE platform = 'boss' AND job_id = ?",
+            (normalized_id,),
+        ).fetchone()
+        if observation is None:
+            return None
+        source_url = canonical_job_url(
+            observation["source_url"]
+            or f"https://www.zhipin.com/job_detail/{normalized_id}.html"
+        )
+        return {
+            "platform": observation["platform"],
+            "job_id": observation["job_id"],
+            "source_run_id": observation["source_run_id"],
+            "source_url": source_url,
+            "source_page": observation["source_page"],
+            "title": observation["title"] or "",
+            "company": observation["company"] or "",
+            "detail_status": "missing",
+            "jd_text": "",
+            "detail_text": observation["card_text"] or "",
+            "collected_at": observation["collected_at"],
+            "source_key": observation["source_key"] or observation["source"] or "refresh",
+            "salary_raw": observation["salary_raw"] or "",
+            "location": observation["location"] or "",
+            "experience_raw": observation["experience_raw"] or "",
+            "education_raw": observation["education_raw"] or "",
+            "industry": observation["industry"] or "",
+            "financing": observation["financing"] or "",
+            "company_size": observation["company_size"] or "",
+            "recruiter_name": observation["recruiter_name"] or "",
+            "recruiter_role": observation["recruiter_role"] or "",
+            "recruiter_active": "",
+            "skills_json": "[]",
+            "welfare_json": "[]",
+            "labels_json": "[]",
+            "last_error": None,
+            "attempt_count": 0,
+            "updated_at": observation["collected_at"],
+        }
 
     def has_collected_detail(self, job_id: str) -> bool:
         row = self.conn.execute(

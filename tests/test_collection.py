@@ -129,6 +129,47 @@ class CollectionStoreTests(unittest.TestCase):
             self.assertEqual(row["scan_miss_count"], 1)
             store.close()
 
+    def test_refresh_target_falls_back_to_observation_only_job(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = CollectionStore(Path(temp_dir) / "jobs.db")
+            run_id = store.start_run(target_count=1)
+            store.save_observation(
+                {
+                    "platform": "boss",
+                    "job_id": "card-only",
+                    "source": "boss-search",
+                    "source_key": "search:上海:AI Agent",
+                    "source_page": 2,
+                    "source_url": "https://www.zhipin.com/job_detail/card-only.html",
+                    "title": "卡片岗位",
+                    "company": "示例公司",
+                    "location": "上海",
+                    "salary_raw": "20-30K",
+                    "experience_raw": "1-3年",
+                    "education_raw": "本科",
+                    "industry": "人工智能",
+                    "financing": "A轮",
+                    "company_size": "20-99人",
+                    "recruiter_name": "招聘者",
+                    "recruiter_role": "HR",
+                    "card_text": "卡片岗位",
+                },
+                run_id,
+            )
+
+            self.assertIsNone(store.get_detail("card-only"))
+            target = store.get_refresh_target("card-only")
+
+            self.assertIsNotNone(target)
+            self.assertEqual(target["job_id"], "card-only")
+            self.assertEqual(target["title"], "卡片岗位")
+            self.assertEqual(target["company"], "示例公司")
+            self.assertEqual(target["source_page"], 2)
+            self.assertEqual(target["source_key"], "search:上海:AI Agent")
+            self.assertEqual(target["detail_status"], "missing")
+            self.assertEqual(target["jd_text"], "")
+            store.close()
+
     def test_closed_refresh_preserves_last_successful_jd(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = CollectionStore(Path(temp_dir) / "jobs.db")
@@ -379,9 +420,10 @@ class CollectionCliTests(unittest.TestCase):
         }
         board = {
             "refresh_plan": [
-                {"job_id": "job-1", "refresh_due": True},
-                {"job_id": "job-2", "refresh_due": True},
-                {"job_id": "job-3", "refresh_due": False},
+                {"job_id": "job-1", "refresh_due": True, "refresh_action": "detail_refresh"},
+                {"job_id": "job-2", "refresh_due": True, "refresh_action": "detail_refresh"},
+                {"job_id": "job-3", "refresh_due": True, "refresh_action": "coverage_scan"},
+                {"job_id": "job-4", "refresh_due": False, "refresh_action": None},
             ]
         }
         result = SimpleNamespace(collected=2, total=3, status="completed", error=None)
@@ -399,7 +441,7 @@ class CollectionCliTests(unittest.TestCase):
             patch.object(main_module, "build_freshness_dashboard", return_value=board),
             patch.object(main_module, "BossCollector", return_value=collector),
             patch("builtins.print"),
-            patch("sys.argv", ["main.py", "--refresh-due", "--refresh-target", "2"]),
+            patch("sys.argv", ["main.py", "--refresh-due", "--refresh-target", "3"]),
         ):
             main_module.main()
 
@@ -408,6 +450,34 @@ class CollectionCliTests(unittest.TestCase):
         knowledge.assert_not_called()
         application_store.assert_not_called()
         collector.refresh.assert_called_once_with(["job-1", "job-2"], max_jobs=2)
+        collection_store.close.assert_called_once()
+
+    def test_refresh_due_explains_when_only_coverage_scan_is_due(self):
+        cfg = {
+            "boss": {"cdp_endpoint": "http://127.0.0.1:17332"},
+            "collection": {"db_path": "jobs.db", "target": 300},
+        }
+        board = {
+            "refresh_plan": [
+                {"job_id": "job-coverage", "refresh_due": True, "refresh_action": "coverage_scan"},
+            ]
+        }
+        collection_store = Mock()
+
+        with (
+            patch.object(main_module, "load_config", return_value=cfg),
+            patch.object(main_module, "CollectionStore", return_value=collection_store),
+            patch.object(main_module, "build_freshness_dashboard", return_value=board),
+            patch.object(main_module, "BossCollector") as collector,
+            patch("builtins.print") as printer,
+            patch("sys.argv", ["main.py", "--refresh-due"]),
+        ):
+            main_module.main()
+
+        collector.assert_not_called()
+        messages = " ".join(str(call.args[0]) for call in printer.call_args_list if call.args)
+        self.assertIn("--scan-coverage", messages)
+        self.assertNotIn("没有到期岗位需要复核", messages)
         collection_store.close.assert_called_once()
 
     def test_collect_only_never_constructs_ai_resume_or_knowledge_provider(self):

@@ -672,6 +672,16 @@ def classify_refresh_attention(job: dict) -> str | None:
     return None
 
 
+def refresh_action_for_job(job: dict) -> str | None:
+    """Map freshness attention to the only safe next operation."""
+    attention = str(job.get("refresh_attention") or "").strip()
+    if attention in {"detail_due", "retry_due", "detail_missing"}:
+        return "detail_refresh"
+    if attention == "scan_attention":
+        return "coverage_scan"
+    return None
+
+
 def build_freshness_dashboard(
     connection: sqlite3.Connection,
     *,
@@ -787,6 +797,7 @@ def build_freshness_dashboard(
             }
         )
         jobs[-1]["refresh_attention"] = classify_refresh_attention(jobs[-1])
+        jobs[-1]["refresh_action"] = refresh_action_for_job(jobs[-1])
         jobs[-1]["refresh_due"] = jobs[-1]["refresh_attention"] is not None
     state_order = {"stale": 0, "inaccessible": 1, "aging": 2, "active": 3, "closed": 4, "archived": 5}
     jobs.sort(key=lambda job: (state_order.get(job["lifecycle_state"], 9), job["refresh_priority"], -job["age_days"], job["job_id"]))

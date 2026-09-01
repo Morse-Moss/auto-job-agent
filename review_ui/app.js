@@ -716,19 +716,29 @@ function filteredMatches() {
   const jobs = state.matching?.jobs || [];
   if (state.matchFilter === "all") return jobs;
   if (state.matchFilter === "changed") return jobs.filter((job) => job.changed);
-  if (state.matchFilter === "stale") return jobs.filter((job) => job.match_stale);
+  if (state.matchFilter === "baseline_pending" || state.matchFilter === "jd_changed") {
+    return jobs.filter((job) => job.match_refresh_reason === state.matchFilter);
+  }
   return jobs.filter((job) => job.recommendation === state.matchFilter);
 }
 
 function renderMatchQueue() {
-  const jobs = filteredMatches();
+  const jobs = filteredMatches().slice();
+  if (state.matchFilter === "baseline_pending" || state.matchFilter === "jd_changed") {
+    jobs.sort((left, right) => (
+      Number(left.refresh_priority ?? 99) - Number(right.refresh_priority ?? 99)
+      || Number(right.score ?? 0) - Number(left.score ?? 0)
+      || String(left.job_id).localeCompare(String(right.job_id))
+    ));
+  }
   const filterLabels = {
     all: "全部岗位",
     priority: "优先投",
     challenge: "挑战投",
     not_fit: "当前不建议投",
     changed: "新旧判断冲突",
-    stale: "JD 待重算",
+    baseline_pending: "待建立基线",
+    jd_changed: "JD 已变化",
   };
   document.querySelector("#matchFilterTitle").textContent = filterLabels[state.matchFilter];
   elements.matchVisibleCount.textContent = String(jobs.length);
@@ -760,7 +770,19 @@ function renderMatchQueue() {
       createTextElement("span", "", job.experience_raw || "经验未提供"),
     );
     if (job.changed) meta.append(createTextElement("span", "match-change-flag", "v1→v2"));
-    if (job.match_stale) meta.append(createTextElement("span", "match-change-flag", "JD 待重算"));
+    if (job.match_refresh_reason === "baseline_pending") {
+      meta.append(createTextElement("span", "match-change-flag", "待建立基线"));
+    }
+    if (job.match_refresh_reason === "jd_changed") {
+      meta.append(createTextElement("span", "match-change-flag", "JD 已变化"));
+    }
+    if (job.match_stale) {
+      meta.append(createTextElement(
+        "span",
+        "match-refresh-priority",
+        `优先处理 ${job.refresh_priority ?? "-"} · ${job.refresh_priority_reason || "待处理匹配"}`,
+      ));
+    }
     if (job.refresh_changed) meta.append(createTextElement("span", "match-change-flag", "重算有变化"));
     button.append(top, title, company, meta);
     button.addEventListener("click", () => selectMatch(job.job_id, job.platform));
@@ -774,7 +796,7 @@ function renderMatchingDashboard(dashboard) {
   if (!snapshot) {
     document.querySelector("#matchScope").textContent = dashboard.empty_message || "尚未生成匹配预览。";
     document.querySelector("#matchVersion").textContent = "";
-    ["matchTotal", "matchPriority", "matchChallenge", "matchNotFit", "matchConflicts", "matchStaleCount"]
+    ["matchTotal", "matchPriority", "matchChallenge", "matchNotFit", "matchConflicts", "matchBaselinePending", "matchJdChanged"]
       .forEach((id) => { document.querySelector(`#${id}`).textContent = "0"; });
     renderMatchQueue();
     elements.matchDetailEmpty.querySelector("strong").textContent = "尚未生成 v2 匹配预览";
@@ -788,7 +810,8 @@ function renderMatchingDashboard(dashboard) {
   document.querySelector("#matchChallenge").textContent = String(snapshot.challenge);
   document.querySelector("#matchNotFit").textContent = String(snapshot.not_fit);
   document.querySelector("#matchConflicts").textContent = String(snapshot.conflicts);
-  document.querySelector("#matchStaleCount").textContent = String(snapshot.stale || 0);
+  document.querySelector("#matchBaselinePending").textContent = String(snapshot.baseline_pending || 0);
+  document.querySelector("#matchJdChanged").textContent = String(snapshot.jd_changed || 0);
   renderMatchQueue();
 }
 
@@ -854,19 +877,41 @@ function renderMatchDetail(match) {
   information.className = `information-label ${match.information_status}`;
   information.textContent = labels.information[match.information_status] || match.information_status;
   document.querySelector("#matchChanged").hidden = !match.changed;
-  document.querySelector("#matchStale").hidden = !match.match_stale;
+  const matchStale = document.querySelector("#matchStale");
+  const refreshReason = match.match_refresh_reason || (
+    match.match_stale ? (match.jd_content_hash ? "jd_changed" : "baseline_pending") : null
+  );
+  matchStale.hidden = !refreshReason;
+  matchStale.textContent = refreshReason === "baseline_pending"
+    ? "待建立匹配基线"
+    : "JD 已变化，待更新匹配";
+  const refreshPriority = document.querySelector("#matchRefreshPriority");
+  refreshPriority.hidden = !refreshReason;
+  refreshPriority.textContent = refreshReason
+    ? `优先处理 ${match.refresh_priority ?? "-"} · ${match.refresh_priority_reason || "待处理匹配"}`
+    : "";
   document.querySelector("#matchRefreshChanged").hidden = !match.refresh_changed;
   const refreshComparison = document.querySelector("#refreshComparison");
   const previousRefreshMatch = document.querySelector("#previousRefreshMatch");
   const currentRefreshMatch = document.querySelector("#currentRefreshMatch");
   const refreshComparisonMeta = document.querySelector("#refreshComparisonMeta");
+  const refreshComparisonLabel = document.querySelector("#refreshComparisonLabel");
+  const refreshComparisonHeading = document.querySelector("#refreshComparisonHeading");
+  const previousRefreshLabel = document.querySelector("#previousRefreshLabel");
+  const currentRefreshLabel = document.querySelector("#currentRefreshLabel");
   if (match.previous_match) {
     const previous = match.previous_match;
+    const refreshKind = match.refresh_comparison?.refresh_kind;
+    const isBaseline = refreshKind === "baseline_initialization";
     refreshComparison.hidden = false;
+    refreshComparisonLabel.textContent = isBaseline ? "首次建立匹配基线" : "JD 更新重算";
+    refreshComparisonHeading.textContent = isBaseline ? "基线建立前后" : "JD 更新前后";
+    previousRefreshLabel.textContent = isBaseline ? "原始判断" : "更新前";
+    currentRefreshLabel.textContent = isBaseline ? "基线判断" : "更新后";
     previousRefreshMatch.textContent = `${labels.recommendations[previous.recommendation] || previous.recommendation} · ${previous.score} 分`;
     currentRefreshMatch.textContent = `${labels.recommendations[match.recommendation] || match.recommendation} · ${match.score} 分`;
     refreshComparisonMeta.textContent = previous.captured_at
-      ? `重算于 ${formatFreshnessTime(previous.captured_at)}`
+      ? `${isBaseline ? "建立于" : "重算于"} ${formatFreshnessTime(previous.captured_at)}`
       : "";
     renderRefreshComparison(match.refresh_comparison);
   } else {
@@ -874,6 +919,10 @@ function renderMatchDetail(match) {
     previousRefreshMatch.textContent = "";
     currentRefreshMatch.textContent = "";
     refreshComparisonMeta.textContent = "";
+    refreshComparisonLabel.textContent = "匹配刷新记录";
+    refreshComparisonHeading.textContent = "更新前后";
+    previousRefreshLabel.textContent = "更新前";
+    currentRefreshLabel.textContent = "更新后";
     renderRefreshComparison(null);
   }
   document.querySelector("#matchJobTitle").textContent = match.title || "未命名岗位";
@@ -977,7 +1026,7 @@ async function refreshStaleMatches() {
       body: JSON.stringify({ limit: 20 }),
     });
     elements.refreshStaleMatchesState.textContent = result.refreshed
-      ? `已重算 ${result.refreshed} 条，剩余 ${result.remaining} 条`
+      ? `建立基线 ${result.baseline_initialized || 0} 条，因 JD 变化重算 ${result.jd_changed_refreshed || 0} 条，剩余 ${result.remaining} 条`
       : "没有可重算岗位";
     state.matching = null;
     await loadMatchingDashboard();
@@ -1188,6 +1237,13 @@ function freshnessAction(job) {
   }[job.refresh_attention] || "无需动作";
 }
 
+function freshnessActionLabel(job) {
+  return {
+    detail_refresh: "详情复核",
+    coverage_scan: "列表复扫",
+  }[job.refresh_action] || freshnessAction(job);
+}
+
 function renderRefreshPlan(plan) {
   elements.refreshPlan.replaceChildren();
   plan.slice(0, 10).forEach((job, index) => {
@@ -1197,10 +1253,10 @@ function renderRefreshPlan(plan) {
     const body = document.createElement("div");
     const heading = document.createElement("div");
     heading.className = "refresh-plan-heading";
-    heading.append(createTextElement("h4", "", job.title || "未命名岗位"), createFreshnessStatus(job));
+      heading.append(createTextElement("h4", "", job.title || "未命名岗位"), createFreshnessStatus(job));
     body.append(
       heading,
-      createTextElement("p", "", `${job.company || "公司信息缺失"} · ${freshnessAction(job)}`),
+      createTextElement("p", "", `${job.company || "公司信息缺失"} · ${freshnessActionLabel(job)}`),
       createTextElement("small", "", `距最近有效证据 ${job.age_days} 天 · 建议周期 ${job.ttl_days} 天`),
     );
     row.append(number, body);
@@ -1239,7 +1295,7 @@ function renderFreshnessJobs() {
         : "尚未采集完整 JD"],
       ["刷新周期", `${job.ttl_days} 天`],
       ["当前间隔", `${job.age_days} 天`],
-      ["下一步", freshnessAction(job)],
+      ["下一步", freshnessActionLabel(job)],
     ].forEach(([name, value]) => {
       const wrapper = document.createElement("div");
       wrapper.append(createTextElement("dt", "", name), createTextElement("dd", "", value));

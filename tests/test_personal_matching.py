@@ -539,6 +539,74 @@ def create_preview_database(path: Path) -> None:
 
 
 class MatchPersistenceTests(unittest.TestCase):
+    def test_missing_jd_hash_is_baseline_pending_not_jd_changed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "jobs.db"
+            create_preview_database(db_path)
+            run_match_preview(db_path, candidate_profile(), "match-v2.0")
+            connection = sqlite3.connect(db_path)
+            connection.row_factory = sqlite3.Row
+            connection.execute(
+                "UPDATE job_match_analyses SET jd_content_hash = NULL WHERE job_id = 'job-1'"
+            )
+            connection.commit()
+            try:
+                job = build_match_dashboard(connection)["jobs"][0]
+            finally:
+                connection.close()
+
+            self.assertTrue(job["match_stale"])
+            self.assertEqual(job["match_refresh_reason"], "baseline_pending")
+
+    def test_changed_jd_hash_is_jd_changed_not_baseline_pending(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "jobs.db"
+            create_preview_database(db_path)
+            run_match_preview(db_path, candidate_profile(), "match-v2.0")
+            connection = sqlite3.connect(db_path)
+            connection.row_factory = sqlite3.Row
+            connection.execute(
+                "UPDATE job_details SET jd_text = jd_text || ' 新增 Kubernetes 门槛' WHERE job_id = 'job-1'"
+            )
+            connection.commit()
+            try:
+                job = build_match_dashboard(connection)["jobs"][0]
+            finally:
+                connection.close()
+
+            self.assertTrue(job["match_stale"])
+            self.assertEqual(job["match_refresh_reason"], "jd_changed")
+
+    def test_baseline_refresh_history_is_marked_as_initialization(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "jobs.db"
+            create_preview_database(db_path)
+            run_match_preview(db_path, candidate_profile(), "match-v2.0")
+            connection = sqlite3.connect(db_path)
+            connection.row_factory = sqlite3.Row
+            connection.execute(
+                "UPDATE job_match_analyses SET jd_content_hash = NULL WHERE job_id = 'job-1'"
+            )
+            connection.commit()
+            connection.close()
+
+            refresh_stale_matches(db_path, limit=1)
+            connection = sqlite3.connect(db_path)
+            connection.row_factory = sqlite3.Row
+            try:
+                row = connection.execute(
+                    "SELECT jd_content_hash FROM job_match_history WHERE job_id = 'job-1'"
+                ).fetchone()
+                job = build_match_dashboard(connection)["jobs"][0]
+            finally:
+                connection.close()
+
+            self.assertIsNone(row["jd_content_hash"])
+            self.assertEqual(
+                job["refresh_comparison"]["refresh_kind"],
+                "baseline_initialization",
+            )
+
     def test_refresh_stale_matches_updates_only_changed_jobs(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "jobs.db"
@@ -553,6 +621,8 @@ class MatchPersistenceTests(unittest.TestCase):
 
             result = refresh_stale_matches(db_path, limit=1)
             self.assertEqual(result["refreshed"], 1)
+            self.assertEqual(result["baseline_initialized"], 0)
+            self.assertEqual(result["jd_changed_refreshed"], 1)
             self.assertEqual(result["remaining"], 0)
             connection = sqlite3.connect(db_path)
             connection.row_factory = sqlite3.Row
@@ -572,6 +642,66 @@ class MatchPersistenceTests(unittest.TestCase):
                 self.assertIn("refresh_changed", job)
             finally:
                 connection.close()
+
+    def test_refresh_queue_prioritizes_wanted_priority_jobs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "jobs.db"
+            create_preview_database(db_path)
+            connection = sqlite3.connect(db_path)
+            connection.execute(
+                """
+                INSERT INTO job_details (
+                  platform, job_id, title, company, detail_status, jd_text, detail_text,
+                  salary_raw, location, experience_raw, education_raw, recruiter_name,
+                  recruiter_role, labels_json, source_url, collected_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    "boss", "job-2", "AI Agent 工程师", "另一家公司", "collected",
+                    "使用 Python 和 Agent 开发应用。", "", "15-25K", "深圳",
+                    "1-3年", "本科", "招聘者", "HR", "[]",
+                    "https://example.invalid/job-2", "2026-08-01T00:00:00+08:00",
+                ),
+            )
+            connection.execute(
+                "INSERT INTO job_decisions VALUES (?,?,?,?,?,?,?)",
+                ("boss", "job-2", "reject", "方向不符", "", 0, "2026-08-02T00:00:00+08:00"),
+            )
+            connection.execute(
+                """
+                UPDATE job_details
+                   SET title = 'AI Agent 应用工程师',
+                       jd_text = '负责使用 Python、Agent、RAG 开发 AI 应用，完成部署交付。熟悉 FastAPI、Docker，学历本科，1-3年经验。'
+                 WHERE job_id = 'job-1'
+                """
+            )
+            connection.execute(
+                "UPDATE job_details SET jd_text = jd_text || ' 新增 Kubernetes 门槛'"
+            )
+            connection.commit()
+            connection.close()
+
+            run_match_preview(db_path, candidate_profile(), "match-v2.0")
+            connection = sqlite3.connect(db_path)
+            connection.row_factory = sqlite3.Row
+            connection.execute(
+                "UPDATE job_details SET jd_text = jd_text || ' 再次更新职责'"
+            )
+            connection.commit()
+            try:
+                dashboard = build_match_dashboard(connection)
+                stale = [job for job in dashboard["jobs"] if job["match_stale"]]
+            finally:
+                connection.close()
+
+            stale.sort(key=lambda job: (job["refresh_priority"], job["job_id"]))
+            self.assertEqual([job["job_id"] for job in stale], ["job-1", "job-2"])
+            self.assertEqual(stale[0]["refresh_priority"], 1)
+            self.assertEqual(stale[0]["refresh_priority_reason"], "想投且匹配为优先投")
+            self.assertEqual(stale[1]["refresh_priority"], 7)
+
+            result = refresh_stale_matches(db_path, limit=1)
+            self.assertEqual(result["refreshed_job_ids"], ["job-1"])
 
     def test_jd_content_change_marks_existing_match_stale_without_recomputing(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -696,6 +826,11 @@ class MatchPreviewApiTests(unittest.TestCase):
                 self.assertEqual(dashboard["snapshot"]["conflicts"], 1)
                 self.assertEqual(dashboard["jobs"][0]["previous_fit_tier"], "exclude")
                 self.assertTrue(dashboard["jobs"][0]["changed"])
+                self.assertEqual(dashboard["jobs"][0]["refresh_priority"], 2)
+                self.assertEqual(
+                    dashboard["jobs"][0]["refresh_priority_reason"],
+                    "想投但匹配为挑战投",
+                )
 
                 with urlopen(f"{base_url}/api/matches/job-1") as response:
                     detail = json.load(response)["match"]
@@ -704,6 +839,7 @@ class MatchPreviewApiTests(unittest.TestCase):
                 self.assertTrue(detail["strengths"])
                 self.assertIn("jd_evidence", detail["strengths"][0])
                 self.assertEqual(detail["company"], "示例公司")
+                self.assertEqual(detail["refresh_priority"], 2)
             finally:
                 server.shutdown()
                 server.server_close()

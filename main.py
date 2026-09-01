@@ -156,13 +156,22 @@ def main() -> None:
                 str(job["job_id"])
                 for job in board["refresh_plan"]
                 if job.get("refresh_due")
+                and job.get("refresh_action", "detail_refresh") == "detail_refresh"
             ][:target]
             if not job_ids:
-                print("没有到期岗位需要复核")
+                coverage_due = any(
+                    job.get("refresh_due")
+                    and job.get("refresh_action") == "coverage_scan"
+                    for job in board["refresh_plan"]
+                )
+                if coverage_due:
+                    print("当前只有列表复扫任务，请使用 --scan-coverage")
+                else:
+                    print("没有到期岗位需要复核")
                 return
             print(BROWSER_RISK_WARNING)
             collector = BossCollector(cfg, collection_store)
-            result = collector.refresh(job_ids, max_jobs=target)
+            result = collector.refresh(job_ids, max_jobs=len(job_ids))
             print(
                 f"复核结束：成功 {result.collected}，本地岗位库 {result.total}，"
                 f"状态 {result.status}"

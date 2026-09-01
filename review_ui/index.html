@@ -383,7 +383,7 @@
           <div id="refreshPlan" class="refresh-plan-list">
             <p class="loading">正在生成刷新顺序...</p>
           </div>
-          <p class="freshness-boundary">这里只生成离线计划。页面加载不会访问招聘平台，也不会把登录失败或验证码判成岗位关闭。</p>
+          <p class="freshness-boundary">这里只生成离线计划。详情复核与列表复扫分开安排；页面加载不会访问招聘平台，也不会把登录失败或验证码判成岗位关闭。</p>
         </aside>
 
         <section class="freshness-inventory" aria-labelledby="freshnessInventoryHeading">
@@ -423,7 +423,7 @@
         </div>
         <div class="matching-header-actions">
           <span id="matchVersion"></span>
-          <button type="button" class="secondary-action" id="refreshStaleMatchesButton">重算 JD 已变化岗位</button>
+          <button type="button" class="secondary-action" id="refreshStaleMatchesButton">处理待更新匹配</button>
           <span class="save-state" id="refreshStaleMatchesState" role="status"></span>
         </div>
       </header>
@@ -444,8 +444,11 @@
         <button type="button" data-match-filter="changed">
           <strong id="matchConflicts">0</strong><span>新旧判断冲突</span>
         </button>
-        <button type="button" data-match-filter="stale">
-          <strong id="matchStaleCount">0</strong><span>JD 待重算</span>
+        <button type="button" data-match-filter="baseline_pending">
+          <strong id="matchBaselinePending">0</strong><span>待建立基线</span>
+        </button>
+        <button type="button" data-match-filter="jd_changed">
+          <strong id="matchJdChanged">0</strong><span>JD 已变化</span>
         </button>
       </section>
 
@@ -475,7 +478,8 @@
                   <span id="matchRecommendation"></span>
                   <span id="matchInformation"></span>
                   <span id="matchChanged" hidden>判断有变化</span>
-                  <span id="matchStale" hidden>JD 变化，待重算</span>
+                  <span id="matchStale" hidden>匹配待更新</span>
+                  <span id="matchRefreshPriority" hidden></span>
                   <span id="matchRefreshChanged" hidden>重算后有变化</span>
                 </div>
                 <h2 id="matchJobTitle"></h2>
@@ -507,15 +511,15 @@
             <section class="refresh-comparison" id="refreshComparison" aria-labelledby="refreshComparisonHeading" hidden>
               <div class="section-row">
                 <div>
-                  <p class="section-label">本次 JD 重算</p>
-                  <h3 id="refreshComparisonHeading">重算前后</h3>
+                  <p class="section-label" id="refreshComparisonLabel">匹配刷新记录</p>
+                  <h3 id="refreshComparisonHeading">更新前后</h3>
                 </div>
                 <span id="refreshComparisonMeta"></span>
               </div>
               <div class="comparison-line">
-                <div><span>重算前</span><strong id="previousRefreshMatch"></strong></div>
+                <div><span id="previousRefreshLabel">更新前</span><strong id="previousRefreshMatch"></strong></div>
                 <span aria-hidden="true">→</span>
-                <div><span>当前</span><strong id="currentRefreshMatch"></strong></div>
+                <div><span id="currentRefreshLabel">更新后</span><strong id="currentRefreshMatch"></strong></div>
               </div>
               <div class="refresh-evidence-changes" id="refreshEvidenceChanges" hidden>
                 <div class="refresh-change-column" id="refreshAddedColumn" hidden>

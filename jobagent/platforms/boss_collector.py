@@ -194,7 +194,7 @@ class BossCollector:
                         original_page.bring_to_front()
 
                     for job_id in selected:
-                        row = self.store.get_detail(job_id)
+                        row = self.store.get_refresh_target(job_id)
                         if row is None:
                             continue
                         job = dict(row)

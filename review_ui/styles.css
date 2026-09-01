@@ -760,7 +760,7 @@ textarea { min-height: 88px; padding: 9px 10px; resize: vertical; line-height: 1
 .match-metrics {
   margin: 22px 0 28px;
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   border-block: 1px solid var(--line);
 }
 .match-metrics button {
@@ -811,8 +811,9 @@ textarea { min-height: 88px; padding: 9px 10px; resize: vertical; line-height: 1
 .match-job-company, .match-job-meta { color: var(--muted); font-size: 11px; }
 .match-job-meta { justify-content: flex-start; flex-wrap: wrap; }
 .match-change-flag { color: var(--blue); font-weight: 700; }
+.match-refresh-priority { color: var(--amber); font-weight: 700; }
 .match-list-score { color: var(--ink); font-size: 15px; }
-.match-label, .information-label, #matchChanged, #matchStale, #matchRefreshChanged {
+.match-label, .information-label, #matchChanged, #matchStale, #matchRefreshPriority, #matchRefreshChanged {
   width: fit-content;
   padding: 4px 7px;
   border-radius: 4px;
@@ -826,6 +827,7 @@ textarea { min-height: 88px; padding: 9px 10px; resize: vertical; line-height: 1
 .information-label.partial, .information-label.insufficient { background: var(--surface-muted); color: var(--muted); }
 #matchChanged { background: var(--blue-soft); color: var(--blue); }
 #matchStale { background: var(--amber-soft); color: var(--amber); }
+#matchRefreshPriority { background: var(--blue-soft); color: var(--blue); }
 #matchRefreshChanged { background: var(--green-soft); color: var(--green); }
 .match-detail { min-width: 0; min-height: 620px; padding: 28px clamp(22px, 4vw, 54px) 52px; }
 .match-detail-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 28px; padding-bottom: 20px; border-bottom: 2px solid var(--ink); }
@@ -985,6 +987,11 @@ textarea { min-height: 88px; padding: 9px 10px; resize: vertical; line-height: 1
   .company-profile-grid div:nth-child(2n) { border-right: 0; }
   .company-profile-grid div:nth-child(4) { border-right: 0; }
   .matching-workspace { grid-template-columns: 290px minmax(0, 1fr); }
+  .match-metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .match-metrics button { border-bottom: 1px solid var(--line); }
+  .match-metrics button:nth-child(4n) { border-right: 0; }
+  .match-metrics button:nth-child(n + 5) { border-bottom: 0; }
+  .match-metrics button:last-child { border-right: 0; }
   .match-evidence-list { grid-template-columns: 1fr; }
   .refresh-evidence-changes { grid-template-columns: 1fr; gap: 8px; }
   .boundary-workspace { grid-template-columns: 280px minmax(0, 1fr); }
@@ -1080,7 +1087,7 @@ textarea { min-height: 88px; padding: 9px 10px; resize: vertical; line-height: 1
   .match-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); margin: 18px 0; }
   .match-metrics button { min-height: 64px; padding: 12px 10px; border-bottom: 1px solid var(--line); }
   .match-metrics button:nth-child(2n) { border-right: 0; }
-  .match-metrics button:nth-last-child(-n + 2) { border-bottom: 0; }
+  .match-metrics button:nth-child(7) { border-bottom: 0; }
   .match-metrics button:last-child { grid-column: auto; }
   .matching-workspace { display: block; }
   .match-queue { border-right: 0; border-bottom: 6px solid var(--canvas); }
