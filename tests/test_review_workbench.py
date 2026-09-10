@@ -1454,6 +1454,9 @@ class ReviewUiContractTests(unittest.TestCase):
         self.assertIn('id="jobUpdateStatus"', page)
         self.assertIn("/api/job-updates", script)
         self.assertIn("loadJobUpdate", script)
+        self.assertIn('id="executeJobUpdate"', page)
+        self.assertIn("executeJobUpdate", script)
+        self.assertIn("/execute", script)
 
     def test_ui_exposes_versioned_match_calibration_view(self):
         page = (PROJECT_ROOT / "review_ui" / "index.html").read_text(encoding="utf-8")

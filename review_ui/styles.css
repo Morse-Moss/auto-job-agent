@@ -807,6 +807,7 @@ textarea { min-height: 88px; padding: 9px 10px; resize: vertical; line-height: 1
 .job-update-control summary { cursor: pointer; }
 .job-update-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .job-update-actions button { padding: 10px 14px; }
+.job-update-actions .primary-action:disabled { opacity: .48; cursor: not-allowed; }
 @media (max-width: 760px) { .job-update-control { flex-direction: column; } .job-update-actions { width: 100%; } }
 .freshness-header p, .freshness-header > span { color: var(--muted); }
 .freshness-header > span { flex: 0 0 auto; font-size: 11px; }

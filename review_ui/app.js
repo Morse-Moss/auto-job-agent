@@ -179,6 +179,7 @@ const elements = {
   refreshPlan: document.querySelector("#refreshPlan"),
   freshnessError: document.querySelector("#freshnessError"),
   startJobUpdate: document.querySelector("#startJobUpdate"),
+  executeJobUpdate: document.querySelector("#executeJobUpdate"),
   stopJobUpdate: document.querySelector("#stopJobUpdate"),
   jobUpdateStatus: document.querySelector("#jobUpdateStatus"),
   outreachView: document.querySelector("#outreachView"),
@@ -1419,6 +1420,7 @@ function renderJobUpdate(task) {
   const status = task || {};
   elements.jobUpdateStatus.textContent = jobUpdateLabel(status);
   elements.startJobUpdate.disabled = Boolean(task && ["planned", "running"].includes(status.status));
+  elements.executeJobUpdate.disabled = !task || !["planned", "interrupted"].includes(status.status);
   elements.stopJobUpdate.disabled = !["planned", "running", "interrupted"].includes(status.status);
 }
 
@@ -1467,6 +1469,24 @@ async function stopJobUpdate() {
   } catch (error) {
     elements.jobUpdateStatus.textContent = error.message;
     elements.stopJobUpdate.disabled = false;
+  }
+}
+
+async function executeJobUpdate() {
+  const runId = state.jobUpdate?.run_id;
+  if (!runId) return;
+  elements.executeJobUpdate.disabled = true;
+  elements.jobUpdateStatus.textContent = "正在连接 Boss 并执行本轮更新，请留在此页面观察状态…";
+  try {
+    const payload = await fetchJson(`/api/job-updates/${encodeURIComponent(runId)}/execute`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+    });
+    renderJobUpdate(payload.job_update);
+    renderJobUpdatePlan(payload.job_update.plan);
+    if (state.freshness) await loadFreshnessDashboard(true);
+  } catch (error) {
+    elements.jobUpdateStatus.textContent = error.message;
+    elements.executeJobUpdate.disabled = false;
   }
 }
 
@@ -2172,6 +2192,7 @@ elements.correctionForm.addEventListener("submit", saveCorrection);
 elements.preferenceForm.addEventListener("submit", savePreferences);
 elements.refreshStaleMatchesButton?.addEventListener("click", refreshStaleMatches);
 elements.startJobUpdate?.addEventListener("click", startJobUpdate);
+elements.executeJobUpdate?.addEventListener("click", executeJobUpdate);
 elements.stopJobUpdate?.addEventListener("click", stopJobUpdate);
 document.querySelector("#reloadJobUpdate")?.addEventListener("click", loadJobUpdate);
 elements.preferenceTrackOptions.addEventListener("change", syncPreferenceTrackState);
