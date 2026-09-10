@@ -1,8 +1,8 @@
 # 开发阶段记录
 
-当前阶段：S1a 本地更新计划器，LOCAL_READY；S1b 尚未开始。
-最近完成：框架/spec/规范落库；本地计划器与只读快照实现，独立审查 PASS，Windows 中文输出修复。
-下一步：按 S1b 先冻结持久化任务/浏览器租约与更新监管 UI 交互，再接收藏、搜索、旧详情的统一执行。
+当前阶段：S1b 持久化更新任务骨架，LOCAL_READY；真实采集执行与 UI 尚未开始。
+最近完成：框架/spec/规范落库；只读计划器与可恢复任务状态、HTTP 查询/启动/停止入口实现，测试通过。
+下一步：把任务状态接入更新监管 UI，再在单一浏览器租约下接收藏、搜索、旧详情的统一执行。
 
 ```yaml
 stage: S1a-jd-update-plan
@@ -14,25 +14,26 @@ controls:
 state: CLOSE
 preset: null
 scope:
-  owned: [AGENTS.md, docs/product-contract.md, docs/architecture.md, docs/specs/v1-controlled-outreach.md, docs/development-stage.md, jobagent/jd_update.py, tests/test_jd_update.py]
+  owned: [AGENTS.md, docs/product-contract.md, docs/architecture.md, docs/specs/v1-controlled-outreach.md, docs/development-stage.md, jobagent/jd_update.py, jobagent/job_updates.py, jobagent/review_server.py, tests/test_jd_update.py, tests/test_job_updates.py]
   forbidden: [真实简历, config.yaml, 个人数据库内容, 外部发送]
   unrelated_or_unknown: [本轮开始前的 README/config.example/main/review_server/ai/UI/runtime_safety 修改, 原有未跟踪 outreach/pilot 与对应测试]
 dod:
   - 框架、产品边界、阶段 spec 与项目规范落库
   - 旧库已达目标时仍计划增量轮，收藏搜索预算独立
   - 复核按人工意向排序且去重，终态和复扫不混入详情队列
-  - CLI 不改变个人数据库，不调用外部服务，明确计划不是执行结果
+  - HTTP 任务可持久化查询、重复启动复用、重启标记中断、停止可追溯
+  - 本阶段仍不调用外部服务，明确计划不是执行结果
 approvals:
   - 用户授权先落库框架与 spec 再开始开发；产品更新要求由用户主动触发
 verification:
-  focused: [py -m pytest tests/test_jd_update.py -q]
-  stage_exit: [py -m pytest tests/test_collection.py tests/test_freshness.py tests/test_jd_update.py -q, git diff --check]
+  focused: [py -m pytest tests/test_job_updates.py tests/test_review_workbench.py -q]
+  stage_exit: [py -m pytest tests/test_collection.py tests/test_freshness.py tests/test_jd_update.py tests/test_job_updates.py tests/test_review_workbench.py -q, git diff --check]
   real_observation: [本阶段不执行真实 Boss 更新，不发送消息，不调用付费模型]
 review:
   shape: combined
   correction_budget: 2
 knowledge_impact: [架构与产品契约, 项目规范, 阶段接续记录]
-non_goals: [本阶段不接 UI 和统一任务 API, 不生成三套简历, 不实现发送, 不声称全库 JD 已更新]
+  non_goals: [本阶段不接真实采集执行和浏览器租约, 不接 UI, 不生成三套简历, 不实现发送, 不声称全库 JD 已更新]
 ```
 
 独立挑战结论：直接拼接现有采集会混淆总库存与本轮额度，且缺少统一租约与恢复状态。采纳收敛建议，先交付只读计划器；S1b 再统一采集、持久化任务、浏览器互斥、停止恢复和 UI。S1a 不是“更新岗位”端到端完成。

@@ -12,7 +12,17 @@ from typing import Callable
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from jobagent.resume_collection import collect_resume_market_data
+from jobagent.ai import OpenAICompatibleClient
+from jobagent.config import resolve_project_path
+from jobagent.knowledge import create_provider
 from jobagent.matching import refresh_stale_matches
+from jobagent.jd_update import plan_from_database
+from jobagent.job_updates import JobUpdateStore
+from jobagent.outreach import (
+    OutreachService,
+    OutreachValidationError,
+    TailoredResumeRenderer,
+)
 from jobagent.review import (
     ReviewStore,
     ReviewValidationError,
@@ -41,6 +51,7 @@ class ReviewHttpServer(ThreadingHTTPServer):
         config: dict | None = None,
         collection_runner: Callable = collect_resume_market_data,
         analysis_output_dir: Path | None = None,
+        outreach_service_factory: Callable | None = None,
     ):
         super().__init__(address, handler)
         self.db_path = db_path
@@ -48,13 +59,22 @@ class ReviewHttpServer(ThreadingHTTPServer):
         self.config = config or {}
         self.collection_runner = collection_runner
         self.analysis_output_dir = analysis_output_dir or db_path.parent / "analysis"
+        self.outreach_service_factory = outreach_service_factory
         self.collection_lock = threading.Lock()
         self.calibration_operation_lock = threading.Lock()
         self.collection_state = {"status": "idle"}
 
+    def outreach_service(self):
+        if self.outreach_service_factory is None:
+            raise OutreachValidationError("投递准备功能尚未配置")
+        return self.outreach_service_factory()
+
     def collection_snapshot(self) -> dict:
         with self.collection_lock:
             return dict(self.collection_state)
+
+    def job_update_store(self) -> JobUpdateStore:
+        return JobUpdateStore(self.db_path, self.config)
 
     def start_resume_collection(self, payload: dict) -> dict:
         if not self.calibration_operation_lock.acquire(blocking=False):
@@ -172,9 +192,34 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/learning":
             self._learning_dashboard()
             return
+        if path == "/api/outreach":
+            self._outreach_call(lambda service: {"jobs": service.list_candidates()})
+            return
+        if path.startswith("/api/outreach/"):
+            parts = [unquote(value) for value in path.split("/") if value]
+            if len(parts) == 3:
+                self._outreach_call(
+                    lambda service: {"outreach": service.get(
+                        str(query.get("platform", ["boss"])[0]), parts[2]
+                    )}
+                )
+                return
+            if len(parts) == 5 and parts[3] == "artifact" and parts[4] in {"docx", "image"}:
+                self._send_outreach_artifact(
+                    parts[2], parts[4], str(query.get("platform", ["boss"])[0])
+                )
+                return
         if path == "/api/freshness":
             self._freshness_dashboard()
             return
+        if path == "/api/job-updates/plan":
+            self._job_update_plan()
+            return
+        if path.startswith("/api/job-updates/"):
+            run_id = unquote(path.removeprefix("/api/job-updates/"))
+            if run_id:
+                self._job_update_status(run_id)
+                return
         if path == "/api/boundary-calibration":
             self._boundary_dashboard()
             return
@@ -212,7 +257,55 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "页面不存在"})
 
     def do_POST(self) -> None:
-        path = urlsplit(self.path).path
+        request_url = urlsplit(self.path)
+        path = request_url.path
+        query = parse_qs(request_url.query)
+        if path.startswith("/api/outreach/"):
+            parts = [unquote(value) for value in path.split("/") if value]
+            if len(parts) == 4 and parts[3] in {"generate", "confirm"}:
+                try:
+                    payload = self._read_json(64_000)
+                    platform = str(query.get("platform", ["boss"])[0])
+                    if parts[3] == "generate":
+                        self._outreach_call(
+                            lambda service: {"outreach": service.generate(platform, parts[2])}
+                        )
+                    else:
+                        self._outreach_call(
+                            lambda service: {"outreach": service.confirm(
+                                platform, parts[2], str(payload.get("kind") or "")
+                            )}
+                        )
+                except (ValueError, json.JSONDecodeError, OutreachValidationError) as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+        if path == "/api/job-updates":
+            try:
+                payload = self._read_json(64_000)
+                store = self.server.job_update_store()
+                try:
+                    task = store.start(payload)
+                finally:
+                    store.close()
+                self._send_json(HTTPStatus.ACCEPTED, {"job_update": task})
+            except (ValueError, json.JSONDecodeError, ReviewValidationError) as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        if path.startswith("/api/job-updates/") and path.endswith("/stop"):
+            run_id = unquote(path.removeprefix("/api/job-updates/").removesuffix("/stop"))
+            try:
+                store = self.server.job_update_store()
+                try:
+                    task = store.stop(run_id)
+                finally:
+                    store.close()
+                if task is None:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": "更新任务不存在"})
+                else:
+                    self._send_json(HTTPStatus.OK, {"job_update": task})
+            except (ValueError, ReviewValidationError) as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
         if path == "/api/matches/refresh-stale":
             try:
                 content_length = int(self.headers.get("Content-Length", "0"))
@@ -275,6 +368,24 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         request_url = urlsplit(self.path)
         path = request_url.path
         query = parse_qs(request_url.query)
+        if path.startswith("/api/outreach/"):
+            parts = [unquote(value) for value in path.split("/") if value]
+            if len(parts) == 4 and parts[3] in {"greeting", "resume"}:
+                try:
+                    payload = self._read_json(500_000)
+                    platform = str(query.get("platform", ["boss"])[0])
+                    if parts[3] == "greeting":
+                        action = lambda service: {"outreach": service.update_greeting(
+                            platform, parts[2], str(payload.get("text") or "")
+                        )}
+                    else:
+                        action = lambda service: {"outreach": service.update_resume(
+                            platform, parts[2], str(payload.get("markdown") or "")
+                        )}
+                    self._outreach_call(action)
+                except (ValueError, json.JSONDecodeError, OutreachValidationError) as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
         if path == "/api/calibration/preferences":
             try:
                 content_length = int(self.headers.get("Content-Length", "0"))
@@ -375,6 +486,23 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         finally:
             store.close()
 
+    def _job_update_plan(self) -> None:
+        try:
+            self._send_json(HTTPStatus.OK, {"job_update": plan_from_database(self.server.db_path, self.server.config)})
+        except (ValueError, OSError) as exc:
+            self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+
+    def _job_update_status(self, run_id: str) -> None:
+        store = self.server.job_update_store()
+        try:
+            task = store.get(run_id)
+        finally:
+            store.close()
+        if task is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "更新任务不存在"})
+        else:
+            self._send_json(HTTPStatus.OK, {"job_update": task})
+
     def _boundary_dashboard(self) -> None:
         store = ReviewStore(self.server.db_path)
         try:
@@ -428,6 +556,55 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _read_json(self, limit: int) -> dict:
+        content_length = int(self.headers.get("Content-Length", "0"))
+        if content_length > limit:
+            raise OutreachValidationError("提交内容过大")
+        payload = json.loads(self.rfile.read(content_length) or b"{}")
+        if not isinstance(payload, dict):
+            raise OutreachValidationError("提交内容格式不正确")
+        return payload
+
+    def _outreach_call(self, action) -> None:
+        service = None
+        try:
+            service = self.server.outreach_service()
+            self._send_json(HTTPStatus.OK, action(service))
+        except OutreachValidationError as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        except Exception as exc:
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"error": f"投递准备失败：{type(exc).__name__}: {exc}"},
+            )
+        finally:
+            if service is not None:
+                service.close()
+
+    def _send_outreach_artifact(self, job_id: str, kind: str, platform: str) -> None:
+        service = None
+        try:
+            service = self.server.outreach_service()
+            path = service.artifact(platform, job_id, kind)
+            body = path.read_bytes()
+            content_type = (
+                "image/jpeg"
+                if kind == "image"
+                else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Disposition", f'inline; filename="{path.name}"')
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except OutreachValidationError as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        finally:
+            if service is not None:
+                service.close()
+
     def _send_json(self, status: HTTPStatus, payload: dict) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -449,8 +626,46 @@ def create_server(
     config: dict | None = None,
     collection_runner: Callable = collect_resume_market_data,
     analysis_output_dir: str | Path | None = None,
+    outreach_service_factory: Callable | None = None,
 ) -> ReviewHttpServer:
     database = migrate_review_database(db_path)
+    if outreach_service_factory is None and config:
+        def outreach_service_factory():
+            resume_cfg = config.get("resume") or {}
+            resume_path = resolve_project_path(
+                resume_cfg.get("master_file", "resume/AI-Product-Builder-Resume.scoring.md")
+            )
+            template_path = resolve_project_path(
+                resume_cfg.get("word_template", "resume/Ai-product-builder-v10.docx")
+            )
+            output_dir = resolve_project_path(resume_cfg.get("output_dir", "output/tailored"))
+            def load_job(platform, job_id):
+                review_store = ReviewStore(database)
+                try:
+                    return review_store.match_detail(job_id, platform)
+                finally:
+                    review_store.close()
+
+            def load_candidates():
+                review_store = ReviewStore(database)
+                try:
+                    return review_store.match_dashboard().get("jobs", [])
+                finally:
+                    review_store.close()
+
+            return OutreachService(
+                database, resume_path=resume_path,
+                job_loader=load_job,
+                candidate_loader=load_candidates,
+                ai_factory=lambda: OpenAICompatibleClient(config.get("ai") or {}),
+                knowledge=create_provider(config.get("knowledge")),
+                renderer=TailoredResumeRenderer(
+                    template_path,
+                    output_dir,
+                    image_width=int(resume_cfg.get("image_width", 1400)),
+                ),
+            )
+
     return ReviewHttpServer(
         (host, port),
         ReviewRequestHandler,
@@ -461,6 +676,7 @@ def create_server(
         analysis_output_dir=(
             Path(analysis_output_dir).resolve() if analysis_output_dir else None
         ),
+        outreach_service_factory=outreach_service_factory,
     )
 
 
