@@ -73,3 +73,11 @@ knowledge_impact: [架构与产品契约, 项目规范, 阶段接续记录]
 - 兼容旧测试数据库缺少 `source_run_id` 的情况，不因历史 schema 让执行任务假失败。
 - 受影响测试：`py -m pytest tests/test_collection.py tests/test_freshness.py tests/test_jd_update.py tests/test_job_updates.py tests/test_incremental_executor.py tests/test_review_workbench.py -q`，104 项通过。
 - 外部证据仍为空：未连接 CDP、未访问 Boss、未调用模型、未发送消息、未修改个人数据库。
+
+## 真实 Boss 小批次验收（2026-09-10）
+
+- 服务：重启审阅服务加载当前源码；项目配置 `http://127.0.0.1:17332` 正常连接。
+- 任务：`jd-update-94ecd4fb06cf41628dec38321ddc3a47`，仅授权小批次：收藏 3、搜索 3、到期详情 2。
+- 结果：收藏阶段尝试 3 次、采集 0 条；Boss 返回安全校验，任务状态为 `paused`，搜索与详情阶段均未启动。
+- 现场证据：17332 会话页面显示“BOSS 安全提示”，URL 含 `_security_check=1`；未重试、未绕过、未发送消息、未调用模型。
+- 结论：真实更新为部分完成/安全中断，不得声称全库 JD 已更新。后续需用户在 Boss 页面完成平台要求的安全处理后，再由用户明确授权新的小批次执行；当前任务不自动续跑。
