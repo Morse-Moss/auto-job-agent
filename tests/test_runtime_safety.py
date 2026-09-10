@@ -116,7 +116,8 @@ class RuntimeSafetyTests(unittest.TestCase):
             )
             client._chat("system", "user")
 
-        self.assertEqual(create.call_args.kwargs.get("max_tokens"), 256)
+        self.assertEqual(create.call_args.kwargs.get("max_completion_tokens"), 256)
+        self.assertNotIn("max_tokens", create.call_args.kwargs)
 
     def test_scoring_prompt_has_bounded_private_inputs(self):
         with patch.object(ai_module, "OpenAI", return_value=Mock()):

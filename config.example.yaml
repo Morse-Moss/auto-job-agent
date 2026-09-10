@@ -5,6 +5,7 @@ ai:
   api_key: "sk-your-api-key"
   base_url: "https://api.openai.com/v1"  # 也可填写其他 OpenAI-compatible 服务
   model: "gpt-4o-mini"
+  reasoning_effort: ""             # reasoning 模型可设 low / medium / high 等
   max_output_tokens: 1200          # 仅评分时可收紧到 256
 
 match:
@@ -21,7 +22,9 @@ preferences: |
 
 resume:
   master_file: "resume/master_resume.md"
+  word_template: "resume/Ai-product-builder-v10.docx"
   output_dir: "output/tailored"
+  image_width: 1400
 
 # ===== 个人知识库（可选）=====
 # 打招呼语与定制简历的生成依据。没有知识库也能正常运行

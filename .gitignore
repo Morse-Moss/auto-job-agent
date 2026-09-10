@@ -17,6 +17,7 @@ knowledge/*
 
 # 运行时产物
 .state/
+.workbuddy/
 output/
 artifacts/
 private/

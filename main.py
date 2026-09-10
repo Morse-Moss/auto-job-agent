@@ -8,6 +8,7 @@
 """
 
 import argparse
+import json
 import sys
 
 from jobagent.config import load_config, resolve_project_path
@@ -20,10 +21,12 @@ from jobagent.knowledge import create_provider
 from jobagent.matching import load_candidate_profile, run_match_preview
 from jobagent.resume import ResumeManager
 from jobagent.review_server import run_review_server
+from jobagent.review import ReviewStore
 from jobagent.resume_collection import collect_resume_market_data
 from jobagent.store import Store
 from jobagent.platforms.boss import BossPlatform
 from jobagent.platforms.boss_collector import BossCollector
+from jobagent.pilot import build_pilot_plan
 
 PLATFORMS = {
     "boss": BossPlatform,
@@ -110,6 +113,17 @@ def main() -> None:
         help="按简历生成的岗位范围执行只读采集，并在采集后重新校准",
     )
     parser.add_argument(
+        "--pilot-plan",
+        action="store_true",
+        help="基于本地匹配、新鲜度和简历生成受控试点计划，不调用 AI、浏览器或发送消息",
+    )
+    parser.add_argument(
+        "--pilot-max",
+        type=int,
+        default=3,
+        help="试点计划最多保留的岗位数，默认 3",
+    )
+    parser.add_argument(
         "--analysis-output",
         default="output/analysis",
         help="离线分析 CSV 与报告输出目录",
@@ -132,6 +146,7 @@ def main() -> None:
         or args.match_preview
         or args.calibrate_resume
         or args.collect_from_resume
+        or args.pilot_plan
     )
     cfg = load_config(require_ai=not offline_only)
     if args.review_jobs:
@@ -143,6 +158,28 @@ def main() -> None:
             config=cfg,
             analysis_output_dir=resolve_project_path(args.analysis_output),
         )
+        return
+    if args.pilot_plan:
+        collection_cfg = cfg.get("collection") or {}
+        resume_cfg = cfg.get("resume") or {}
+        matching_cfg = cfg.get("matching") or {}
+        resume_path = resolve_project_path(
+            resume_cfg.get("master_file", "resume/master_resume.md")
+        )
+        db_path = resolve_project_path(collection_cfg.get("db_path", "output/jobagent.db"))
+        collection_store = CollectionStore(db_path)
+        review_store = ReviewStore(db_path)
+        try:
+            plan = build_pilot_plan(
+                review_store.match_dashboard(),
+                build_freshness_dashboard(collection_store.conn),
+                resume_path,
+                max_jobs=args.pilot_max,
+            )
+        finally:
+            collection_store.close()
+            review_store.close()
+        print(json.dumps(plan, ensure_ascii=False, indent=2))
         return
     if args.refresh_due:
         collection_cfg = cfg.get("collection") or {}
