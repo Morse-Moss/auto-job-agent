@@ -2,7 +2,7 @@
 
 当前阶段：S1b 更新任务、监管 UI 与采集执行骨架，执行器已绑定租约，LOCAL_READY；真实 Boss 运行尚未执行。
 最近完成：持久化任务执行器绑定浏览器租约，按收藏 → 搜索 → 到期详情串行执行并写回各阶段真实计数；停止请求与安全/登录中断阻断后续阶段；新增 POST /api/job-updates/{run_id}/execute 显式后端动作；简历采集入口接入同一浏览器租约。
-下一步：把详情成功/失败、旧 JD 已变/未变/确认关闭等细分指标接入任务汇总；真实 Boss 小批次验收单列执行，不与模拟验收混报。
+下一步：将真实 Boss 小批次验收单列执行，不与模拟验收混报；之后再推进三方向岗位分析。
 
 ```yaml
 stage: S1a-jd-update-plan
@@ -66,3 +66,10 @@ knowledge_impact: [架构与产品契约, 项目规范, 阶段接续记录]
 - 已知缺口：任务汇总尚未细分“详情成功/失败、旧 JD 已变/未变/确认关闭”，需要从详情版本与新鲜度表取数后补。真实 Boss 验收仍未执行。
 - 有意偏离 spec：spec 的 S1b 接口表要求 `POST /api/job-updates`（start）即原子获取浏览器租约并返回 409。实现改为 start 只建任务、由 `POST /api/job-updates/{run_id}/execute` 才获取租约。理由是“生成计划”属于本地只读动作，不应长时间占住浏览器而阻塞简历采集；且这更贴合“不让页面加载或生成计划触发外部动作”的硬约束。互斥能力未削弱：任一时刻仍只有一个持有者。若后续要对齐 spec 原文，需同步修改本条与产品契约。
 - 修复：采集线程启动失败时复位 `collection_state`，避免状态卡在 running 并泄漏租约；已加回归测试。
+
+## 验证记录（2026-09-10 细分指标）
+
+- `CollectionStore.run_metrics` 现在分别返回详情尝试、成功、失败、明确关闭、已变、未变；无刷新事件保持 0/未知边界，不猜测内容变化。
+- 兼容旧测试数据库缺少 `source_run_id` 的情况，不因历史 schema 让执行任务假失败。
+- 受影响测试：`py -m pytest tests/test_collection.py tests/test_freshness.py tests/test_jd_update.py tests/test_job_updates.py tests/test_incremental_executor.py tests/test_review_workbench.py -q`，104 项通过。
+- 外部证据仍为空：未连接 CDP、未访问 Boss、未调用模型、未发送消息、未修改个人数据库。

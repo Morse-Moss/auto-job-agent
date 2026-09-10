@@ -105,6 +105,13 @@ class JobUpdateStore:
         self.conn.commit()
         return self.get(run_id)
 
+    def collection_metrics(self, collection_run_id: str) -> dict:
+        collection = CollectionStore(self.db_path)
+        try:
+            return collection.run_metrics(collection_run_id)
+        finally:
+            collection.close()
+
     def stop(self, run_id: str) -> dict:
         self.conn.execute("UPDATE job_update_runs SET stop_requested=1, status='cancelled', finished_at=? WHERE run_id=? AND status IN ('planned','running','interrupted')", (_now(), run_id))
         self.conn.commit()

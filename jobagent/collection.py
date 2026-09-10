@@ -331,6 +331,33 @@ class CollectionStore:
             "SELECT * FROM detail_collection_runs WHERE run_id = ?", (run_id,)
         ).fetchone()
 
+    def run_metrics(self, run_id: str) -> dict:
+        """Return auditable counts for one collection run without inferring missing data."""
+        try:
+            rows = self.conn.execute(
+                "SELECT detail_status, COUNT(*) AS count FROM job_details WHERE source_run_id=? GROUP BY detail_status",
+                (run_id,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = []
+        counts = {str(row["detail_status"]): int(row["count"]) for row in rows}
+        events = self.conn.execute(
+            "SELECT result, COUNT(*) AS count FROM job_refresh_events WHERE run_id=? GROUP BY result",
+            (run_id,),
+        ).fetchall() if self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_refresh_events'"
+        ).fetchone() else []
+        results = {str(row["result"]): int(row["count"]) for row in events if row["result"]}
+        return {
+            "attempted": sum(counts.values()),
+            "detail_success": counts.get("collected", 0),
+            "detail_failed": counts.get("failed", 0),
+            "detail_closed": counts.get("closed", 0),
+            "changed": results.get("changed", 0),
+            "unchanged": results.get("unchanged", 0),
+            "refresh_result_unknown": results.get("unknown", 0),
+        }
+
     def save_observation(self, job: dict, run_id: str) -> None:
         source_url = canonical_job_url(job.get("source_url") or job.get("href") or "")
         values = (

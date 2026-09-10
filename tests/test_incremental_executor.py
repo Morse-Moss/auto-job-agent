@@ -109,6 +109,19 @@ def test_executor_rejects_external_execution_without_explicit_run_method():
     assert executor.prepare_only({"run_id": "r1", "status": "planned"})["status"] == "planned"
 
 
+def test_collection_run_metrics_keep_unknown_refresh_results_explicit():
+    with tempfile.TemporaryDirectory() as directory:
+        store = CollectionStore(Path(directory) / "jobs.db")
+        run_id = store.start_run(2, source="test")
+        store.save_detail({"platform": "boss", "job_id": "ok", "source_url": "", "title": "ok", "company": "x", "jd": "jd"}, run_id)
+        store.save_failure({"platform": "boss", "job_id": "bad", "source_url": "", "title": "bad", "company": "x"}, run_id, "timeout")
+        metrics = store.run_metrics(run_id)
+        assert metrics["detail_success"] == 1
+        assert metrics["detail_failed"] == 1
+        assert metrics["refresh_result_unknown"] == 0
+        store.close()
+
+
 def test_executor_runs_stages_in_order_and_writes_real_counts():
     with tempfile.TemporaryDirectory() as directory:
         store = JobUpdateStore(Path(directory) / "jobs.db", CONFIG)

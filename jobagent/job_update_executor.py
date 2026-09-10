@@ -121,6 +121,7 @@ class JobUpdateExecutor:
                 stage["external_status"] = external
                 stage["collected"] = max(0, int(getattr(result, "collected", 0) or 0))
                 stage["attempted"] = self._stage_attempted(stage)
+                stage["metrics"] = self._stage_metrics(result, store)
                 if error:
                     stage["error"] = error
                 stage["status"] = STAGE_STATUS.get(external, "failed")
@@ -160,6 +161,21 @@ class JobUpdateExecutor:
         if stage.get("source") == "detail_refresh":
             return len(stage.get("job_ids") or [])
         return int(stage.get("budget") or 0)
+
+    @staticmethod
+    def _stage_metrics(result, store) -> dict:
+        run_id = str(getattr(result, "run_id", "") or "")
+        if run_id and hasattr(store, "collection_metrics"):
+            return store.collection_metrics(run_id)
+        return {
+            "attempted": int(getattr(result, "collected", 0) or 0),
+            "detail_success": int(getattr(result, "collected", 0) or 0),
+            "detail_failed": 0,
+            "detail_closed": 0,
+            "changed": 0,
+            "unchanged": 0,
+            "refresh_result_unknown": 0,
+        }
 
     @staticmethod
     def _run_stage(stage: dict, collector):
