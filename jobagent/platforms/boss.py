@@ -429,6 +429,12 @@ class BossPlatform(BasePlatform):
     @staticmethod
     def _is_security_url(url: str) -> bool:
         value = str(url or "").lower()
+        parsed = urllib.parse.urlsplit(value)
+        # Boss appends `_security_check` to otherwise normal signed job-detail
+        # links.  Only treat that marker as a block on non-detail routes; the
+        # dedicated verification routes remain hard stops everywhere.
+        if parsed.path.startswith("/job_detail/"):
+            return any(marker in parsed.path for marker in SECURITY_URL_MARKERS[1:])
         return any(marker in value for marker in SECURITY_URL_MARKERS)
 
     # ------------------------------------------------------------------

@@ -265,6 +265,13 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertIs(session[2], safe_page)
         context.new_page.assert_not_called()
 
+    def test_normal_job_detail_security_id_is_not_a_security_page(self):
+        self.assertFalse(
+            BossPlatform._is_security_url(
+                "https://www.zhipin.com/job_detail/abc.html?_security_check=1_123"
+            )
+        )
+
     def test_security_url_is_a_hard_stop(self):
         self.assertTrue(
             BossPlatform._is_security_url(
