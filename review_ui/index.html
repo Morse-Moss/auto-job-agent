@@ -18,6 +18,7 @@
         <button type="button" data-view-target="review" aria-selected="false">岗位审阅</button>
         <button type="button" data-view-target="freshness" aria-selected="false">更新监管</button>
         <button type="button" data-view-target="matching" aria-selected="false">匹配校准</button>
+        <button type="button" data-view-target="outreach" aria-selected="false">投递准备</button>
         <button type="button" data-view-target="boundary" aria-selected="false">边界复核</button>
         <button type="button" data-view-target="learning" aria-selected="false">学习雷达</button>
       </nav>
@@ -350,6 +351,21 @@
         <span id="freshnessAsOf"></span>
       </header>
 
+      <section class="job-update-control" aria-labelledby="jobUpdateHeading">
+        <div>
+          <p class="section-label">用户主动触发</p>
+          <h3 id="jobUpdateHeading">准备本轮更新</h3>
+          <p id="jobUpdateSummary">正在读取本轮范围…</p>
+          <p id="jobUpdateStatus" role="status">正在读取已保存的任务…</p>
+          <details><summary>查看范围与说明</summary><p id="jobUpdateCoverage"></p><p>当前可保存和取消计划，实际采集功能尚未接入。</p></details>
+        </div>
+        <div class="job-update-actions">
+          <button type="button" class="primary-action" id="startJobUpdate" disabled>生成本轮更新任务</button>
+          <button type="button" class="secondary-action" id="stopJobUpdate" disabled>取消本轮计划</button>
+          <button type="button" class="secondary-action" id="reloadJobUpdate">刷新状态</button>
+        </div>
+      </section>
+
       <section class="freshness-metrics" aria-label="岗位新鲜度概览">
         <button type="button" data-freshness-filter="all">
           <strong id="freshnessTotal">0</strong><span>全部岗位</span>
@@ -383,7 +399,7 @@
           <div id="refreshPlan" class="refresh-plan-list">
             <p class="loading">正在生成刷新顺序...</p>
           </div>
-          <p class="freshness-boundary">这里只生成离线计划。详情复核与列表复扫分开安排；页面加载不会访问招聘平台，也不会把登录失败或验证码判成岗位关闭。</p>
+          <p class="freshness-boundary">详情复核与列表复扫分开安排；页面加载不会访问招聘平台，也不会把登录失败或验证码判成岗位关闭。</p>
         </aside>
 
         <section class="freshness-inventory" aria-labelledby="freshnessInventoryHeading">
@@ -581,6 +597,136 @@
           </div>
           <div class="matching-error" id="matchingError" role="alert"></div>
         </article>
+      </div>
+    </main>
+
+    <main class="outreach-view" id="outreachView" hidden>
+      <header class="outreach-header">
+        <div>
+          <p class="section-label">想投岗位 × 受控微调 × 人工确认</p>
+          <h2>投递准备</h2>
+          <p>AI 只调整既有项目和要点的优先级，不改写简历事实。这里不会连接 Boss，也不会发送消息。</p>
+        </div>
+        <span id="outreachSummary">正在读取候选岗位...</span>
+      </header>
+
+      <div class="outreach-workspace">
+        <aside class="outreach-queue" aria-label="待准备岗位">
+          <div class="outreach-pane-heading">
+            <div><p class="section-label">行动队列</p><h3>优先投岗位</h3></div>
+            <span id="outreachCount">0</span>
+          </div>
+          <div class="outreach-job-list" id="outreachJobList">
+            <p class="loading">正在读取...</p>
+          </div>
+        </aside>
+
+        <section class="outreach-editor" aria-labelledby="outreachEditorHeading">
+          <div class="outreach-empty" id="outreachEmpty">
+            <strong>选择一个岗位开始准备</strong>
+            <span>只显示已经标记“想投”、匹配有效且信息完整的岗位。</span>
+          </div>
+          <div id="outreachContent" hidden>
+            <header class="outreach-job-header">
+              <div>
+                <p class="section-label" id="outreachCompany"></p>
+                <h2 id="outreachEditorHeading"></h2>
+                <p id="outreachJobMeta"></p>
+              </div>
+              <span class="outreach-status" id="outreachStatus"></span>
+            </header>
+            <div class="outreach-generate-row">
+              <p id="outreachVersion">尚未生成投递包</p>
+              <button type="button" class="primary-action" id="generateOutreach">生成投递包</button>
+            </div>
+            <nav class="outreach-mobile-tabs" id="outreachMobileTabs" aria-label="投递准备内容">
+              <button type="button" class="active" data-outreach-tab="jd">JD</button>
+              <button type="button" data-outreach-tab="changes">适配变化</button>
+              <button type="button" data-outreach-tab="package">投递内容</button>
+            </nav>
+            <div class="outreach-collapse-toolbar" aria-label="内容展开控制">
+              <span>先看摘要，需要时再展开证据</span>
+              <div>
+                <button type="button" class="text-action" data-collapse-action="expand">全部展开</button>
+                <button type="button" class="text-action" data-collapse-action="collapse">全部收起</button>
+              </div>
+            </div>
+            <div class="outreach-comparison">
+              <section class="outreach-panel outreach-jd-panel active" data-outreach-panel="jd">
+                <div class="outreach-section-heading">
+                  <div><p class="section-label">岗位原文</p><h3>完整 JD</h3></div>
+                  <span id="outreachJdLength"></span>
+                </div>
+                <details class="outreach-collapsible outreach-jd-details" data-collapse-group="jd" data-collapse-default="open">
+                  <summary><span>查看完整 JD</span><span id="outreachJdSummary"></span></summary>
+                  <div class="outreach-jd-text" id="outreachJdText"></div>
+                </details>
+              </section>
+
+              <section class="outreach-panel outreach-change-panel" data-outreach-panel="changes">
+                <div class="outreach-section-heading">
+                  <div><p class="section-label">匹配解释</p><h3>适配度与微调</h3></div>
+                  <strong id="outreachMatchScore">0</strong>
+                </div>
+                <div class="outreach-scope" id="outreachScope"></div>
+                <details class="outreach-collapsible outreach-evidence-group" data-collapse-group="evidence" data-collapse-default="closed">
+                  <summary><span>已匹配</span><span id="outreachStrengthCount"></span></summary>
+                  <div id="outreachStrengths" class="outreach-evidence-list"></div>
+                </details>
+                <details class="outreach-collapsible outreach-evidence-group" data-collapse-group="evidence" data-collapse-default="closed">
+                  <summary><span>缺口与待确认</span><span id="outreachGapCount"></span></summary>
+                  <div id="outreachGaps" class="outreach-evidence-list"></div>
+                </details>
+                <details class="outreach-collapsible outreach-evidence-group outreach-change-group" data-collapse-group="changes" data-collapse-default="open">
+                  <summary><span>简历具体调整</span><span id="outreachChangeCount"></span></summary>
+                  <div id="outreachChanges" class="outreach-change-list"></div>
+                </details>
+              </section>
+
+              <section class="outreach-panel outreach-package-panel" data-outreach-panel="package">
+                <section class="outreach-edit-section greeting-section">
+                  <div class="outreach-section-heading">
+                    <div><p class="section-label">第一条消息</p><h3>招呼语</h3></div>
+                    <span id="greetingCount">0 字</span>
+                  </div>
+                  <p class="greeting-hint">先介绍自己，再回应一个具体 JD 要求，用一条真实经历和相关作品集支撑。</p>
+                  <p class="greeting-quality" id="greetingQuality"></p>
+                  <textarea id="greetingEditor" rows="6" placeholder="生成后可在这里修改招呼语" disabled></textarea>
+                  <div class="outreach-actions">
+                    <button type="button" class="secondary-action" id="saveGreeting" disabled>保存修改</button>
+                    <button type="button" class="confirm-action" id="confirmGreeting" disabled>确认招呼语</button>
+                  </div>
+                </section>
+
+                <section class="outreach-preview" aria-labelledby="outreachPreviewHeading">
+                  <div class="outreach-section-heading">
+                    <div><p class="section-label">发送前预览</p><h3 id="outreachPreviewHeading">简历长图</h3></div>
+                    <span id="resumeImageSize"></span>
+                  </div>
+                  <div class="outreach-image-frame">
+                    <p id="outreachImageEmpty">生成投递包后显示长图。</p>
+                    <img id="outreachResumeImage" alt="岗位定制简历长图" hidden>
+                  </div>
+                </section>
+
+                <details class="outreach-resume-source">
+                  <summary>查看和编辑简历原文</summary>
+                  <div class="outreach-section-heading">
+                    <span>母版原文受保护</span>
+                    <a id="downloadOutreachDocx" class="text-action" href="#" hidden>下载 Word</a>
+                  </div>
+                  <textarea id="resumeEditor" rows="16" placeholder="生成后可在这里调整 Markdown 内容" disabled></textarea>
+                  <div class="outreach-actions">
+                    <button type="button" class="secondary-action" id="saveResume" disabled>保存并重做长图</button>
+                    <button type="button" class="confirm-action" id="confirmResume" disabled>确认长图简历</button>
+                  </div>
+                </details>
+                <p class="outreach-boundary">招呼语与长图必须分别确认。修改任一内容后，对应确认会自动失效。</p>
+              </section>
+            </div>
+            <p class="outreach-error" id="outreachError" role="alert"></p>
+          </div>
+        </section>
       </div>
     </main>
 

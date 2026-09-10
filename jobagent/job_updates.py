@@ -26,6 +26,10 @@ class JobUpdateStore:
           run_id TEXT PRIMARY KEY, status TEXT NOT NULL, external_status TEXT NOT NULL,
           created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, stop_requested INTEGER NOT NULL DEFAULT 0,
           plan_json TEXT NOT NULL, error TEXT)""")
+        self.conn.commit()
+
+    def recover_interrupted(self) -> None:
+        """Startup recovery only, after the executor's exclusive ownership is established."""
         self.conn.execute("UPDATE job_update_runs SET status='interrupted', finished_at=? WHERE status='running'", (_now(),))
         self.conn.commit()
 
@@ -54,15 +58,26 @@ class JobUpdateStore:
         finally:
             collection.close()
         run_id = f"jd-update-{uuid.uuid4().hex}"
-        self.conn.execute(
-            "INSERT INTO job_update_runs(run_id,status,external_status,created_at,plan_json) VALUES(?,?,?,?,?)",
-            (run_id, "planned", "not_run", _now(), json.dumps(plan, ensure_ascii=False)),
-        )
-        self.conn.commit()
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            existing = self.conn.execute(
+                "SELECT * FROM job_update_runs WHERE status IN ('planned','running') ORDER BY rowid DESC LIMIT 1"
+            ).fetchone()
+            if existing:
+                return self._record(existing)
+            self.conn.execute(
+                "INSERT INTO job_update_runs(run_id,status,external_status,created_at,plan_json) VALUES(?,?,?,?,?)",
+                (run_id, "planned", "not_run", _now(), json.dumps(plan, ensure_ascii=False)),
+            )
         return self._record(self.conn.execute("SELECT * FROM job_update_runs WHERE run_id=?", (run_id,)).fetchone())
 
     def get(self, run_id: str) -> dict | None:
         return self._record(self.conn.execute("SELECT * FROM job_update_runs WHERE run_id=?", (run_id,)).fetchone())
+
+    def latest(self) -> dict | None:
+        return self._record(self.conn.execute(
+            "SELECT * FROM job_update_runs ORDER BY rowid DESC LIMIT 1"
+        ).fetchone())
 
     def mark_running(self, run_id: str) -> dict:
         self.conn.execute("UPDATE job_update_runs SET status='running', started_at=? WHERE run_id=? AND status='planned'", (_now(), run_id))

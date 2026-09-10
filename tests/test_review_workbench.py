@@ -1446,6 +1446,15 @@ class ReviewUiContractTests(unittest.TestCase):
         self.assertIn("补采完整 JD", script)
         self.assertNotIn('fetchJson("/api/freshness", {', script)
 
+    def test_ui_exposes_durable_jd_update_controls(self):
+        page = (PROJECT_ROOT / "review_ui" / "index.html").read_text(encoding="utf-8")
+        script = (PROJECT_ROOT / "review_ui" / "app.js").read_text(encoding="utf-8")
+        self.assertIn('id="startJobUpdate"', page)
+        self.assertIn('id="stopJobUpdate"', page)
+        self.assertIn('id="jobUpdateStatus"', page)
+        self.assertIn("/api/job-updates", script)
+        self.assertIn("loadJobUpdate", script)
+
     def test_ui_exposes_versioned_match_calibration_view(self):
         page = (PROJECT_ROOT / "review_ui" / "index.html").read_text(encoding="utf-8")
         script = (PROJECT_ROOT / "review_ui" / "app.js").read_text(encoding="utf-8")

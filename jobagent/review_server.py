@@ -63,6 +63,11 @@ class ReviewHttpServer(ThreadingHTTPServer):
         self.collection_lock = threading.Lock()
         self.calibration_operation_lock = threading.Lock()
         self.collection_state = {"status": "idle"}
+        recovery_store = JobUpdateStore(self.db_path, self.config)
+        try:
+            recovery_store.recover_interrupted()
+        finally:
+            recovery_store.close()
 
     def outreach_service(self):
         if self.outreach_service_factory is None:
@@ -214,6 +219,14 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/job-updates/plan":
             self._job_update_plan()
+            return
+        if path == "/api/job-updates/latest":
+            store = self.server.job_update_store()
+            try:
+                task = store.latest()
+            finally:
+                store.close()
+            self._send_json(HTTPStatus.OK, {"job_update": task})
             return
         if path.startswith("/api/job-updates/"):
             run_id = unquote(path.removeprefix("/api/job-updates/"))
