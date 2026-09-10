@@ -272,6 +272,22 @@ class RuntimeSafetyTests(unittest.TestCase):
             )
         )
 
+    def test_job_detail_redirect_to_verification_is_a_security_page(self):
+        self.assertTrue(
+            BossPlatform._is_security_url(
+                "https://www.zhipin.com/job_detail/abc.html?"
+                "redirect=%2Fweb%2Fpassport%2Fzp%2Fverify.html"
+            )
+        )
+
+    def test_job_detail_unknown_security_check_is_a_hard_stop(self):
+        self.assertTrue(
+            BossPlatform._is_security_url(
+                "https://www.zhipin.com/job_detail/abc.html?"
+                "_security_check=verify_required"
+            )
+        )
+
     def test_security_url_is_a_hard_stop(self):
         self.assertTrue(
             BossPlatform._is_security_url(
