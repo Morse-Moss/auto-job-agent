@@ -80,7 +80,28 @@ class JobUpdateStore:
         ).fetchone())
 
     def mark_running(self, run_id: str) -> dict:
-        self.conn.execute("UPDATE job_update_runs SET status='running', started_at=? WHERE run_id=? AND status='planned'", (_now(), run_id))
+        self.conn.execute(
+            "UPDATE job_update_runs SET status='running', started_at=? "
+            "WHERE run_id=? AND status IN ('planned','interrupted')",
+            (_now(), run_id),
+        )
+        self.conn.commit()
+        return self.get(run_id)
+
+    def write_plan(self, run_id: str, plan: dict) -> dict:
+        """Persist stage progress without implying the whole task succeeded."""
+        self.conn.execute(
+            "UPDATE job_update_runs SET plan_json=? WHERE run_id=?",
+            (json.dumps(plan, ensure_ascii=False), run_id),
+        )
+        self.conn.commit()
+        return self.get(run_id)
+
+    def finish(self, run_id: str, status: str, error: str | None = None) -> dict:
+        self.conn.execute(
+            "UPDATE job_update_runs SET status=?, error=?, finished_at=? WHERE run_id=?",
+            (status, error or None, _now(), run_id),
+        )
         self.conn.commit()
         return self.get(run_id)
 

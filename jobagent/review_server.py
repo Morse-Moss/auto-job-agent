@@ -18,6 +18,7 @@ from jobagent.knowledge import create_provider
 from jobagent.matching import refresh_stale_matches
 from jobagent.jd_update import plan_from_database
 from jobagent.job_updates import JobUpdateStore
+from jobagent.job_update_executor import BrowserLease, BrowserLeaseBusy, JobUpdateExecutor
 from jobagent.outreach import (
     OutreachService,
     OutreachValidationError,
@@ -52,6 +53,7 @@ class ReviewHttpServer(ThreadingHTTPServer):
         collection_runner: Callable = collect_resume_market_data,
         analysis_output_dir: Path | None = None,
         outreach_service_factory: Callable | None = None,
+        job_update_executor: JobUpdateExecutor | None = None,
     ):
         super().__init__(address, handler)
         self.db_path = db_path
@@ -63,6 +65,10 @@ class ReviewHttpServer(ThreadingHTTPServer):
         self.collection_lock = threading.Lock()
         self.calibration_operation_lock = threading.Lock()
         self.collection_state = {"status": "idle"}
+        self.browser_lease = BrowserLease()
+        self.job_update_executor = job_update_executor or JobUpdateExecutor(
+            lease=self.browser_lease, config=self.config
+        )
         recovery_store = JobUpdateStore(self.db_path, self.config)
         try:
             recovery_store.recover_interrupted()
@@ -81,11 +87,25 @@ class ReviewHttpServer(ThreadingHTTPServer):
     def job_update_store(self) -> JobUpdateStore:
         return JobUpdateStore(self.db_path, self.config)
 
+    def execute_job_update(self, run_id: str) -> dict:
+        """Explicit external action. Never reachable from a page load or plan build."""
+        store = self.job_update_store()
+        try:
+            task = store.get(run_id)
+            if task is None:
+                raise ReviewValidationError("更新任务不存在")
+            return self.job_update_executor.run(task, store)
+        finally:
+            store.close()
+
     def start_resume_collection(self, payload: dict) -> dict:
         if not self.calibration_operation_lock.acquire(blocking=False):
             if self.collection_snapshot().get("status") == "running":
                 raise ReviewValidationError("岗位采集正在运行，请等待当前任务结束")
             raise ReviewValidationError("简历校准正在运行，请等待当前任务结束")
+        if not self.browser_lease.try_acquire("resume-collect"):
+            self.calibration_operation_lock.release()
+            raise ReviewValidationError("浏览器正在被更新任务占用，请等待当前任务结束")
 
         try:
             with self.collection_lock:
@@ -105,6 +125,9 @@ class ReviewHttpServer(ThreadingHTTPServer):
             )
             thread.start()
         except Exception:
+            with self.collection_lock:
+                self.collection_state = {"status": "idle"}
+            self.browser_lease.release("resume-collect")
             self.calibration_operation_lock.release()
             raise
         return dict(started)
@@ -181,6 +204,7 @@ class ReviewHttpServer(ThreadingHTTPServer):
             with self.collection_lock:
                 self.collection_state = completed
         finally:
+            self.browser_lease.release("resume-collect")
             self.calibration_operation_lock.release()
 
 
@@ -301,6 +325,18 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
                 finally:
                     store.close()
                 self._send_json(HTTPStatus.ACCEPTED, {"job_update": task})
+            except (ValueError, json.JSONDecodeError, ReviewValidationError) as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        if path.startswith("/api/job-updates/") and path.endswith("/execute"):
+            run_id = unquote(path.removeprefix("/api/job-updates/").removesuffix("/execute"))
+            try:
+                if int(self.headers.get("Content-Length", "0") or 0):
+                    self._read_json(64_000)
+                task = self.server.execute_job_update(run_id)
+                self._send_json(HTTPStatus.OK, {"job_update": task})
+            except BrowserLeaseBusy as exc:
+                self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
             except (ValueError, json.JSONDecodeError, ReviewValidationError) as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
@@ -640,6 +676,7 @@ def create_server(
     collection_runner: Callable = collect_resume_market_data,
     analysis_output_dir: str | Path | None = None,
     outreach_service_factory: Callable | None = None,
+    job_update_executor: JobUpdateExecutor | None = None,
 ) -> ReviewHttpServer:
     database = migrate_review_database(db_path)
     if outreach_service_factory is None and config:
@@ -690,6 +727,7 @@ def create_server(
             Path(analysis_output_dir).resolve() if analysis_output_dir else None
         ),
         outreach_service_factory=outreach_service_factory,
+        job_update_executor=job_update_executor,
     )
 
 

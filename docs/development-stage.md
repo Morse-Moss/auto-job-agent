@@ -1,8 +1,8 @@
 # 开发阶段记录
 
-当前阶段：S1b 更新任务与监管 UI，LOCAL_READY；真实采集执行与浏览器租约尚未开始。
-最近完成：任务状态、HTTP 查询/启动/停止入口和更新监管控件已接通；重启恢复只在服务启动时执行，避免查询中断任务；Edge 桌面/窄屏验收通过。
-下一步：在单一浏览器租约下接收藏、搜索、旧详情的统一执行。
+当前阶段：S1b 更新任务、监管 UI 与采集执行骨架，执行器已绑定租约，LOCAL_READY；真实 Boss 运行尚未执行。
+最近完成：持久化任务执行器绑定浏览器租约，按收藏 → 搜索 → 到期详情串行执行并写回各阶段真实计数；停止请求与安全/登录中断阻断后续阶段；新增 POST /api/job-updates/{run_id}/execute 显式后端动作；简历采集入口接入同一浏览器租约。
+下一步：把详情成功/失败、旧 JD 已变/未变/确认关闭等细分指标接入任务汇总；真实 Boss 小批次验收单列执行，不与模拟验收混报。
 
 ```yaml
 stage: S1a-jd-update-plan
@@ -14,7 +14,7 @@ controls:
 state: CLOSE
 preset: null
 scope:
-  owned: [AGENTS.md, docs/product-contract.md, docs/architecture.md, docs/specs/v1-controlled-outreach.md, docs/development-stage.md, jobagent/jd_update.py, jobagent/job_updates.py, jobagent/review_server.py, review_ui/index.html, review_ui/app.js, review_ui/styles.css, tests/test_jd_update.py, tests/test_job_updates.py, tests/test_review_workbench.py]
+  owned: [AGENTS.md, docs/product-contract.md, docs/architecture.md, docs/specs/v1-controlled-outreach.md, docs/development-stage.md, jobagent/jd_update.py, jobagent/job_updates.py, jobagent/job_update_executor.py, jobagent/platforms/boss_collector.py, jobagent/review_server.py, review_ui/index.html, review_ui/app.js, review_ui/styles.css, tests/test_jd_update.py, tests/test_job_updates.py, tests/test_incremental_executor.py, tests/test_review_workbench.py]
   forbidden: [真实简历, config.yaml, 个人数据库内容, 外部发送]
   unrelated_or_unknown: [本轮开始前的 README/config.example/main/review_server/ai/UI/runtime_safety 修改, 原有未跟踪 outreach/pilot 与对应测试]
 dod:
@@ -22,18 +22,19 @@ dod:
   - 旧库已达目标时仍计划增量轮，收藏搜索预算独立
   - 复核按人工意向排序且去重，终态和复扫不混入详情队列
   - HTTP 任务可持久化查询、重复启动复用、重启标记中断、停止可追溯
-  - 更新监管 UI 可生成、查看、刷新、取消本地计划；本阶段仍不调用外部服务
+  - 更新监管 UI 可生成、查看、刷新、取消本地计划；采集器支持独立来源目标与单一浏览器租约
+  - 本阶段测试不调用真实外部服务
 approvals:
   - 用户授权先落库框架与 spec 再开始开发；产品更新要求由用户主动触发
 verification:
-  focused: [py -m pytest tests/test_job_updates.py tests/test_review_workbench.py -q, node --check review_ui/app.js]
-  stage_exit: [py -m pytest tests/test_collection.py tests/test_freshness.py tests/test_jd_update.py tests/test_job_updates.py tests/test_review_workbench.py -q, git diff --check]
+  focused: [py -m pytest tests/test_incremental_executor.py tests/test_job_updates.py tests/test_review_workbench.py -q, node --check review_ui/app.js]
+  stage_exit: [py -m pytest tests/test_collection.py tests/test_freshness.py tests/test_jd_update.py tests/test_job_updates.py tests/test_incremental_executor.py tests/test_review_workbench.py -q, git diff --check]
   real_observation: [本阶段不执行真实 Boss 更新，不发送消息，不调用付费模型]
 review:
   shape: combined
   correction_budget: 2
 knowledge_impact: [架构与产品契约, 项目规范, 阶段接续记录]
-  non_goals: [本阶段不接真实采集执行和浏览器租约, 不生成三套简历, 不实现发送, 不声称全库 JD 已更新]
+  non_goals: [本阶段不执行真实 Boss 采集, 不接任务后台执行线程, 不生成三套简历, 不实现发送, 不声称全库 JD 已更新]
 ```
 
 独立挑战结论：直接拼接现有采集会混淆总库存与本轮额度，且缺少统一租约与恢复状态。采纳收敛建议，先交付只读计划器；S1b 再统一采集、持久化任务、浏览器互斥、停止恢复和 UI。S1a 不是“更新岗位”端到端完成。
@@ -50,3 +51,18 @@ knowledge_impact: [架构与产品契约, 项目规范, 阶段接续记录]
 - 外部证据：没有执行 Boss 更新、没有模型调用或消息发送；没有修改个人数据库、简历或重启服务。
 - 知识对账：neat-freak 检查产品契约、架构、spec、AGENTS 和本记录，已更新；未写跨项目记忆。
 - 失效条件：修改计划器或 freshness 输入结构后需重验；实时数据变化需重新生成计划。
+
+## 验证记录（2026-09-10 执行器接通）
+
+- 范围：`jobagent/job_update_executor.py`、`jobagent/job_updates.py`、`jobagent/review_server.py`、`tests/test_incremental_executor.py`。原有脏修改仍未纳入本阶段提交。
+- 先写失败测试再实现：新增 5 项测试首轮全部红灯（缺 `run`、`write_plan`、`finish`、`create_server(job_update_executor=...)`），实现后 9 项通过。
+- 新增能力：执行器按收藏 → 搜索 → 到期详情串行执行；每阶段写回 attempted/collected/external_status/error；停止请求后不开启新来源；安全校验与登录失效暂停全部后续阶段；`BrowserLease` 增加可在工作线程调用的 `release`，冲突异常收敛为 `BrowserLeaseBusy` 并在 HTTP 层返回 409。
+- 互斥：`start_resume_collection` 现在先取浏览器租约再启动线程，与“boss-update”共用同一租约；采集线程结束或异常均释放租约与校准锁。
+- 执行入口：`POST /api/job-updates/{run_id}/execute` 是唯一外部动作入口；GET 状态与生成计划均不触发执行，测试已断言 `collector.calls == []`。
+- 受影响边界：`py -m pytest tests/test_collection.py tests/test_freshness.py tests/test_jd_update.py tests/test_job_updates.py tests/test_incremental_executor.py tests/test_review_workbench.py -q`，101 项通过。
+- 全量：`py -m pytest -q`，214 项通过；唯一告警来自既有 `tests/test_outreach.py` 的子进程编码，与本轮无关。
+- `git diff --check` 通过，仅有既有的 LF/CRLF 提示，无空白错误。`node --check review_ui/app.js` 未改动 UI，无需重跑。
+- 外部证据：本轮全部使用注入的模拟采集器与临时数据库，未连接 CDP、未访问 Boss、未调用模型、未发送消息、未修改个人数据库。
+- 已知缺口：任务汇总尚未细分“详情成功/失败、旧 JD 已变/未变/确认关闭”，需要从详情版本与新鲜度表取数后补。真实 Boss 验收仍未执行。
+- 有意偏离 spec：spec 的 S1b 接口表要求 `POST /api/job-updates`（start）即原子获取浏览器租约并返回 409。实现改为 start 只建任务、由 `POST /api/job-updates/{run_id}/execute` 才获取租约。理由是“生成计划”属于本地只读动作，不应长时间占住浏览器而阻塞简历采集；且这更贴合“不让页面加载或生成计划触发外部动作”的硬约束。互斥能力未削弱：任一时刻仍只有一个持有者。若后续要对齐 spec 原文，需同步修改本条与产品契约。
+- 修复：采集线程启动失败时复位 `collection_state`，避免状态卡在 running 并泄漏租约；已加回归测试。

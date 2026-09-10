@@ -137,6 +137,58 @@ class BossCollector:
             error=error,
         )
 
+    def run_incremental(self, favorites_budget: int = 0, search_budget: int = 0) -> CollectionResult:
+        """Collect separate per-source increments in one browser session.
+
+        This keeps the legacy total-inventory API untouched. A budget counts
+        inventory records, including failed detail placeholders.
+        """
+        favorites_budget = max(0, int(favorites_budget))
+        search_budget = max(0, int(search_budget))
+        starting_count = self.store.detail_inventory_count()
+        run_id = self.store.start_run(
+            target_count=favorites_budget + search_budget,
+            source="boss-incremental",
+        )
+        if not (favorites_budget or search_budget):
+            self.store.finish_run(run_id, "completed", records_collected=0)
+            return CollectionResult(run_id, 0, starting_count, "completed")
+        own_pages = []
+        original_page = None
+        status, error = "completed", None
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.connect_over_cdp(
+                    self.boss_cfg.get("cdp_endpoint", "http://127.0.0.1:17332"), timeout=15_000
+                )
+                if not browser.contexts:
+                    raise RuntimeError("CDP browser has no usable context")
+                context = browser.contexts[0]
+                original_page = next((page for page in context.pages if "zhipin.com" in (page.url or "") and not BossPlatform._is_security_url(page.url)), None)
+                list_page = context.new_page(); own_pages.append(list_page)
+                detail_page = context.new_page(); own_pages.append(detail_page)
+                if original_page:
+                    original_page.bring_to_front()
+                if favorites_budget:
+                    self._collect_favorites(list_page, detail_page, run_id=run_id, target=starting_count + favorites_budget)
+                if search_budget:
+                    search_start = self.store.detail_inventory_count()
+                    self._collect_search(list_page, run_id=run_id, target=search_start + search_budget)
+        except BossSecurityCheck as exc:
+            status, error = "security_check", str(exc)
+        except Exception as exc:
+            status, error = "stopped", f"{type(exc).__name__}: {exc}"
+        finally:
+            for page in reversed(own_pages):
+                try: page.close()
+                except Exception: pass
+            if original_page:
+                try: original_page.bring_to_front()
+                except Exception: pass
+        total = self.store.detail_inventory_count()
+        self.store.finish_run(run_id, status, error, records_collected=max(0, total - starting_count))
+        return CollectionResult(run_id, max(0, total - starting_count), total, status, error)
+
     @staticmethod
     def _bounded_job_ids(job_ids: Iterable[str], max_jobs: int = 20) -> list[str]:
         limit = max(0, int(max_jobs))
