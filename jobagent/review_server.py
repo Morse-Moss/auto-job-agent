@@ -9,10 +9,10 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from jobagent.resume_collection import collect_resume_market_data
-from jobagent.ai import OpenAICompatibleClient
+from jobagent.ai import create_ai_client
 from jobagent.config import resolve_project_path
 from jobagent.knowledge import create_provider
 from jobagent.matching import refresh_stale_matches
@@ -23,7 +23,14 @@ from jobagent.outreach import (
     OutreachService,
     OutreachValidationError,
     TailoredResumeRenderer,
+    normalize_resume_assets,
 )
+from jobagent.outreach_send import (
+    OutreachSendService,
+    SendBusy,
+    SendValidationError,
+)
+from jobagent.platforms.boss_sender import BossSender
 from jobagent.review import (
     ReviewStore,
     ReviewValidationError,
@@ -53,6 +60,7 @@ class ReviewHttpServer(ThreadingHTTPServer):
         collection_runner: Callable = collect_resume_market_data,
         analysis_output_dir: Path | None = None,
         outreach_service_factory: Callable | None = None,
+        send_service_factory: Callable | None = None,
         job_update_executor: JobUpdateExecutor | None = None,
     ):
         super().__init__(address, handler)
@@ -62,6 +70,7 @@ class ReviewHttpServer(ThreadingHTTPServer):
         self.collection_runner = collection_runner
         self.analysis_output_dir = analysis_output_dir or db_path.parent / "analysis"
         self.outreach_service_factory = outreach_service_factory
+        self.send_service_factory = send_service_factory
         self.collection_lock = threading.Lock()
         self.calibration_operation_lock = threading.Lock()
         self.collection_state = {"status": "idle"}
@@ -79,6 +88,12 @@ class ReviewHttpServer(ThreadingHTTPServer):
         if self.outreach_service_factory is None:
             raise OutreachValidationError("投递准备功能尚未配置")
         return self.outreach_service_factory()
+
+    def send_service(self):
+        """A controlled-first-contact service bound to the shared browser lease."""
+        if self.send_service_factory is None:
+            raise SendValidationError("受控发送功能尚未配置")
+        return self.send_service_factory(self.browser_lease)
 
     def collection_snapshot(self) -> dict:
         with self.collection_lock:
@@ -238,6 +253,11 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
                     parts[2], parts[4], str(query.get("platform", ["boss"])[0])
                 )
                 return
+            if len(parts) == 4 and parts[3] == "send":
+                self._outreach_send_status(
+                    parts[2], str(query.get("platform", ["boss"])[0])
+                )
+                return
         if path == "/api/freshness":
             self._freshness_dashboard()
             return
@@ -299,13 +319,22 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         query = parse_qs(request_url.query)
         if path.startswith("/api/outreach/"):
             parts = [unquote(value) for value in path.split("/") if value]
-            if len(parts) == 4 and parts[3] in {"generate", "confirm"}:
+            if len(parts) == 4 and parts[3] in {"generate", "confirm", "asset"}:
                 try:
                     payload = self._read_json(64_000)
                     platform = str(query.get("platform", ["boss"])[0])
                     if parts[3] == "generate":
                         self._outreach_call(
-                            lambda service: {"outreach": service.generate(platform, parts[2])}
+                            lambda service: {"outreach": service.generate(
+                                platform, parts[2],
+                                asset_id=str(payload.get("asset_id") or "") or None,
+                            )}
+                        )
+                    elif parts[3] == "asset":
+                        self._outreach_call(
+                            lambda service: {"outreach": service.select_asset(
+                                platform, parts[2], str(payload.get("asset_id") or "")
+                            )}
                         )
                     else:
                         self._outreach_call(
@@ -315,6 +344,15 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
                         )
                 except (ValueError, json.JSONDecodeError, OutreachValidationError) as exc:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            if len(parts) == 4 and parts[3] == "authorize":
+                platform = str(query.get("platform", ["boss"])[0])
+                self._send_call(
+                    lambda service: {"send": service.authorize(platform, parts[2])}
+                )
+                return
+            if len(parts) == 5 and parts[2] == "send" and parts[4] == "execute":
+                self._send_call(lambda service: {"send": service.execute(parts[3])})
                 return
         if path == "/api/job-updates":
             try:
@@ -424,13 +462,15 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
                     payload = self._read_json(500_000)
                     platform = str(query.get("platform", ["boss"])[0])
                     if parts[3] == "greeting":
-                        action = lambda service: {"outreach": service.update_greeting(
-                            platform, parts[2], str(payload.get("text") or "")
-                        )}
+                        def action(service):
+                            return {"outreach": service.update_greeting(
+                                platform, parts[2], str(payload.get("text") or "")
+                            )}
                     else:
-                        action = lambda service: {"outreach": service.update_resume(
-                            platform, parts[2], str(payload.get("markdown") or "")
-                        )}
+                        def action(service):
+                            return {"outreach": service.update_resume(
+                                platform, parts[2], str(payload.get("markdown") or "")
+                            )}
                     self._outreach_call(action)
                 except (ValueError, json.JSONDecodeError, OutreachValidationError) as exc:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -630,6 +670,27 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             if service is not None:
                 service.close()
 
+    def _send_call(self, action) -> None:
+        service = None
+        try:
+            service = self.server.send_service()
+            self._send_json(HTTPStatus.OK, action(service))
+        except SendValidationError as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        except SendBusy as exc:
+            self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+        except Exception as exc:
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"error": f"受控发送失败：{type(exc).__name__}: {exc}"},
+            )
+        finally:
+            if service is not None:
+                service.close()
+
+    def _outreach_send_status(self, job_id: str, platform: str) -> None:
+        self._send_call(lambda service: {"send": service.status_for(platform, job_id)})
+
     def _send_outreach_artifact(self, job_id: str, kind: str, platform: str) -> None:
         service = None
         try:
@@ -641,10 +702,17 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
                 if kind == "image"
                 else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             )
+            # HTTP 头只能 latin-1；中文文件名必须按 RFC 5987 用 filename* 编码，
+            # 否则 UnicodeEncodeError 会直接掐断连接，前端只剩破图占位。
+            ascii_fallback = path.name.encode("ascii", "ignore").decode("ascii") or "artifact"
+            utf8_name = quote(path.name, safe="")
+            disposition = (
+                f"inline; filename=\"{ascii_fallback}\"; filename*=UTF-8''{utf8_name}"
+            )
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Content-Disposition", f'inline; filename="{path.name}"')
+            self.send_header("Content-Disposition", disposition)
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
@@ -676,11 +744,13 @@ def create_server(
     collection_runner: Callable = collect_resume_market_data,
     analysis_output_dir: str | Path | None = None,
     outreach_service_factory: Callable | None = None,
+    send_service_factory: Callable | None = None,
     job_update_executor: JobUpdateExecutor | None = None,
 ) -> ReviewHttpServer:
     database = migrate_review_database(db_path)
-    if outreach_service_factory is None and config:
-        def outreach_service_factory():
+    build_outreach_service: Callable | None = None
+    if config:
+        def build_outreach_service():
             resume_cfg = config.get("resume") or {}
             resume_path = resolve_project_path(
                 resume_cfg.get("master_file", "resume/AI-Product-Builder-Resume.scoring.md")
@@ -689,6 +759,7 @@ def create_server(
                 resume_cfg.get("word_template", "resume/Ai-product-builder-v10.docx")
             )
             output_dir = resolve_project_path(resume_cfg.get("output_dir", "output/tailored"))
+            assets = normalize_resume_assets(resume_cfg.get("assets"))
             def load_job(platform, job_id):
                 review_store = ReviewStore(database)
                 try:
@@ -707,14 +778,36 @@ def create_server(
                 database, resume_path=resume_path,
                 job_loader=load_job,
                 candidate_loader=load_candidates,
-                ai_factory=lambda: OpenAICompatibleClient(config.get("ai") or {}),
+                ai_factory=lambda: create_ai_client(config.get("ai") or {}),
                 knowledge=create_provider(config.get("knowledge")),
                 renderer=TailoredResumeRenderer(
                     template_path,
                     output_dir,
                     image_width=int(resume_cfg.get("image_width", 1400)),
                 ),
+                assets=assets,
             )
+
+    if outreach_service_factory is None and build_outreach_service is not None:
+        outreach_service_factory = build_outreach_service
+
+    if send_service_factory is None and build_outreach_service is not None:
+        def _default_send_service_factory(lease):
+            def package_provider(platform: str, job_id: str):
+                outreach = build_outreach_service()
+                try:
+                    return outreach.get(platform, job_id)
+                finally:
+                    outreach.close()
+
+            return OutreachSendService(
+                database,
+                package_provider=package_provider,
+                sender=BossSender(config.get("boss") or {}),
+                lease=lease,
+            )
+
+        send_service_factory = _default_send_service_factory
 
     return ReviewHttpServer(
         (host, port),
@@ -727,6 +820,7 @@ def create_server(
             Path(analysis_output_dir).resolve() if analysis_output_dir else None
         ),
         outreach_service_factory=outreach_service_factory,
+        send_service_factory=send_service_factory,
         job_update_executor=job_update_executor,
     )
 

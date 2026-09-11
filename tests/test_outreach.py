@@ -426,7 +426,7 @@ class OutreachApiTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             sqlite3.connect(root / "jobs.db").close()
-            image = root / "resume.jpg"
+            image = root / "奇光泛海-AI研发工程师.jpg"
             image.write_bytes(b"jpeg-data")
 
             class FakeService:
@@ -436,7 +436,7 @@ class OutreachApiTests(unittest.TestCase):
                 def get(self, platform, job_id):
                     return {"platform": platform, "job_id": job_id, "status": "generated"}
 
-                def generate(self, platform, job_id):
+                def generate(self, platform, job_id, asset_id=None):
                     return {"platform": platform, "job_id": job_id, "status": "generated"}
 
                 def update_greeting(self, platform, job_id, text):
@@ -487,6 +487,9 @@ class OutreachApiTests(unittest.TestCase):
                 with urlopen(f"{base}/job-1/artifact/image?platform=boss") as response:
                     self.assertEqual(response.headers.get_content_type(), "image/jpeg")
                     self.assertEqual(response.read(), b"jpeg-data")
+                    # 中文文件名必须以 RFC 5987 filename* 下发，否则 latin-1 编码会炸掉连接
+                    disposition = response.headers.get("Content-Disposition", "")
+                    self.assertIn("filename*=UTF-8''", disposition)
             finally:
                 server.shutdown()
                 server.server_close()

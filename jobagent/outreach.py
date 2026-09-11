@@ -52,6 +52,58 @@ def _file_hash(path: Path) -> str:
     return digest.hexdigest()
 
 
+def normalize_resume_assets(raw, *, root: Path | None = None) -> list[dict]:
+    """把 config.resume.assets 归一化成可用的简历资产列表。
+
+    每项形如::
+
+        - id: "fde-solution"
+          label: "FDE · AI 解决方案交付"
+          match_keywords: ["FDE", "解决方案", "交付"]
+          docx: "output/resume-pack/01-FDE.docx"
+          image: "output/resume-pack/01-FDE.jpg"
+
+    相对路径基于项目根目录解析；文件不存在直接报错（宁可启动失败，不可发送时才发现）。
+    """
+    if not raw:
+        return []
+    if not isinstance(raw, list):
+        raise OutreachValidationError("resume.assets 必须是列表")
+    base = (root or ROOT).resolve()
+    assets: list[dict] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise OutreachValidationError(f"resume.assets 第 {index + 1} 项格式不正确")
+        asset_id = str(item.get("id") or "").strip()
+        if not asset_id:
+            raise OutreachValidationError(f"resume.assets 第 {index + 1} 项缺少 id")
+        docx = Path(str(item.get("docx") or ""))
+        image = Path(str(item.get("image") or ""))
+        if not docx.is_absolute():
+            docx = base / docx
+        if not image.is_absolute():
+            image = base / image
+        docx = docx.resolve()
+        image = image.resolve()
+        if not docx.is_file():
+            raise OutreachValidationError(f"简历资产 {asset_id} 的 Word 文件不存在：{docx}")
+        if not image.is_file():
+            raise OutreachValidationError(f"简历资产 {asset_id} 的长图不存在：{image}")
+        assets.append(
+            {
+                "id": asset_id,
+                "label": str(item.get("label") or asset_id),
+                "keywords": [str(k) for k in (item.get("match_keywords") or []) if str(k).strip()],
+                "docx_path": docx,
+                "image_path": image,
+            }
+        )
+    ids = [asset["id"] for asset in assets]
+    if len(set(ids)) != len(ids):
+        raise OutreachValidationError("resume.assets 的 id 重复")
+    return assets
+
+
 class TailoredResumeRenderer:
     """Create a job-specific DOCX and a mobile-readable long JPEG."""
 
@@ -556,6 +608,7 @@ class OutreachService:
         ai_factory=None,
         knowledge,
         renderer: TailoredResumeRenderer,
+        assets: list[dict] | None = None,
     ):
         resume = Path(resume_path)
         if not resume.is_absolute():
@@ -570,6 +623,8 @@ class OutreachService:
         self.ai_factory = ai_factory
         self.knowledge = knowledge
         self.renderer = renderer
+        # 可选的成品简历资产（用户自制 Word/长图）；配置后发送这些文件而不是重排渲染产物。
+        self.assets = list(assets or [])
 
     @property
     def resume_text(self) -> str:
@@ -659,7 +714,21 @@ class OutreachService:
             "strengths": list(job.get("strengths") or []),
             "gaps": list(job.get("gaps") or []),
             "uncertainties": list(job.get("uncertainties") or []),
+            # 所有岗位共用同一份母版简历；"定制"只是按 JD 重排既有内容，不换简历。
+            "resume_source": self.resume_path.name,
+            "resume_tailoring": "reorder_only",
         }
+        if self.assets:
+            suggested = self._suggest_asset_id(job)
+            base["resume_assets"] = [
+                {
+                    "id": asset["id"],
+                    "label": asset["label"],
+                    "suggested": asset["id"] == suggested,
+                }
+                for asset in self.assets
+            ]
+            base["suggested_asset_id"] = suggested
         result = {
             **base,
             **(saved or {"status": "not_generated", "ready": False, "stale": False}),
@@ -670,30 +739,115 @@ class OutreachService:
             )
         return result
 
-    def generate(self, platform: str, job_id: str) -> dict:
+    # ------------------------------------------------------------------
+    # 成品简历资产（三选一）
+    def _suggest_asset_id(self, job: dict) -> str:
+        """按标题/JD 命中的关键词挑资产；标题命中权重更高，都不命中时取第一个。"""
+        if not self.assets:
+            return ""
+        title = str(job.get("title") or "")
+        body = str(job.get("jd") or job.get("jd_text") or "")
+        best_id, best_score = self.assets[0]["id"], 0
+        for asset in self.assets:
+            keywords = [k for k in asset["keywords"] if k]
+            score = 3 * sum(1 for k in keywords if k in title)
+            score += sum(1 for k in keywords if k in body)
+            if score > best_score:
+                best_id, best_score = asset["id"], score
+        return best_id
+
+    def _asset_by_id(self, asset_id: str) -> dict:
+        if not self.assets:
+            raise OutreachValidationError("未配置 resume.assets，无法选择成品简历")
+        for asset in self.assets:
+            if asset["id"] == str(asset_id or "").strip():
+                return asset
+        known = "、".join(asset["id"] for asset in self.assets)
+        raise OutreachValidationError(f"简历资产 {asset_id!r} 不存在，可选：{known}")
+
+    def _asset_copy(self, job: dict, asset: dict) -> RenderedResume:
+        """把成品资产复制成本岗位专属文件，避免源文件日后被改影响已确认内容。"""
+        self.renderer.output_dir.mkdir(parents=True, exist_ok=True)
+        key = f"{job['job_id']}-{asset['id']}"
+        safe = TailoredResumeRenderer._safe_name(job, key)
+        docx_path = self.renderer.output_dir / f"{safe}.docx"
+        image_path = self.renderer.output_dir / f"{safe}.jpg"
+        shutil.copyfile(asset["docx_path"], docx_path)
+        shutil.copyfile(asset["image_path"], image_path)
+        with Image.open(image_path) as source:
+            width, height = source.size
+        return RenderedResume(
+            docx_path=docx_path,
+            image_path=image_path,
+            docx_hash=_file_hash(docx_path),
+            image_hash=_file_hash(image_path),
+            image_width=int(width),
+            image_height=int(height),
+        )
+
+    def select_asset(self, platform: str, job_id: str, asset_id: str) -> dict:
+        """切换岗位使用的成品简历，并使其长图需要重新确认。"""
+        if not self.assets:
+            raise OutreachValidationError("未配置 resume.assets，无法选择成品简历")
+        job = self._load_eligible_job(platform, job_id)
+        if self.store.get(platform, job_id) is None:
+            raise OutreachValidationError("请先生成投递包")
+        asset = self._asset_by_id(asset_id)
+        rendered = self._asset_copy(job, asset)
+        return self._attach_job(
+            self.store.update_asset(
+                platform, job_id,
+                resume_asset_id=asset["id"],
+                docx_path=str(rendered.docx_path),
+                image_path=str(rendered.image_path),
+                docx_hash=rendered.docx_hash,
+                image_hash=rendered.image_hash,
+                image_width=rendered.image_width,
+                image_height=rendered.image_height,
+            ),
+            job,
+        )
+
+    def generate(self, platform: str, job_id: str, asset_id: str | None = None) -> dict:
         job = self._load_eligible_job(platform, job_id)
         resume_text = self.resume_text
         knowledge = self.knowledge.for_job(job) if self.knowledge else ""
         ai = self.ai or (self.ai_factory() if self.ai_factory else None)
         if ai is None:
             raise OutreachValidationError("投递准备尚未配置 AI 模型")
-        catalog = build_resume_catalog(resume_text)
-        try:
-            plan = ai.resume_plan(resume_text, job, catalog)
-        except ValueError as exc:
-            raise OutreachValidationError(
-                "AI 返回的简历微调计划无法解析，已阻止生成"
-            ) from exc
-        tailored = apply_controlled_resume_plan(resume_text, plan, catalog)
-        change_summary = build_resume_change_summary(
-            resume_text, plan, catalog, jd_text=job["jd"]
-        )
+        asset = None
+        if asset_id or self.assets:
+            # 配置了成品资产：长图/Word 直接用选中的资产，不再按母版重排渲染。
+            asset = self._asset_by_id(asset_id) if asset_id else self._asset_by_id(
+                self._suggest_asset_id(job)
+            )
+        if asset is None:
+            catalog = build_resume_catalog(resume_text)
+            try:
+                plan = ai.resume_plan(resume_text, job, catalog)
+            except ValueError as exc:
+                raise OutreachValidationError(
+                    "AI 返回的简历微调计划无法解析，已阻止生成"
+                ) from exc
+            tailored = apply_controlled_resume_plan(resume_text, plan, catalog)
+            change_summary = build_resume_change_summary(
+                resume_text, plan, catalog, jd_text=job["jd"]
+            )
+        else:
+            # 成品资产不接收任何改写；母版原文仅作内容存档展示。
+            tailored = resume_text
+            change_summary = {}
         greeting = ai.greeting(resume_text, job, knowledge)
         if not str(greeting or "").strip() or not str(tailored or "").strip():
             raise OutreachValidationError("AI 没有返回完整的招呼语和定制简历")
-        rendered = self.renderer.render(
-            job, tailored, f"{job_id}-generated-{_content_hash(tailored)[:12]}"
-        )
+        if asset is None:
+            rendered = self.renderer.render(
+                job, tailored, f"{job_id}-generated-{_content_hash(tailored)[:12]}"
+            )
+            used_asset_id = ""
+        else:
+            rendered = self._asset_copy(job, asset)
+            used_asset_id = asset["id"]
         saved = self.store.save_generation(
             platform=platform, job_id=job_id,
             jd_hash=_content_hash(job["jd"]), resume_hash=_content_hash(resume_text),
@@ -701,7 +855,7 @@ class OutreachService:
             docx_path=str(rendered.docx_path), image_path=str(rendered.image_path),
             docx_hash=rendered.docx_hash, image_hash=rendered.image_hash,
             image_width=rendered.image_width, image_height=rendered.image_height,
-            change_summary=change_summary,
+            change_summary=change_summary, resume_asset_id=used_asset_id,
         )
         return self._attach_job(saved, job)
 
@@ -785,6 +939,7 @@ class OutreachStore:
               updated_at TEXT NOT NULL,
               last_error TEXT NOT NULL DEFAULT '',
               change_summary_json TEXT NOT NULL DEFAULT '{}',
+              resume_asset_id TEXT NOT NULL DEFAULT '',
               PRIMARY KEY(platform, job_id)
             )
             """
@@ -797,6 +952,10 @@ class OutreachStore:
         if "change_summary_json" not in columns:
             self.conn.execute(
                 "ALTER TABLE job_outreach ADD COLUMN change_summary_json TEXT NOT NULL DEFAULT '{}'"
+            )
+        if "resume_asset_id" not in columns:
+            self.conn.execute(
+                "ALTER TABLE job_outreach ADD COLUMN resume_asset_id TEXT NOT NULL DEFAULT ''"
             )
         self.conn.commit()
 
@@ -871,6 +1030,7 @@ class OutreachStore:
         image_width: int,
         image_height: int,
         change_summary: dict | None = None,
+        resume_asset_id: str = "",
     ) -> dict:
         existing = self.conn.execute(
             "SELECT content_version FROM job_outreach WHERE platform = ? AND job_id = ?",
@@ -886,8 +1046,8 @@ class OutreachStore:
                   greeting_text, tailored_md, docx_path, image_path, docx_hash,
                   image_hash, image_width, image_height, greeting_confirmed_at,
                   resume_confirmed_at, content_edited, generated_at, updated_at, last_error,
-                  change_summary_json
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, '', ?)
+                  change_summary_json, resume_asset_id
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, '', ?, ?)
                 ON CONFLICT(platform, job_id) DO UPDATE SET
                   content_version = excluded.content_version,
                   jd_hash = excluded.jd_hash,
@@ -906,7 +1066,8 @@ class OutreachStore:
                   generated_at = excluded.generated_at,
                   updated_at = excluded.updated_at,
                   last_error = '',
-                  change_summary_json = excluded.change_summary_json
+                  change_summary_json = excluded.change_summary_json,
+                  resume_asset_id = excluded.resume_asset_id
                 """,
                 (
                     platform, job_id, version, jd_hash, resume_hash,
@@ -914,6 +1075,7 @@ class OutreachStore:
                     docx_hash, image_hash, int(image_width), int(image_height),
                     None, None, 0, generated_at, generated_at,
                     json.dumps(change_summary or {}, ensure_ascii=False),
+                    str(resume_asset_id or ""),
                 ),
             )
         return self.get(platform, job_id)
@@ -971,6 +1133,52 @@ class OutreachStore:
             )
         if cursor.rowcount != 1:
             raise OutreachValidationError("请先生成投递包")
+        return self.get(platform, job_id)
+
+    def update_asset(
+        self,
+        platform: str,
+        job_id: str,
+        *,
+        resume_asset_id: str,
+        docx_path: str,
+        image_path: str,
+        docx_hash: str,
+        image_hash: str,
+        image_width: int,
+        image_height: int,
+    ) -> dict:
+        """切换使用的简历资产：换文件、提升内容版本并清掉长图确认。
+
+        提升版本是刻意的：发送授权按 (platform, job_id, content_version) 去重，
+        版本不动会导致旧授权的 image_hash 与新文件永远对不上且无法重新授权。
+        """
+        updated_at = _now()
+        with self.conn:
+            existing = self.conn.execute(
+                "SELECT content_version FROM job_outreach WHERE platform = ? AND job_id = ?",
+                (platform, job_id),
+            ).fetchone()
+            if existing is None:
+                raise OutreachValidationError("请先生成投递包")
+            version = int(existing[0]) + 1
+            cursor = self.conn.execute(
+                """
+                UPDATE job_outreach
+                   SET resume_asset_id = ?, docx_path = ?, image_path = ?,
+                       docx_hash = ?, image_hash = ?, image_width = ?,
+                       image_height = ?, resume_confirmed_at = NULL, content_edited = 0,
+                       content_version = ?, updated_at = ?, last_error = ''
+                 WHERE platform = ? AND job_id = ?
+                """,
+                (
+                    str(resume_asset_id or ""), docx_path, image_path, docx_hash,
+                    image_hash, int(image_width), int(image_height), version,
+                    updated_at, platform, job_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise OutreachValidationError("请先生成投递包")
         return self.get(platform, job_id)
 
     def confirm(self, platform: str, job_id: str, kind: str) -> dict:

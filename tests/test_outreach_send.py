@@ -1,8 +1,5 @@
 """S5 send-ledger tests. All platform action is faked; no CDP, no Boss."""
 
-import tempfile
-import threading
-from pathlib import Path
 
 import pytest
 
@@ -12,7 +9,6 @@ from jobagent.outreach_send import (
     SendPaused,
     SendValidationError,
     OutreachSendService,
-    OutreachSendStore,
 )
 
 

@@ -19,6 +19,8 @@
 import hashlib
 import json
 import re
+from pathlib import Path
+
 from openai import OpenAI
 
 _INJECTION_GUARD = (
@@ -68,8 +70,29 @@ def _portfolio_url(resume_md: str) -> str:
     return value if "." in value else ""
 
 
+def _active_provider_spec(cfg: dict | None) -> dict:
+    """Accept either a flat provider spec or a multi-provider ``ai`` block.
+
+    Legacy callers still pass the whole ``ai`` dict straight in; when that dict
+    uses the ``providers``/``active`` shape we resolve the active entry here so
+    the flat OpenAI-compatible client keeps working unchanged.
+    """
+    if isinstance(cfg, dict) and isinstance(cfg.get("providers"), dict) and cfg.get("providers"):
+        from jobagent.config import provider_type, resolve_ai_provider
+
+        spec = resolve_ai_provider(cfg)
+        if provider_type(spec) != "openai":
+            raise ValueError(
+                f"当前 ai.active 指向的 provider 类型为 {provider_type(spec)!r}，"
+                "不能用于 OpenAI 兼容客户端；请改用 create_ai_client()。"
+            )
+        return spec
+    return cfg or {}
+
+
 class OpenAICompatibleClient:
     def __init__(self, cfg: dict):
+        cfg = _active_provider_spec(cfg)
         self.client = OpenAI(
             api_key=cfg["api_key"],
             base_url=cfg.get("base_url", "https://api.deepseek.com"),
@@ -246,6 +269,114 @@ class OpenAICompatibleClient:
         return apply_controlled_resume_plan(
             resume_md, self.resume_plan(resume_md, job, catalog), catalog
         )
+
+
+class ManualOutreachProvider:
+    """由人工（或脚本）预先撰写的投递内容，不调用任何外部模型。
+
+    用途：上游模型不可用、被禁用，或需要逐条精修时，把招呼语和简历排序意图
+    写进一个 JSON 文件，仍走同一套受控流水线（过滤、排序、渲染、哈希、落库），
+    从而与真实模型产物完全同构、可随时替换。
+
+    文件格式（``file`` 指向，默认 private/outreach_manual.json）::
+
+        {
+          "jobs": {
+            "<job_id>": {
+              "greeting": "给该岗位的招呼语正文",
+              "resume_plan": {
+                "project_priority": ["project-3", "project-2"],
+                "bullet_priority": ["bullet-1", "bullet-15"],
+                "explanations": [{"id": "project-3", "reason": "…", "jd_evidence": "…"}]
+              },
+              "score": 90,
+              "reason": "一句话评分理由（可选）"
+            }
+          }
+        }
+
+    ``resume_plan`` 可省略，表示母版简历顺序不变；``greeting`` 必填。
+    """
+
+    def __init__(self, cfg: dict):
+        raw = str(cfg.get("file") or "private/outreach_manual.json").strip()
+        path = Path(raw)
+        if not path.is_absolute():
+            from jobagent.config import resolve_project_path
+
+            path = resolve_project_path(raw)
+        self.path = Path(path)
+        self.model = f"manual:{self.path.name}"
+
+    def _jobs(self) -> dict:
+        if not self.path.is_file():
+            raise ValueError(
+                f"人工托管内容文件不存在：{self.path}（请在 ai.providers 里指向正确文件）"
+            )
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"人工托管内容文件无法解析：{exc}") from exc
+        jobs = data.get("jobs") if isinstance(data, dict) else None
+        return jobs if isinstance(jobs, dict) else {}
+
+    def _entry(self, job: dict) -> dict:
+        job_id = str(job.get("job_id") or "")
+        entry = self._jobs().get(job_id)
+        if not isinstance(entry, dict):
+            raise ValueError(f"人工托管内容缺少岗位 {job_id} 的条目")
+        return entry
+
+    def greeting(self, resume_md: str, job: dict, knowledge: str = "") -> str:
+        text = str(self._entry(job).get("greeting") or "").strip()
+        if not text:
+            raise ValueError(f"人工托管内容缺少岗位 {job.get('job_id')} 的招呼语")
+        return text
+
+    def resume_plan(self, resume_md: str, job: dict, catalog: dict) -> dict:
+        plan = self._entry(job).get("resume_plan") or {}
+        if not isinstance(plan, dict):
+            return {}
+        return plan
+
+    def match_score(self, resume_md: str, job: dict, preferences: str = "") -> tuple[int, str]:
+        """人工评分可选；缺失时沿用与模型解析失败一致的降级标记。"""
+        entry = self._jobs().get(str(job.get("job_id") or ""))
+        if isinstance(entry, dict) and entry.get("score") is not None:
+            try:
+                score = max(0, min(100, int(entry["score"])))
+            except (TypeError, ValueError):
+                score = 0
+            return score, str(entry.get("reason") or "人工评分")
+        return 0, "[需人工复核] 人工托管模式未提供该岗位评分"
+
+
+# ----------------------------------------------------------------------
+# Provider 工厂：把 ai 配置块解析成具体客户端，便于扩展与替换。
+_PROVIDER_BUILDERS = {
+    "openai": OpenAICompatibleClient,
+    "manual": ManualOutreachProvider,
+}
+
+
+def register_provider(type_name: str, builder) -> None:
+    """注册新的 provider 类型，供后续扩展（如新增专用 SDK）。"""
+    _PROVIDER_BUILDERS[str(type_name).strip().lower()] = builder
+
+
+def create_ai_client(ai_cfg: dict | None = None, provider: str | None = None):
+    """按 ai 配置构造客户端。``provider`` 指定名称，缺省用 ``ai.active``。
+
+    同时兼容旧格式（``ai.api_key``/``base_url``/``model`` 平铺），
+    因此调用方只需把整块 ai 配置传进来即可。
+    """
+    from jobagent.config import provider_type, resolve_ai_provider
+
+    spec = resolve_ai_provider(ai_cfg, provider)
+    builder = _PROVIDER_BUILDERS.get(provider_type(spec))
+    if builder is None:
+        raise ValueError(f"未知的 AI provider 类型：{provider_type(spec)}")
+    return builder(spec)
 
 
 # 兼容已有导入；两者是同一个实现，不维护重复的 Provider 客户端。

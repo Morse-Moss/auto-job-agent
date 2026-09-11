@@ -699,11 +699,21 @@
                   </div>
                 </section>
 
+                <section class="outreach-asset-section" id="outreachAssetSection" hidden>
+                  <div class="outreach-section-heading">
+                    <div><p class="section-label">使用简历</p><h3>选择成品简历</h3></div>
+                    <span id="outreachAssetCurrent"></span>
+                  </div>
+                  <p class="asset-hint">发送的是你做好的成品简历（Word + 长图），系统按 JD 关键词自动推荐一份，可在这里逐岗切换；切换后长图需要重新确认，已授权的发送也会作废。</p>
+                  <div class="asset-options" id="outreachAssetOptions"></div>
+                </section>
+
                 <section class="outreach-preview" aria-labelledby="outreachPreviewHeading">
                   <div class="outreach-section-heading">
                     <div><p class="section-label">发送前预览</p><h3 id="outreachPreviewHeading">简历长图</h3></div>
                     <span id="resumeImageSize"></span>
                   </div>
+                  <p class="resume-source-note" id="outreachResumeSource"></p>
                   <div class="outreach-image-frame">
                     <p id="outreachImageEmpty">生成投递包后显示长图。</p>
                     <img id="outreachResumeImage" alt="岗位定制简历长图" hidden>
@@ -722,7 +732,22 @@
                     <button type="button" class="confirm-action" id="confirmResume" disabled>确认长图简历</button>
                   </div>
                 </details>
-                <p class="outreach-boundary">招呼语与长图必须分别确认。修改任一内容后，对应确认会自动失效。</p>
+                <div class="outreach-send-gate" id="outreachSendGate">
+                  <div class="outreach-section-heading">
+                    <div><p class="section-label">受控发送</p><h3>逐岗授权</h3></div>
+                    <span id="outreachSendBadge" class="send-badge idle">未授权</span>
+                  </div>
+                  <p class="send-safety">授权只冻结当前这一版的招呼语与长图，不会发出任何消息。真实发送只发生在你点击“确认发送”的那一刻，一次只发这一个岗位。</p>
+                  <div class="outreach-actions send-actions">
+                    <button type="button" class="secondary-action" id="authorizeSend" disabled>授权本岗</button>
+                    <button type="button" class="confirm-action" id="executeSend" disabled>确认发送</button>
+                  </div>
+                  <div class="send-task" id="outreachSendTask" hidden>
+                    <div class="send-task-head"><span>发送任务</span><strong id="outreachSendStatus"></strong></div>
+                    <ul class="send-action-list" id="outreachSendActions"></ul>
+                  </div>
+                </div>
+                <p class="outreach-boundary">招呼语与长图必须分别确认。修改任一内容后，对应确认会自动失效；内容一旦变化，已发出的授权也会随之作废。</p>
               </section>
             </div>
             <p class="outreach-error" id="outreachError" role="alert"></p>

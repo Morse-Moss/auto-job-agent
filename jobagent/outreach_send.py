@@ -118,6 +118,15 @@ class OutreachSendStore:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def latest_for(self, platform: str, job_id: str) -> dict | None:
+        """Most recent send task for a job, regardless of content version."""
+        row = self.conn.execute(
+            "SELECT * FROM outreach_send_tasks WHERE platform=? AND job_id=? "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (platform, job_id),
+        ).fetchone()
+        return self._record(row)
+
     def authorize(
         self,
         platform: str,
@@ -248,6 +257,10 @@ class OutreachSendService:
         if task is None:
             raise SendValidationError("发送任务不存在")
         return task
+
+    def status_for(self, platform: str, job_id: str) -> dict | None:
+        """Latest send task for a job, or None when never authorized."""
+        return self.store.latest_for(str(platform), str(job_id))
 
     def _load_ready_package(self, platform: str, job_id: str) -> dict:
         package = self.package_provider(platform, job_id)

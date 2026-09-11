@@ -30,6 +30,10 @@ const state = {
   outreachRequest: 0,
   greetingDirty: false,
   resumeDirty: false,
+  sendTask: null,
+  sendBusy: false,
+  sendRequest: 0,
+  pendingAssetId: null,
 };
 
 const labels = {
@@ -196,6 +200,10 @@ const elements = {
   downloadOutreachDocx: document.querySelector("#downloadOutreachDocx"),
   outreachResumeImage: document.querySelector("#outreachResumeImage"),
   outreachImageEmpty: document.querySelector("#outreachImageEmpty"),
+  outreachResumeSource: document.querySelector("#outreachResumeSource"),
+  outreachAssetSection: document.querySelector("#outreachAssetSection"),
+  outreachAssetOptions: document.querySelector("#outreachAssetOptions"),
+  outreachAssetCurrent: document.querySelector("#outreachAssetCurrent"),
   outreachError: document.querySelector("#outreachError"),
   outreachJdText: document.querySelector("#outreachJdText"),
   outreachStrengths: document.querySelector("#outreachStrengths"),
@@ -204,6 +212,12 @@ const elements = {
   outreachScope: document.querySelector("#outreachScope"),
   outreachMobileTabs: document.querySelector("#outreachMobileTabs"),
   outreachCollapseToolbar: document.querySelector(".outreach-collapse-toolbar"),
+  authorizeSend: document.querySelector("#authorizeSend"),
+  executeSend: document.querySelector("#executeSend"),
+  outreachSendBadge: document.querySelector("#outreachSendBadge"),
+  outreachSendTask: document.querySelector("#outreachSendTask"),
+  outreachSendStatus: document.querySelector("#outreachSendStatus"),
+  outreachSendActions: document.querySelector("#outreachSendActions"),
 };
 
 async function fetchJson(url, options) {
@@ -1529,6 +1543,30 @@ const outreachStatusLabels = {
   ready: "可以发送",
 };
 
+const sendStatusLabels = {
+  queued: "已授权 · 待发送",
+  running: "发送中",
+  partial: "部分送达",
+  confirmed: "已送达",
+  failed: "发送失败",
+  paused: "已暂停 · 待人工核对",
+  unknown: "结果未知 · 待人工核对",
+};
+
+const sendActionLabels = { greeting: "招呼语", image: "简历长图" };
+
+const sendActionStatusLabels = {
+  pending: "待发送",
+  running: "发送中",
+  confirmed: "已送达",
+  failed: "失败",
+  unknown: "结果未知",
+};
+
+// Only these task states may be executed (or retried) from the UI. A confirmed
+// task is never re-sent, and a paused one must wait for a human.
+const sendExecutableStates = ["queued", "partial", "failed", "unknown"];
+
 function outreachApi(jobId, suffix = "", platform = state.selectedOutreachPlatform || "boss") {
   const query = new URLSearchParams({ platform });
   return `/api/outreach/${encodeURIComponent(jobId)}${suffix}?${query}`;
@@ -1716,6 +1754,19 @@ function renderOutreachDetail(outreach) {
   document.querySelector("#greetingCount").textContent = `${elements.greetingEditor.value.length} 字`;
 
   const artifactVersion = outreach.image_hash || outreach.content_version || 0;
+  if (outreach.resume_assets && outreach.resume_assets.length) {
+    const current = outreach.resume_assets.find(
+      (asset) => asset.id === (outreach.resume_asset_id || state.pendingAssetId),
+    );
+    elements.outreachResumeSource.textContent = outreach.resume_asset_id
+      ? `发送的简历：成品「${current ? current.label : outreach.resume_asset_id}」（你做好的 Word/长图副本，逐岗确认后发送）`
+      : "发送的简历：尚未选定成品简历，生成时将按 JD 关键词自动推荐一份";
+  } else {
+    elements.outreachResumeSource.textContent = outreach.resume_source
+      ? `发送的简历：母版 ${outreach.resume_source}（全部岗位共用 · 仅按 JD 重排既有内容，不换简历、不新增内容）`
+      : "";
+  }
+  renderAssetPicker(outreach);
   if (generated && outreach.image_path) {
     elements.outreachResumeImage.src = `${outreachApi(outreach.job_id, "/artifact/image", outreach.platform)}&v=${encodeURIComponent(artifactVersion)}`;
     elements.outreachResumeImage.hidden = false;
@@ -1730,11 +1781,89 @@ function renderOutreachDetail(outreach) {
     document.querySelector("#resumeImageSize").textContent = "";
     elements.downloadOutreachDocx.hidden = true;
   }
+  renderSendGate(outreach);
+}
+
+function renderAssetPicker(outreach) {
+  const assets = (outreach && outreach.resume_assets) || [];
+  if (!assets.length) {
+    elements.outreachAssetSection.hidden = true;
+    elements.outreachAssetOptions.replaceChildren();
+    elements.outreachAssetCurrent.textContent = "";
+    return;
+  }
+  elements.outreachAssetSection.hidden = false;
+  const savedId = outreach.resume_asset_id || "";
+  const effectiveId = savedId || state.pendingAssetId
+    || outreach.suggested_asset_id || assets[0].id;
+  const current = assets.find((asset) => asset.id === effectiveId);
+  elements.outreachAssetCurrent.textContent = savedId
+    ? `当前：${current ? current.label : savedId}`
+    : "生成时自动推荐";
+  elements.outreachAssetOptions.replaceChildren();
+  assets.forEach((asset) => {
+    const checked = asset.id === effectiveId;
+    const option = document.createElement("label");
+    option.className = `asset-option${checked ? " checked" : ""}`;
+    const input = document.createElement("input");
+    input.type = "radio";
+    input.name = "outreachAsset";
+    input.value = asset.id;
+    input.checked = checked;
+    input.addEventListener("change", () => chooseOutreachAsset(asset.id));
+    option.append(input, createTextElement("span", "", asset.label));
+    if (asset.suggested) option.append(createTextElement("span", "asset-tag", "推荐"));
+    elements.outreachAssetOptions.append(option);
+  });
+}
+
+async function chooseOutreachAsset(assetId) {
+  if (!state.selectedOutreachId) return;
+  const jobId = state.selectedOutreachId;
+  const platform = state.selectedOutreachPlatform || "boss";
+  const outreach = state.outreachDetail;
+  if ((outreach && outreach.resume_asset_id) === assetId) {
+    renderAssetPicker(outreach);
+    return;
+  }
+  if (!outreach || !outreach.content_version) {
+    // 还没生成投递包：只记住选择，点「生成投递包」时带上。
+    state.pendingAssetId = assetId;
+    renderAssetPicker(outreach);
+    return;
+  }
+  if (outreach.resume_confirmed
+    && !window.confirm("切换成品简历会作废当前长图确认和已发出的发送授权，确定切换？")) {
+    renderAssetPicker(outreach);
+    return;
+  }
+  setOutreachBusy("正在切换成品简历并生成本岗副本...");
+  try {
+    const payload = await fetchJson(outreachApi(jobId, "/asset", platform), {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ asset_id: assetId }),
+    });
+    state.pendingAssetId = null;
+    if (state.selectedOutreachId === jobId && state.selectedOutreachPlatform === platform) {
+      renderOutreachDetail(payload.outreach);
+    }
+    state.outreach = null;
+    await loadOutreachDashboard(true);
+  } catch (error) {
+    elements.outreachError.textContent = error.message;
+    renderAssetPicker(state.outreachDetail);
+  } finally {
+    setOutreachBusy("");
+  }
 }
 
 async function selectOutreach(jobId, platform = "boss") {
   state.selectedOutreachId = jobId;
   state.selectedOutreachPlatform = platform;
+  state.sendTask = null;
+  state.sendBusy = false;
+  state.sendRequest += 1;
+  state.pendingAssetId = null;
   renderOutreachQueue();
   const request = ++state.outreachRequest;
   elements.outreachEmpty.hidden = false;
@@ -1744,6 +1873,7 @@ async function selectOutreach(jobId, platform = "boss") {
     const payload = await fetchJson(outreachApi(jobId, "", platform));
     if (request !== state.outreachRequest) return;
     renderOutreachDetail(payload.outreach);
+    await loadSendTask(jobId, platform);
   } catch (error) {
     if (request !== state.outreachRequest) return;
     elements.outreachEmpty.querySelector("strong").textContent = "投递准备读取失败";
@@ -1761,7 +1891,7 @@ async function loadOutreachDashboard(force = false) {
 }
 
 function setOutreachBusy(message = "") {
-  const buttons = [elements.generateOutreach, elements.saveGreeting, elements.saveResume, elements.confirmGreeting, elements.confirmResume];
+  const buttons = [elements.generateOutreach, elements.saveGreeting, elements.saveResume, elements.confirmGreeting, elements.confirmResume, elements.authorizeSend, elements.executeSend];
   if (message) {
     buttons.forEach((button) => { button.disabled = true; });
     elements.outreachJobList.querySelectorAll("button").forEach((button) => { button.disabled = true; });
@@ -1770,6 +1900,7 @@ function setOutreachBusy(message = "") {
   }
   elements.outreachJobList.querySelectorAll("button").forEach((button) => { button.disabled = false; });
   if (state.outreachDetail) applyOutreachControls(state.outreachDetail);
+  renderSendGate(state.outreachDetail);
 }
 
 async function generateOutreachPackage() {
@@ -1780,8 +1911,10 @@ async function generateOutreachPackage() {
   elements.generateOutreach.textContent = "生成中";
   try {
     const payload = await fetchJson(outreachApi(jobId, "/generate", platform), {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ asset_id: state.pendingAssetId || "" }),
     });
+    state.pendingAssetId = null;
     if (state.selectedOutreachId === jobId && state.selectedOutreachPlatform === platform) {
       renderOutreachDetail(payload.outreach);
     }
@@ -1838,6 +1971,132 @@ async function confirmOutreachPart(kind) {
     elements.outreachError.textContent = error.message;
   } finally {
     setOutreachBusy("");
+  }
+}
+
+async function loadSendTask(jobId, platform) {
+  const request = ++state.sendRequest;
+  try {
+    const payload = await fetchJson(outreachApi(jobId, "/send", platform));
+    if (request !== state.sendRequest) return;
+    state.sendTask = payload.send || null;
+  } catch (error) {
+    if (request !== state.sendRequest) return;
+    state.sendTask = null;
+  }
+  renderSendGate(state.outreachDetail);
+}
+
+function renderSendGate(outreach) {
+  const ready = Boolean(outreach && outreach.content_version && outreach.ready && !outreach.stale);
+  const version = Number((outreach && outreach.content_version) || 0);
+  const task = state.sendTask;
+  const versionMatches = Boolean(task) && Number(task.content_version) === version;
+  const status = versionMatches ? task.status : null;
+
+  let badgeClass = "idle";
+  let badgeText = "未授权";
+  if (!outreach || !outreach.content_version) {
+    badgeText = "先完成双确认";
+  } else if (task && !versionMatches) {
+    badgeClass = "stale";
+    badgeText = "内容已更新 · 需重新授权";
+  } else if (!ready) {
+    badgeText = "先完成双确认";
+  } else if (versionMatches) {
+    badgeClass = status;
+    badgeText = sendStatusLabels[status] || status;
+  }
+  elements.outreachSendBadge.textContent = badgeText;
+  elements.outreachSendBadge.className = `send-badge ${badgeClass}`;
+
+  const canAuthorize = ready && !versionMatches && !state.sendBusy;
+  const canExecute = ready && versionMatches && sendExecutableStates.includes(status) && !state.sendBusy;
+  elements.authorizeSend.disabled = !canAuthorize;
+  elements.executeSend.disabled = !canExecute;
+  elements.authorizeSend.textContent = task ? "重新授权本岗" : "授权本岗";
+  elements.executeSend.textContent = status === "partial"
+    ? "继续发送剩余内容"
+    : (status === "failed" || status === "unknown" ? "重试发送" : "确认发送");
+
+  if (versionMatches && task) {
+    elements.outreachSendTask.hidden = false;
+    elements.outreachSendStatus.textContent = sendStatusLabels[status] || status;
+    elements.outreachSendActions.replaceChildren();
+    (task.actions || []).forEach((action) => {
+      const row = document.createElement("li");
+      row.className = `send-action ${action.status}`;
+      row.append(
+        createTextElement("span", "", sendActionLabels[action.kind] || action.kind),
+        createTextElement("strong", "", sendActionStatusLabels[action.status] || action.status),
+      );
+      if (action.evidence) row.append(createTextElement("small", "", `证据：${action.evidence}`));
+      if (action.error) row.append(createTextElement("small", "send-action-error", action.error));
+      elements.outreachSendActions.append(row);
+    });
+  } else {
+    elements.outreachSendTask.hidden = true;
+    elements.outreachSendActions.replaceChildren();
+    elements.outreachSendStatus.textContent = "";
+  }
+}
+
+async function authorizeSendAction() {
+  if (!state.selectedOutreachId || state.sendBusy) return;
+  const jobId = state.selectedOutreachId;
+  const platform = state.selectedOutreachPlatform || "boss";
+  state.sendBusy = true;
+  renderSendGate(state.outreachDetail);
+  elements.outreachError.textContent = "正在冻结当前版本的招呼语与长图...";
+  try {
+    const payload = await fetchJson(outreachApi(jobId, "/authorize", platform), {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+    });
+    if (state.selectedOutreachId === jobId && state.selectedOutreachPlatform === platform) {
+      state.sendTask = payload.send || null;
+      elements.outreachError.textContent = "";
+    }
+  } catch (error) {
+    elements.outreachError.textContent = `${error.message} 没有发送任何消息。`;
+  } finally {
+    state.sendBusy = false;
+    if (state.selectedOutreachId === jobId && state.selectedOutreachPlatform === platform) {
+      renderSendGate(state.outreachDetail);
+    }
+  }
+}
+
+async function executeSendAction() {
+  if (!state.selectedOutreachId || state.sendBusy) return;
+  const task = state.sendTask;
+  if (!task || !task.task_id) return;
+  const jobId = state.selectedOutreachId;
+  const platform = state.selectedOutreachPlatform || "boss";
+  const title = (state.outreachDetail && state.outreachDetail.title) || "该岗位";
+  if (!window.confirm(`确认向「${title}」真实发送招呼语和简历长图？\n\n这一步会立即向招聘方发出消息，且不可撤回。`)) {
+    return;
+  }
+  state.sendBusy = true;
+  renderSendGate(state.outreachDetail);
+  elements.outreachError.textContent = "正在发送招呼语与简历长图，请勿重复点击...";
+  try {
+    const payload = await fetchJson(`/api/outreach/send/${encodeURIComponent(task.task_id)}/execute`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+    });
+    if (state.selectedOutreachId === jobId && state.selectedOutreachPlatform === platform) {
+      state.sendTask = payload.send || null;
+      elements.outreachError.textContent = "";
+    }
+  } catch (error) {
+    elements.outreachError.textContent = error.message;
+    if (state.selectedOutreachId === jobId && state.selectedOutreachPlatform === platform) {
+      await loadSendTask(jobId, platform);
+    }
+  } finally {
+    state.sendBusy = false;
+    if (state.selectedOutreachId === jobId && state.selectedOutreachPlatform === platform) {
+      renderSendGate(state.outreachDetail);
+    }
   }
 }
 
@@ -2220,6 +2479,8 @@ elements.saveGreeting.addEventListener("click", () => saveOutreachPart("greeting
 elements.saveResume.addEventListener("click", () => saveOutreachPart("resume"));
 elements.confirmGreeting.addEventListener("click", () => confirmOutreachPart("greeting"));
 elements.confirmResume.addEventListener("click", () => confirmOutreachPart("resume"));
+elements.authorizeSend.addEventListener("click", authorizeSendAction);
+elements.executeSend.addEventListener("click", executeSendAction);
 elements.outreachMobileTabs.addEventListener("click", (event) => {
   const button = event.target.closest("[data-outreach-tab]");
   if (button) setOutreachMobileTab(button.dataset.outreachTab);
