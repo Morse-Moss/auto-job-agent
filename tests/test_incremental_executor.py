@@ -82,7 +82,8 @@ def test_browser_lease_is_exclusive_and_reentrant_for_same_owner():
             assert lease.owner == "update"
             blocked = []
             thread = threading.Thread(target=lambda: blocked.append(lease.try_acquire("resume")))
-            thread.start(); thread.join()
+            thread.start()
+            thread.join()
             assert blocked == [False]
     assert lease.owner is None
 

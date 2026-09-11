@@ -1,0 +1,23 @@
+[tool.ruff]
+# 只做质量门，不做风格改造：目标是不产生大面积机械 diff，同时拦住真实错误。
+target-version = "py310"
+line-length = 100
+
+extend-exclude = [
+  "private",      # 迁移备份与遗留运行时，不参与检查
+  "output",       # 运行时产物
+  "tmp",          # 临时脚本
+  "knowledge",    # 用户知识库
+  "artifacts",
+  "references",
+  ".state",
+  ".workbuddy",
+  "docs",
+]
+
+[tool.ruff.lint]
+# E4/E7/E9：pycodestyle 错误级子集；F：pyflakes（未用导入/未定义名）；
+# B023：闭包捕获循环变量（真实 bug 类）。
+# 刻意不启用 I（import 排序）与 SIM/UP 等风格规则，避免一次性机械改动；
+# 需要时可单独跑 `ruff check --select I --fix` 做一次性清理。
+select = ["E4", "E7", "E9", "F", "B023"]

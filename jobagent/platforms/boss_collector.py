@@ -165,8 +165,10 @@ class BossCollector:
                     raise RuntimeError("CDP browser has no usable context")
                 context = browser.contexts[0]
                 original_page = next((page for page in context.pages if "zhipin.com" in (page.url or "") and not BossPlatform._is_security_url(page.url)), None)
-                list_page = context.new_page(); own_pages.append(list_page)
-                detail_page = context.new_page(); own_pages.append(detail_page)
+                list_page = context.new_page()
+                own_pages.append(list_page)
+                detail_page = context.new_page()
+                own_pages.append(detail_page)
                 if original_page:
                     original_page.bring_to_front()
                 if favorites_budget:
@@ -180,11 +182,15 @@ class BossCollector:
             status, error = "stopped", f"{type(exc).__name__}: {exc}"
         finally:
             for page in reversed(own_pages):
-                try: page.close()
-                except Exception: pass
+                try:
+                    page.close()
+                except Exception:
+                    pass
             if original_page:
-                try: original_page.bring_to_front()
-                except Exception: pass
+                try:
+                    original_page.bring_to_front()
+                except Exception:
+                    pass
         total = self.store.detail_inventory_count()
         self.store.finish_run(run_id, status, error, records_collected=max(0, total - starting_count))
         return CollectionResult(run_id, max(0, total - starting_count), total, status, error)
@@ -486,7 +492,8 @@ class BossCollector:
                 self._collect_one(
                     job,
                     run_id,
-                    lambda: self._load_detail_page(detail_page, job),
+                    # loader 在 _collect_one 内同步调用，捕获本轮 job 是安全的
+                    lambda: self._load_detail_page(detail_page, job),  # noqa: B023
                 )
                 if self.store.detail_inventory_count() < target:
                     self._wait(detail_page, self._detail_delay())

@@ -1,0 +1,2 @@
+# 开发/CI 工具链（与 requirements.txt 分开，运行时不需要）
+ruff>=0.16

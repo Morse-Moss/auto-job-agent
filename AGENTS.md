@@ -10,6 +10,7 @@
 
 - 保持 Python 模块化单体、SQLite 和现有原生前端。采集、分析、资产、审核、执行各有边界，优先复用现有模块。
 - 本地测试：`py -m pytest -q`；采集边界：`py -m pytest tests/test_collection.py -q`。若 `python` 是 Store 别名，使用 `py` 或实际 Python 解释器。
+- 本地 CI：`py scripts/ci.py`（ruff lint + Python/JS 编译检查 + 全量测试）。提交与推送由 `.githooks/` 钩子自动把关（pre-commit 只查改动文件，pre-push 跑完整 CI）；GitHub Actions 在 push/PR 时跑同一脚本。
 - 本地审阅：`py main.py --review-jobs --review-port 8765`。此命令启动本地服务，不等于完成外部验证。
 - 不运行裸 `main.py` 验证功能：旧默认路径可能发送消息。`--dry-run` 也不是离线测试，会访问浏览器与模型。
 

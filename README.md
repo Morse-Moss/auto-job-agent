@@ -29,6 +29,9 @@ playwright install chromium
 # 2. 配置
 cp config.example.yaml config.yaml          # 填 API 地址、key、模型、求职要求和关键词
 cp resume/master_resume.example.md resume/master_resume.md   # 写你的简历
+# 模型接入支持多套接口：ai.providers 下逐个定义（可放多个 DeepSeek 或任意
+# OpenAI-compatible 服务），ai.active 指定当前使用哪一个，切换只改这一行。
+# 也可把 ai.active 设为 manual：内容写在 private/outreach_manual.json，不调外部模型。
 
 # 3. 试运行（只打分不投递，务必先跑这个）
 python main.py --dry-run
@@ -36,6 +39,19 @@ python main.py --dry-run
 # 4. 正式运行
 python main.py
 ```
+
+## 质量门与 CI
+
+提交和推送时会自动检查，失败会给出文件、行号与规则码：
+
+```bash
+pip install -r requirements-dev.txt   # ruff（lint 工具）
+python scripts/ci.py                  # 手动跑完整检查：lint + build + 全量测试
+```
+
+- `pyproject.toml`：ruff 规则（只拦真实错误：未使用导入、未定义名、循环变量闭包等，不做风格改造）。
+- `.githooks/`：pre-commit 只检查本次改动文件（秒级）；pre-push 跑完整 CI。仓库已设置 `core.hooksPath`，克隆后无需再配置。
+- `.github/workflows/ci.yml`：push/PR 时在 GitHub Actions 上执行同一个 `scripts/ci.py`；Linux 环境额外安装 LibreOffice 与 poppler 供简历渲染测试使用。
 
 ## 只读岗位采集
 

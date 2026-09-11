@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# 提交前快速检查：只检查本次改动的文件，秒级完成。
+# 生效方式：git config core.hooksPath .githooks（本仓库已设置）
+set -u
+fail=0
+
+# Windows 上依赖装在 py 启动器指向的解释器里；Linux CI 没有 py，回退 python
+PY=python
+command -v py >/dev/null 2>&1 && PY=py
+
+py_files=$(git diff --cached --name-only --diff-filter=ACMR -- '*.py')
+js_files=$(git diff --cached --name-only --diff-filter=ACMR -- '*.js')
+
+if [ -n "${py_files}" ]; then
+  count=$(echo "${py_files}" | wc -l)
+  echo "[pre-commit] ruff 检查 ${count} 个 Python 文件..."
+  # shellcheck disable=SC2086
+  "$PY" -m ruff check ${py_files} || fail=1
+  for f in ${py_files}; do
+    "$PY" -m py_compile "$f" || fail=1
+  done
+fi
+
+if [ -n "${js_files}" ]; then
+  echo "[pre-commit] node --check 检查改动的 JS..."
+  for f in ${js_files}; do
+    node --check "$f" || fail=1
+  done
+fi
+
+if [ "${fail}" -ne 0 ]; then
+  echo ""
+  echo "[pre-commit] 检查未通过：请按上方提示修复后再提交。"
+  echo "[pre-commit] （确需跳过可 git commit --no-verify，但不要养成习惯）"
+fi
+exit ${fail}

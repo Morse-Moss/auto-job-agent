@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# 推送前完整检查：与 GitHub Actions 同一套脚本（lint + build + 全量测试）。
+# 远端失败代价高，推送前先在本地跑一遍，约 2 分钟。
+set -u
+PY=python
+command -v py >/dev/null 2>&1 && PY=py
+echo "[pre-push] 运行完整 CI（lint + build + 全量测试，约 2 分钟）..."
+"$PY" scripts/ci.py
+status=$?
+if [ "${status}" -ne 0 ]; then
+  echo ""
+  echo "[pre-push] CI 未通过，已阻止推送。修复后再推，或 git push --no-verify（不建议）。"
+fi
+exit ${status}

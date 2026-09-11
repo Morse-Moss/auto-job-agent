@@ -1077,7 +1077,9 @@ def _evidence_diff(previous: object, current: object) -> tuple[list[dict], list[
         _comparison_item(previous_by_key[item_key])
         for item_key in previous_by_key.keys() - current_by_key.keys()
     ]
-    sort_key = lambda value: (str(value.get("label") or value.get("id") or ""), str(value.get("id") or ""))
+    def sort_key(value: dict) -> tuple[str, str]:
+        return str(value.get("label") or value.get("id") or ""), str(value.get("id") or "")
+
     return sorted(added, key=sort_key), sorted(removed, key=sort_key)
 
 
