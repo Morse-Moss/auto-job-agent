@@ -34,6 +34,7 @@ const state = {
   sendBusy: false,
   sendRequest: 0,
   pendingAssetId: null,
+  progressRequest: 0,
 };
 
 const labels = {
@@ -218,6 +219,13 @@ const elements = {
   outreachSendTask: document.querySelector("#outreachSendTask"),
   outreachSendStatus: document.querySelector("#outreachSendStatus"),
   outreachSendActions: document.querySelector("#outreachSendActions"),
+  outreachProgressSection: document.querySelector("#outreachProgressSection"),
+  outreachProgressTimeline: document.querySelector("#outreachProgressTimeline"),
+  outreachProgressCount: document.querySelector("#outreachProgressCount"),
+  outreachProgressForm: document.querySelector("#outreachProgressForm"),
+  progressEventType: document.querySelector("#progressEventType"),
+  progressNote: document.querySelector("#progressNote"),
+  progressEvidence: document.querySelector("#progressEvidence"),
 };
 
 async function fetchJson(url, options) {
@@ -1874,6 +1882,7 @@ async function selectOutreach(jobId, platform = "boss") {
     if (request !== state.outreachRequest) return;
     renderOutreachDetail(payload.outreach);
     await loadSendTask(jobId, platform);
+    await loadProgress(jobId, platform);
   } catch (error) {
     if (request !== state.outreachRequest) return;
     elements.outreachEmpty.querySelector("strong").textContent = "投递准备读取失败";
@@ -1985,6 +1994,91 @@ async function loadSendTask(jobId, platform) {
     state.sendTask = null;
   }
   renderSendGate(state.outreachDetail);
+}
+
+async function loadProgress(jobId, platform) {
+  const request = ++state.progressRequest;
+  elements.outreachProgressTimeline.replaceChildren();
+  elements.outreachProgressCount.textContent = "";
+  try {
+    const payload = await fetchJson(outreachApi(jobId, "/progress", platform));
+    if (request !== state.progressRequest) return;
+    renderProgress(jobId, platform, payload.progress || {});
+  } catch (error) {
+    if (request !== state.progressRequest) return;
+    const item = document.createElement("li");
+    item.className = "progress-empty";
+    item.textContent = `沟通进展读取失败：${error.message}`;
+    elements.outreachProgressTimeline.append(item);
+  }
+}
+
+function renderProgress(jobId, platform, data) {
+  const events = data.events || [];
+  elements.outreachProgressCount.textContent = events.length
+    ? `${data.pending_count ? `${data.pending_count} 条待确认 · ` : ""}共 ${data.total} 条`
+    : "暂无记录";
+  elements.outreachProgressSection.hidden = !state.selectedOutreachId;
+  const outcome = data.outcome;
+  if (outcome) {
+    const head = document.createElement("li");
+    head.className = `progress-outcome ${outcome.event_type}`;
+    head.textContent = `当前结果：${outcome.event_label}${outcome.note ? ` · ${outcome.note}` : ""}`;
+    elements.outreachProgressTimeline.append(head);
+  }
+  if (!events.length) {
+    const item = document.createElement("li");
+    item.className = "progress-empty";
+    item.textContent = "还没有沟通记录。发送招呼语后在这里登记，后续进展自己更新。";
+    elements.outreachProgressTimeline.append(item);
+    return;
+  }
+  for (const event of events) {
+    const item = document.createElement("li");
+    item.className = `progress-event ${event.kind}${event.pending ? " pending" : ""}`;
+    const meta = document.createElement("div");
+    meta.className = "progress-event-head";
+    const label = document.createElement("strong");
+    label.textContent = event.event_label;
+    const time = document.createElement("span");
+    time.textContent = `${event.occurred_at.replace("T", " ").slice(0, 16)} · ${event.source === "manual" ? "人工登记" : "AI 推断"}`;
+    meta.append(label, time);
+    const body = document.createElement("div");
+    body.className = "progress-event-body";
+    body.textContent = event.note || "";
+    item.append(meta);
+    if (event.note) item.append(body);
+    if (event.evidence) {
+      const evidence = document.createElement("div");
+      evidence.className = "progress-event-evidence";
+      evidence.textContent = `证据：${event.evidence}`;
+      item.append(evidence);
+    }
+    if (event.pending) {
+      const actions = document.createElement("div");
+      actions.className = "progress-event-actions";
+      const confirmButton = document.createElement("button");
+      confirmButton.type = "button";
+      confirmButton.className = "secondary-action";
+      confirmButton.textContent = "确认无误";
+      confirmButton.addEventListener("click", async () => {
+        confirmButton.disabled = true;
+        try {
+          await fetchJson(outreachApi(jobId, "/progress/confirm", platform), {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ event_id: event.id }),
+          });
+          await loadProgress(jobId, platform);
+        } catch (error) {
+          elements.outreachError.textContent = error.message;
+          confirmButton.disabled = false;
+        }
+      });
+      actions.append(confirmButton);
+      item.append(actions);
+    }
+    elements.outreachProgressTimeline.append(item);
+  }
 }
 
 function renderSendGate(outreach) {
@@ -2481,6 +2575,31 @@ elements.confirmGreeting.addEventListener("click", () => confirmOutreachPart("gr
 elements.confirmResume.addEventListener("click", () => confirmOutreachPart("resume"));
 elements.authorizeSend.addEventListener("click", authorizeSendAction);
 elements.executeSend.addEventListener("click", executeSendAction);
+elements.outreachProgressForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const jobId = state.selectedOutreachId;
+  const platform = state.selectedOutreachPlatform || "boss";
+  if (!jobId) return;
+  const submitButton = elements.outreachProgressForm.querySelector("button");
+  submitButton.disabled = true;
+  try {
+    await fetchJson(outreachApi(jobId, "/progress", platform), {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        event_type: elements.progressEventType.value,
+        note: elements.progressNote.value.trim(),
+        evidence: elements.progressEvidence.value.trim(),
+      }),
+    });
+    elements.progressNote.value = "";
+    elements.progressEvidence.value = "";
+    await loadProgress(jobId, platform);
+  } catch (error) {
+    elements.outreachError.textContent = error.message;
+  } finally {
+    submitButton.disabled = false;
+  }
+});
 elements.outreachMobileTabs.addEventListener("click", (event) => {
   const button = event.target.closest("[data-outreach-tab]");
   if (button) setOutreachMobileTab(button.dataset.outreachTab);

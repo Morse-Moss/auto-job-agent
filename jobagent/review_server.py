@@ -31,6 +31,7 @@ from jobagent.outreach_send import (
     SendValidationError,
 )
 from jobagent.platforms.boss_sender import BossSender
+from jobagent.progress import ProgressStore, ProgressValidationError
 from jobagent.review import (
     ReviewStore,
     ReviewValidationError,
@@ -101,6 +102,10 @@ class ReviewHttpServer(ThreadingHTTPServer):
 
     def job_update_store(self) -> JobUpdateStore:
         return JobUpdateStore(self.db_path, self.config)
+
+    def progress_store(self) -> ProgressStore:
+        """S6 沟通进展存储：与 job_update_store 一样按请求创建。"""
+        return ProgressStore(self.db_path)
 
     def execute_job_update(self, run_id: str) -> dict:
         """Explicit external action. Never reachable from a page load or plan build."""
@@ -258,6 +263,9 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
                     parts[2], str(query.get("platform", ["boss"])[0])
                 )
                 return
+            if len(parts) == 4 and parts[3] == "progress":
+                self._progress_read(parts[2], str(query.get("platform", ["boss"])[0]))
+                return
         if path == "/api/freshness":
             self._freshness_dashboard()
             return
@@ -350,6 +358,38 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
                 self._send_call(
                     lambda service: {"send": service.authorize(platform, parts[2])}
                 )
+                return
+            if len(parts) == 4 and parts[3] == "progress":
+                try:
+                    payload = self._read_json(64_000)
+                    platform = str(query.get("platform", ["boss"])[0])
+                    store = self.server.progress_store()
+                    try:
+                        event = store.add(
+                            platform,
+                            parts[2],
+                            str(payload.get("event_type") or ""),
+                            note=str(payload.get("note") or ""),
+                            evidence=str(payload.get("evidence") or ""),
+                            source=str(payload.get("source") or "manual"),
+                        )
+                    finally:
+                        store.close()
+                    self._send_json(HTTPStatus.CREATED, {"progress_event": event})
+                except (ValueError, json.JSONDecodeError, ProgressValidationError) as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            if len(parts) == 5 and parts[3] == "progress" and parts[4] == "confirm":
+                try:
+                    payload = self._read_json(64_000)
+                    store = self.server.progress_store()
+                    try:
+                        event = store.confirm(int(payload.get("event_id") or 0))
+                    finally:
+                        store.close()
+                    self._send_json(HTTPStatus.OK, {"progress_event": event})
+                except (ValueError, json.JSONDecodeError, ProgressValidationError) as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
             if len(parts) == 5 and parts[2] == "send" and parts[4] == "execute":
                 self._send_call(lambda service: {"send": service.execute(parts[3])})
@@ -690,6 +730,14 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
 
     def _outreach_send_status(self, job_id: str, platform: str) -> None:
         self._send_call(lambda service: {"send": service.status_for(platform, job_id)})
+
+    def _progress_read(self, job_id: str, platform: str) -> None:
+        store = self.server.progress_store()
+        try:
+            data = store.summary(platform, job_id)
+        finally:
+            store.close()
+        self._send_json(HTTPStatus.OK, {"progress": data})
 
     def _send_outreach_artifact(self, job_id: str, kind: str, platform: str) -> None:
         service = None

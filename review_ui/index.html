@@ -747,6 +747,28 @@
                     <ul class="send-action-list" id="outreachSendActions"></ul>
                   </div>
                 </div>
+                <section class="outreach-progress-section" id="outreachProgressSection">
+                  <div class="outreach-section-heading">
+                    <div><p class="section-label">沟通进展</p><h3>进展时间线</h3></div>
+                    <span id="outreachProgressCount"></span>
+                  </div>
+                  <p class="progress-boundary">这里只做记录和提醒：后续回复、正式投递和联系方式交换请你在 Boss 上亲自接管，系统不会代发任何消息。</p>
+                  <ul class="progress-timeline" id="outreachProgressTimeline"></ul>
+                  <form class="progress-form" id="outreachProgressForm">
+                    <select id="progressEventType" aria-label="事件类型">
+                      <option value="greeting_sent">已发送招呼语</option>
+                      <option value="boss_viewed">Boss 已查看</option>
+                      <option value="replied">对方已回复</option>
+                      <option value="interview">约面试</option>
+                      <option value="offer">Offer</option>
+                      <option value="rejected">不合适/被拒</option>
+                      <option value="note">备注</option>
+                    </select>
+                    <input id="progressNote" type="text" placeholder="说明（备注事件必填）" maxlength="200">
+                    <input id="progressEvidence" type="text" placeholder="证据：链接或截图说明（选填）" maxlength="300">
+                    <button type="submit" class="secondary-action">登记进展</button>
+                  </form>
+                </section>
                 <p class="outreach-boundary">招呼语与长图必须分别确认。修改任一内容后，对应确认会自动失效；内容一旦变化，已发出的授权也会随之作废。</p>
               </section>
             </div>
