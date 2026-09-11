@@ -350,6 +350,9 @@ h3 { font-size: 15px; line-height: 1.4; }
 .send-badge.failed { border-color: var(--coral); background: var(--coral-soft); color: var(--coral); }
 .send-badge.paused, .send-badge.unknown, .send-badge.stale { border-color: var(--coral); background: var(--coral-soft); color: var(--coral); }
 .send-actions { margin-top: 12px; }
+.send-precheck { margin: 8px 0 0; font-size: 12px; color: var(--muted); }
+.send-precheck.ok { color: var(--green); }
+.send-precheck.warn { color: var(--coral); }
 .send-task { margin-top: 14px; padding: 12px; border: 1px solid var(--line); border-radius: 4px; background: #fafbf8; }
 .send-task-head { display: flex; justify-content: space-between; align-items: baseline; font-size: 12px; }
 .send-task-head span { color: var(--muted); }

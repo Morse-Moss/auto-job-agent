@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -116,6 +117,35 @@ class SendEndpointTests(unittest.TestCase):
         with self.assertRaises(HTTPError) as raised:
             post(f"{self.base}/api/outreach/send/send-missing/execute")
         self.assertEqual(raised.exception.code, 400)
+
+
+class SendPrecheckTests(unittest.TestCase):
+    """预检端点：CDP 不可达时也必须返回结构化结果，绝不 500。"""
+
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        database = Path(self.tmp.name) / "jobs.db"
+        sqlite3.connect(database).close()
+        self.server = create_server(
+            database,
+            host="127.0.0.1",
+            port=0,
+            config={"boss": {"cdp_endpoint": "http://127.0.0.1:59911"}},
+        )
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.tmp.cleanup()
+
+    def test_precheck_reports_unreachable_browser(self):
+        with urlopen(f"{self.base}/api/send/precheck") as response:
+            precheck = json.loads(response.read().decode("utf-8"))["precheck"]
+        self.assertFalse(precheck["ok"])
+        self.assertFalse(precheck["cdp"])
+        self.assertIn("浏览器服务不可达", precheck["detail"])
 
 
 if __name__ == "__main__":

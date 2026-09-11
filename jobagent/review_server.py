@@ -107,6 +107,11 @@ class ReviewHttpServer(ThreadingHTTPServer):
         """S6 沟通进展存储：与 job_update_store 一样按请求创建。"""
         return ProgressStore(self.db_path)
 
+    def send_precheck(self) -> dict:
+        """发送前浏览器预检：CDP 可达 + Boss 登录态，不导航不点击。"""
+        sender = BossSender(self.config.get("boss") or {})
+        return sender.precheck()
+
     def execute_job_update(self, run_id: str) -> dict:
         """Explicit external action. Never reachable from a page load or plan build."""
         store = self.job_update_store()
@@ -237,6 +242,23 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         query = parse_qs(request_url.query)
         if path == "/health":
             self._send_json(HTTPStatus.OK, {"status": "ok"})
+            return
+        if path == "/api/send/precheck":
+            try:
+                self._send_json(HTTPStatus.OK, {"precheck": self.server.send_precheck()})
+            except Exception as exc:  # 预检失败也要给前端结构化结果，不能 500
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "precheck": {
+                            "ok": False,
+                            "cdp": False,
+                            "zhipin_page": False,
+                            "logged_in": False,
+                            "detail": f"预检执行失败：{exc}",
+                        }
+                    },
+                )
             return
         if path == "/api/learning":
             self._learning_dashboard()

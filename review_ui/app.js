@@ -33,6 +33,7 @@ const state = {
   sendTask: null,
   sendBusy: false,
   sendRequest: 0,
+  sendPrecheck: null,
   pendingAssetId: null,
   progressRequest: 0,
 };
@@ -219,6 +220,7 @@ const elements = {
   outreachSendTask: document.querySelector("#outreachSendTask"),
   outreachSendStatus: document.querySelector("#outreachSendStatus"),
   outreachSendActions: document.querySelector("#outreachSendActions"),
+  outreachSendPrecheck: document.querySelector("#outreachSendPrecheck"),
   outreachProgressSection: document.querySelector("#outreachProgressSection"),
   outreachProgressTimeline: document.querySelector("#outreachProgressTimeline"),
   outreachProgressCount: document.querySelector("#outreachProgressCount"),
@@ -1883,6 +1885,7 @@ async function selectOutreach(jobId, platform = "boss") {
     renderOutreachDetail(payload.outreach);
     await loadSendTask(jobId, platform);
     await loadProgress(jobId, platform);
+    loadSendPrecheck().catch(() => {});
   } catch (error) {
     if (request !== state.outreachRequest) return;
     elements.outreachEmpty.querySelector("strong").textContent = "投递准备读取失败";
@@ -1996,6 +1999,28 @@ async function loadSendTask(jobId, platform) {
   renderSendGate(state.outreachDetail);
 }
 
+async function loadSendPrecheck() {
+  try {
+    const payload = await fetchJson("/api/send/precheck");
+    state.sendPrecheck = payload.precheck || null;
+  } catch (error) {
+    state.sendPrecheck = { ok: false, detail: `预检失败：${error.message}` };
+  }
+  renderSendGate(state.outreachDetail);
+}
+
+function renderSendPrecheck() {
+  if (!elements.outreachSendPrecheck) return;
+  const precheck = state.sendPrecheck;
+  if (!precheck) {
+    elements.outreachSendPrecheck.textContent = "正在预检浏览器与登录态…";
+    elements.outreachSendPrecheck.className = "send-precheck";
+    return;
+  }
+  elements.outreachSendPrecheck.textContent = precheck.detail || (precheck.ok ? "浏览器与登录态正常" : "浏览器未就绪");
+  elements.outreachSendPrecheck.className = `send-precheck ${precheck.ok ? "ok" : "warn"}`;
+}
+
 async function loadProgress(jobId, platform) {
   const request = ++state.progressRequest;
   elements.outreachProgressTimeline.replaceChildren();
@@ -2087,6 +2112,7 @@ function renderSendGate(outreach) {
   const task = state.sendTask;
   const versionMatches = Boolean(task) && Number(task.content_version) === version;
   const status = versionMatches ? task.status : null;
+  renderSendPrecheck();
 
   let badgeClass = "idle";
   let badgeText = "未授权";
@@ -2140,6 +2166,7 @@ async function authorizeSendAction() {
   const jobId = state.selectedOutreachId;
   const platform = state.selectedOutreachPlatform || "boss";
   state.sendBusy = true;
+  loadSendPrecheck().catch(() => {});
   renderSendGate(state.outreachDetail);
   elements.outreachError.textContent = "正在冻结当前版本的招呼语与长图...";
   try {

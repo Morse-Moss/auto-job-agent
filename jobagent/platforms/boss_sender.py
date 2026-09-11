@@ -58,6 +58,64 @@ class BossSender:
     def cdp_endpoint(self) -> str:
         return str(self.cfg.get("cdp_endpoint") or "http://127.0.0.1:17332")
 
+    def precheck(self) -> dict:
+        """发送前预检：CDP 可达 + Boss 登录态（wt2 cookie）。
+
+        轻量探测，不导航、不点击、不动任何页面；始终返回结构化结果，
+        失败信息放在 detail，供发送门 UI 在授权前提示。
+        """
+        result = {
+            "ok": False,
+            "cdp": False,
+            "zhipin_page": False,
+            "logged_in": False,
+            "detail": "",
+        }
+        try:
+            self._playwright = sync_playwright().start()
+            self._browser = self._playwright.chromium.connect_over_cdp(
+                self.cdp_endpoint
+            )
+        except Exception as exc:  # 预检绝不向上抛，浏览器掉线是正常业务态
+            result["detail"] = (
+                f"浏览器服务不可达（{exc.__class__.__name__}），"
+                "请先启动 MorseTools general-web"
+            )
+            self.close()
+            return result
+        result["cdp"] = True
+        try:
+            contexts = self._browser.contexts if self._browser else []
+            context = contexts[0] if contexts else None
+            if context is None:
+                result["detail"] = "浏览器服务在线，但没有可用的浏览器上下文"
+                return result
+            page = next(
+                (
+                    p
+                    for p in context.pages
+                    if "zhipin.com" in (p.url or "")
+                    and not self._is_security_url(p.url)
+                ),
+                None,
+            )
+            result["zhipin_page"] = page is not None
+            cookies = context.cookies("https://www.zhipin.com")
+            result["logged_in"] = any(
+                c.get("name") == "wt2" and c.get("value") for c in cookies
+            )
+            if result["logged_in"] and result["zhipin_page"]:
+                result["ok"] = True
+                result["detail"] = "浏览器在线，Boss 登录态正常"
+            elif result["logged_in"]:
+                result["ok"] = True
+                result["detail"] = "浏览器在线、已登录，但没打开 zhipin.com 页面（发送时会自动新开）"
+            else:
+                result["detail"] = "浏览器在线，但未检测到 Boss 登录态，请先在浏览器里登录"
+        finally:
+            self.close()
+        return result
+
     def _get_page(self):
         if self._page is not None and not self._page.is_closed():
             return self._page
