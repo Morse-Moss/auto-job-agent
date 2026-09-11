@@ -1,12 +1,41 @@
 # 使用方法：cp config.example.yaml config.yaml 然后填写
 # config.yaml 已被 .gitignore 忽略，不会被提交
 
+# ===== 模型接入（可配置多个接口，随时切换）=====
+# active 指定当前使用哪个 provider；切换只改这一行，不动代码。
+# providers 下每一项都是一套独立接口，可指向多个 DeepSeek 或任意 OpenAI-compatible 服务。
 ai:
-  api_key: "sk-your-api-key"
-  base_url: "https://api.openai.com/v1"  # 也可填写其他 OpenAI-compatible 服务
-  model: "gpt-4o-mini"
-  reasoning_effort: ""             # reasoning 模型可设 low / medium / high 等
-  max_output_tokens: 1200          # 仅评分时可收紧到 256
+  active: "deepseek-chat"          # 也可设为 "manual"（人工托管，不调外部模型）
+  providers:
+    # --- DeepSeek 官方：对话模型，适合招呼语/排序等常规生成 ---
+    deepseek-chat:
+      type: "openai"
+      api_key: "sk-your-api-key"
+      base_url: "https://api.deepseek.com/v1"
+      model: "deepseek-chat"
+      reasoning_effort: ""         # deepseek-chat 通常留空
+      max_output_tokens: 2048
+    # --- DeepSeek 官方：推理模型，长文/复杂排序更稳，但更慢更贵 ---
+    deepseek-reasoner:
+      type: "openai"
+      api_key: "sk-your-api-key"
+      base_url: "https://api.deepseek.com/v1"
+      model: "deepseek-reasoner"
+      reasoning_effort: ""
+      max_output_tokens: 4096
+    # --- 任意兼容中转：改 base_url/model 即可，用于失败兜底或换渠道 ---
+    relay-a:
+      type: "openai"
+      api_key: "sk-your-api-key"
+      base_url: "https://your-relay.example.com/v1"
+      model: "deepseek-chat"
+      reasoning_effort: ""
+      max_output_tokens: 2048
+    # --- 人工托管：内容写在 private/outreach_manual.json，不调外部模型 ---
+    # 适合上游不可用、被禁用，或需要逐条精修时；产物与真实模型完全同构。
+    manual:
+      type: "manual"
+      file: "private/outreach_manual.json"
 
 match:
   min_score: 65                    # 匹配分低于此值自动跳过（0-100）
@@ -25,6 +54,19 @@ resume:
   word_template: "resume/Ai-product-builder-v10.docx"
   output_dir: "output/tailored"
   image_width: 1400
+  # 可选：成品简历资产（多选一）。配置后，生成投递包时按 JD 关键词自动推荐一份，
+  # 前端可逐岗切换；发送的就是这些成品 Word/长图的副本，不再用母版重排渲染。
+  # assets:
+  #   - id: "fde-solution"
+  #     label: "FDE · AI 解决方案交付"
+  #     match_keywords: ["FDE", "解决方案", "交付", "实施"]
+  #     docx: "assets/resume-pack/01-FDE.docx"
+  #     image: "assets/resume-pack/01-FDE.jpg"
+  #   - id: "agent-dev"
+  #     label: "AI Agent 应用开发"
+  #     match_keywords: ["Agent", "RAG", "大模型", "全栈"]
+  #     docx: "assets/resume-pack/02-Agent.docx"
+  #     image: "assets/resume-pack/02-Agent.jpg"
 
 # ===== 个人知识库（可选）=====
 # 打招呼语与定制简历的生成依据。没有知识库也能正常运行
