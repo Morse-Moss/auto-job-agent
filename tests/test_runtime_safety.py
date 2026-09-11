@@ -721,6 +721,94 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertLess(configure_index, warning_index)
         self.assertLess(warning_index, run_index)
 
+    def test_main_refuses_legacy_auto_send_without_explicit_flag(self):
+        cfg = {
+            "ai": {
+                "api_key": "sk-test",
+                "base_url": "https://example.invalid/v1",
+                "model": "gpt-test",
+            },
+            "resume": {},
+            "knowledge": {"provider": "none"},
+            "preferences": "",
+            "boss": {},
+        }
+
+        class FakePlatform:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run(self, dry_run=False):
+                raise AssertionError("旧全自动链路不得在默认路径运行")
+
+        with (
+            patch.dict(
+                main_module.__dict__,
+                {
+                    "PLATFORMS": {"boss": FakePlatform},
+                    "OpenAICompatibleClient": Mock(),
+                },
+            ),
+            patch.object(main_module, "load_config", return_value=cfg),
+            patch.object(main_module, "ResumeManager", return_value=Mock()),
+            patch.object(main_module, "Store", return_value=Mock()),
+            patch.object(
+                main_module,
+                "create_provider",
+                return_value=SimpleNamespace(name="none"),
+            ),
+            patch("builtins.print"),
+            patch("sys.argv", ["main.py"]),
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                main_module.main()
+
+        self.assertIn("已封闭", str(raised.exception))
+
+    def test_main_allows_legacy_auto_send_only_with_explicit_flag(self):
+        cfg = {
+            "ai": {
+                "api_key": "sk-test",
+                "base_url": "https://example.invalid/v1",
+                "model": "gpt-test",
+            },
+            "resume": {},
+            "knowledge": {"provider": "none"},
+            "preferences": "",
+            "boss": {},
+        }
+        calls = []
+
+        class FakePlatform:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run(self, dry_run=False):
+                calls.append(dry_run)
+
+        with (
+            patch.dict(
+                main_module.__dict__,
+                {
+                    "PLATFORMS": {"boss": FakePlatform},
+                    "OpenAICompatibleClient": Mock(),
+                },
+            ),
+            patch.object(main_module, "load_config", return_value=cfg),
+            patch.object(main_module, "ResumeManager", return_value=Mock()),
+            patch.object(main_module, "Store", return_value=Mock()),
+            patch.object(
+                main_module,
+                "create_provider",
+                return_value=SimpleNamespace(name="none"),
+            ),
+            patch("builtins.print"),
+            patch("sys.argv", ["main.py", "--legacy-auto-apply"]),
+        ):
+            main_module.main()
+
+        self.assertEqual(calls, [False])
+
     def test_dry_run_never_sends_or_persists_job_history(self):
         cfg = {
             "boss": {

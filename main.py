@@ -135,6 +135,11 @@ def main() -> None:
         default="all",
         help="采集来源，默认先收藏后搜索",
     )
+    parser.add_argument(
+        "--legacy-auto-apply",
+        action="store_true",
+        help="[已封闭] 运行旧的全自动投递链路，不经过审核、逐岗授权与简历长图",
+    )
     args = parser.parse_args()
 
     offline_only = (
@@ -349,6 +354,13 @@ def main() -> None:
         finally:
             collection_store.close()
         return
+
+    if not args.dry_run and not args.legacy_auto_apply:
+        raise SystemExit(
+            "旧的全自动投递链路已封闭：它不经过岗位审核、逐岗授权，也不会上传简历长图。\n"
+            "请改用受控流程：py main.py --review-jobs，在「投递准备」中逐岗确认后再发送。\n"
+            "如确需运行旧链路，请显式加 --legacy-auto-apply，风险自负。"
+        )
 
     ai = OpenAICompatibleClient(cfg["ai"])
     resume_mgr = ResumeManager(cfg["resume"])

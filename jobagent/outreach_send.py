@@ -1,0 +1,351 @@
+"""Controlled first-contact sending (S5).
+
+One task per job authorization. The greeting text and the resume image are
+accounted for separately, and a definite failure can be retried at most once.
+Nothing here runs from a page load: the caller must name a specific task.
+
+The platform action itself is injected as a ``sender`` so tests never open a
+CDP session, and so the real Boss adapter stays a thin, auditable layer.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import sqlite3
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+from jobagent.job_update_executor import BrowserLease
+
+TEXT_KIND = "greeting"
+IMAGE_KIND = "image"
+ACTION_KINDS = (TEXT_KIND, IMAGE_KIND)
+
+ACTION_STATES = ("pending", "running", "confirmed", "failed", "unknown")
+TASK_STATES = ("queued", "running", "partial", "confirmed", "failed", "paused", "unknown")
+
+# One initial attempt plus at most one retry, and only for definite failures.
+MAX_ATTEMPTS = 2
+
+
+def _now() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _hash(value: str) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+
+
+class SendValidationError(ValueError):
+    """The task or its frozen snapshot does not permit sending."""
+
+
+class SendFailed(RuntimeError):
+    """A definite failure. Eligible for at most one retry."""
+
+
+class SendPaused(RuntimeError):
+    """Security or identity anomaly. Stops the whole task and is never retried."""
+
+
+class SendBusy(RuntimeError):
+    """The browser is currently held by another executor."""
+
+
+class OutreachSendStore:
+    """Persistence for send tasks and the per-action ledger."""
+
+    def __init__(self, db_path: str | Path):
+        path = Path(db_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path.resolve()
+        self.conn = sqlite3.connect(self.path)
+        self.conn.row_factory = sqlite3.Row
+        self._migrate()
+
+    def _migrate(self) -> None:
+        self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS outreach_send_tasks (
+              task_id TEXT PRIMARY KEY,
+              platform TEXT NOT NULL,
+              job_id TEXT NOT NULL,
+              content_version INTEGER NOT NULL,
+              greeting_hash TEXT NOT NULL,
+              image_hash TEXT NOT NULL,
+              jd_hash TEXT NOT NULL,
+              resume_hash TEXT NOT NULL,
+              status TEXT NOT NULL,
+              stop_reason TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              finished_at TEXT,
+              UNIQUE(platform, job_id, content_version)
+            );
+            CREATE TABLE IF NOT EXISTS outreach_send_actions (
+              task_id TEXT NOT NULL,
+              kind TEXT NOT NULL,
+              status TEXT NOT NULL,
+              attempts INTEGER NOT NULL DEFAULT 0,
+              evidence TEXT NOT NULL DEFAULT '',
+              error TEXT NOT NULL DEFAULT '',
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY(task_id, kind)
+            );
+            """
+        )
+        self.conn.commit()
+
+    def _record(self, row: sqlite3.Row | None) -> dict | None:
+        if row is None:
+            return None
+        data = dict(row)
+        data["actions"] = self.list_actions(data["task_id"])
+        return data
+
+    def get(self, task_id: str) -> dict | None:
+        return self._record(
+            self.conn.execute(
+                "SELECT * FROM outreach_send_tasks WHERE task_id=?", (task_id,)
+            ).fetchone()
+        )
+
+    def list_actions(self, task_id: str) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM outreach_send_actions WHERE task_id=? ORDER BY kind",
+            (task_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def authorize(
+        self,
+        platform: str,
+        job_id: str,
+        *,
+        content_version: int,
+        greeting_hash: str,
+        image_hash: str,
+        jd_hash: str,
+        resume_hash: str,
+    ) -> dict:
+        """Return the one task for this job at this content version."""
+        version = int(content_version)
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            existing = self.conn.execute(
+                "SELECT task_id FROM outreach_send_tasks "
+                "WHERE platform=? AND job_id=? AND content_version=?",
+                (platform, job_id, version),
+            ).fetchone()
+            if existing:
+                return self.get(existing["task_id"])
+            task_id = f"send-{uuid.uuid4().hex}"
+            now = _now()
+            self.conn.execute(
+                "INSERT INTO outreach_send_tasks("
+                "task_id, platform, job_id, content_version, greeting_hash,"
+                "image_hash, jd_hash, resume_hash, status, created_at, updated_at"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    task_id, platform, job_id, version, greeting_hash,
+                    image_hash, jd_hash, resume_hash, "queued", now, now,
+                ),
+            )
+            for kind in ACTION_KINDS:
+                self.conn.execute(
+                    "INSERT INTO outreach_send_actions("
+                    "task_id, kind, status, attempts, evidence, error, updated_at"
+                    ") VALUES(?,?,?,?,?,?,?)",
+                    (task_id, kind, "pending", 0, "", "", now),
+                )
+        return self.get(task_id)
+
+    def mark_running(self, task_id: str) -> dict | None:
+        self.conn.execute(
+            "UPDATE outreach_send_tasks SET status='running', updated_at=? "
+            "WHERE task_id=? AND status='queued'",
+            (_now(), task_id),
+        )
+        self.conn.commit()
+        return self.get(task_id)
+
+    def claim_action(self, task_id: str, kind: str) -> bool:
+        """Atomically move an action to running.
+
+        Returns False when the action is already confirmed, its result is
+        unknown, another runner already holds it, or the retry budget is spent.
+        The single UPDATE is what stops two runners from sending twice.
+        """
+        cursor = self.conn.execute(
+            "UPDATE outreach_send_actions SET status='running', attempts=attempts+1, "
+            "error='', updated_at=? "
+            "WHERE task_id=? AND kind=? AND ("
+            "  status='pending' OR (status='failed' AND attempts < ?)"
+            ")",
+            (_now(), task_id, kind, MAX_ATTEMPTS),
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
+
+    def finish_action(
+        self, task_id: str, kind: str, status: str, *, evidence: str = "", error: str = ""
+    ) -> None:
+        self.conn.execute(
+            "UPDATE outreach_send_actions SET status=?, evidence=?, error=?, updated_at=? "
+            "WHERE task_id=? AND kind=?",
+            (status, evidence, error, _now(), task_id, kind),
+        )
+        self.conn.commit()
+
+    def finish(self, task_id: str, status: str, error: str | None = None) -> dict | None:
+        now = _now()
+        self.conn.execute(
+            "UPDATE outreach_send_tasks SET status=?, stop_reason=?, finished_at=?, "
+            "updated_at=? WHERE task_id=?",
+            (status, error or "", now, now, task_id),
+        )
+        self.conn.commit()
+        return self.get(task_id)
+
+    def close(self) -> None:
+        self.conn.close()
+
+
+class OutreachSendService:
+    """Authorize and execute one job's controlled first contact."""
+
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        package_provider,
+        sender,
+        lease: BrowserLease | None = None,
+        owner: str = "boss-send",
+    ):
+        self.store = OutreachSendStore(db_path)
+        self.package_provider = package_provider
+        self.sender = sender
+        self.lease = lease or BrowserLease()
+        self.owner = owner
+
+    # -- authorization -------------------------------------------------
+    def authorize(self, platform: str, job_id: str) -> dict:
+        package = self._load_ready_package(platform, job_id)
+        return self.store.authorize(
+            str(platform),
+            str(job_id),
+            content_version=int(package.get("content_version") or 0),
+            greeting_hash=_hash(package.get("greeting_text")),
+            image_hash=str(package.get("image_hash") or ""),
+            jd_hash=str(package.get("jd_hash") or ""),
+            resume_hash=str(package.get("resume_hash") or ""),
+        )
+
+    def status(self, task_id: str) -> dict:
+        task = self.store.get(task_id)
+        if task is None:
+            raise SendValidationError("发送任务不存在")
+        return task
+
+    def _load_ready_package(self, platform: str, job_id: str) -> dict:
+        package = self.package_provider(platform, job_id)
+        if not package:
+            raise SendValidationError("岗位不存在或不在当前匹配结果中")
+        if package.get("stale"):
+            raise SendValidationError("投递包已失效：JD 或简历基准已变化，请重新生成")
+        if not package.get("ready"):
+            raise SendValidationError(
+                "投递包尚未就绪：招呼语与简历长图必须分别确认，且内容不能失效"
+            )
+        return package
+
+    def _assert_snapshot(self, task: dict, package: dict) -> None:
+        if _hash(package.get("greeting_text")) != task["greeting_hash"]:
+            raise SendValidationError("招呼语已变化，旧授权失效，请重新确认后授权")
+        if str(package.get("image_hash") or "") != task["image_hash"]:
+            raise SendValidationError("简历长图已变化，旧授权失效，请重新确认后授权")
+        if str(package.get("jd_hash") or "") != task["jd_hash"]:
+            raise SendValidationError("JD 已变化，旧授权失效，请重新生成投递包")
+        if str(package.get("resume_hash") or "") != task["resume_hash"]:
+            raise SendValidationError("简历基准已变化，旧授权失效，请重新生成投递包")
+
+    # -- execution -----------------------------------------------------
+    def execute(self, task_id: str) -> dict:
+        """Run the unfinished actions of one authorized task. Idempotent."""
+        task = self.store.get(task_id)
+        if task is None:
+            raise SendValidationError("发送任务不存在")
+        if task["status"] == "confirmed":
+            return task  # already fully sent: never send again
+        if task["status"] == "paused":
+            return task  # security or identity anomaly: wait for a human, never auto-resume
+        if not self.lease.try_acquire(self.owner):
+            raise SendBusy(f"浏览器正在被 {self.lease.owner} 占用")
+        try:
+            package = self._load_ready_package(task["platform"], task["job_id"])
+            self._assert_snapshot(task, package)
+            self.store.mark_running(task_id)
+            halted = ""
+            for kind, perform in (
+                (TEXT_KIND, lambda: self.sender.send_text(task, package)),
+                (IMAGE_KIND, lambda: self.sender.send_image(task, package)),
+            ):
+                if halted:
+                    continue
+                try:
+                    self._run_action(task_id, kind, perform)
+                except SendPaused as exc:
+                    halted = str(exc)
+            if halted:
+                return self.store.finish(task_id, "paused", halted)
+            return self.store.finish(task_id, self._summarize(task_id))
+        finally:
+            self.lease.release(self.owner)
+
+    def _action(self, task_id: str, kind: str) -> dict:
+        for action in self.store.list_actions(task_id):
+            if action["kind"] == kind:
+                return action
+        raise SendValidationError(f"发送任务缺少 {kind} 动作")
+
+    def _run_action(self, task_id: str, kind: str, perform) -> None:
+        # The atomic claim decides whether this runner may act at all. A False
+        # result means: already confirmed, result unknown, taken by another
+        # runner, or retry budget spent.
+        if not self.store.claim_action(task_id, kind):
+            return
+        try:
+            evidence = perform()
+        except SendPaused:
+            self.store.finish_action(task_id, kind, "unknown", error="已暂停，结果待人工核对")
+            raise
+        except SendFailed as exc:
+            self.store.finish_action(task_id, kind, "failed", error=str(exc))
+            return
+        except Exception as exc:
+            # An unclassified error means the delivery state is unknown, so it
+            # must never be retried automatically.
+            self.store.finish_action(
+                task_id, kind, "unknown", error=f"{type(exc).__name__}: {exc}"
+            )
+            return
+        if evidence:
+            self.store.finish_action(task_id, kind, "confirmed", evidence=str(evidence))
+        else:
+            self.store.finish_action(task_id, kind, "unknown", error="未取得送达证据")
+
+    def _summarize(self, task_id: str) -> str:
+        states = {action["kind"]: action["status"] for action in self.store.list_actions(task_id)}
+        values = set(states.values())
+        if values == {"confirmed"}:
+            return "confirmed"
+        if "unknown" in values:
+            return "unknown"
+        if "confirmed" in values:
+            return "partial"
+        return "failed"
+
+    def close(self) -> None:
+        self.store.close()
