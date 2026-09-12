@@ -116,6 +116,10 @@ boss:
   city: "上海"                     # 支持城市见 jobagent/platforms/boss.py 的 CITY_CODES
   max_jobs_per_keyword: 3
   max_apply_per_run: 3             # 单次运行最多打招呼次数
+  update_budgets:
+    favorites: 25                  # 本轮新增收藏预算（条）
+    search: 25                     # 本轮搜索发现预算（条）
+    refresh: 20                    # 本轮旧 JD 复核预算（条）
   cdp_endpoint: "http://127.0.0.1:17332" # 连接已有 CDP 浏览器，不新建登录上下文
   page_settle_range_seconds: [12, 18]
   detail_settle_range_seconds: [8, 15]

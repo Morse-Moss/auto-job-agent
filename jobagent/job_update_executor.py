@@ -115,7 +115,7 @@ class JobUpdateExecutor:
                     stage.setdefault("collected", 0)
                     continue
 
-                result = self._run_stage(stage, collector)
+                result = self._run_stage(stage, store, collector)
                 external = str(getattr(result, "status", "") or "")
                 error = str(getattr(result, "error", "") or "")
                 stage["external_status"] = external
@@ -177,8 +177,7 @@ class JobUpdateExecutor:
             "refresh_result_unknown": 0,
         }
 
-    @staticmethod
-    def _run_stage(stage: dict, collector):
+    def _run_stage(self, stage, store, collector):
         source = stage.get("source")
         if source == "favorites":
             return collector.run_incremental(
@@ -190,5 +189,35 @@ class JobUpdateExecutor:
             )
         if source == "detail_refresh":
             job_ids = list(stage.get("job_ids") or [])
-            return collector.refresh(job_ids, max_jobs=len(job_ids))
+            result = collector.refresh(job_ids, max_jobs=len(job_ids))
+            # 岗位关闭不会重新上架：用候补顶上被死岗消耗的复核名额，
+            # 保证每轮净产出。候补数量以实测关闭数为上限。
+            closed = self._closed_count(result, store)
+            backups = list(stage.get("backup_job_ids") or [])
+            if closed > 0 and backups:
+                extra = backups[: int(closed)]
+                second = collector.refresh(extra, max_jobs=len(extra))
+                result = self._merge_results(result, second)
+            return result
         raise ValueError(f"未知阶段：{source}")
+
+    @staticmethod
+    def _closed_count(result, store) -> int:
+        run_id = str(getattr(result, "run_id", "") or "")
+        if run_id and hasattr(store, "collection_metrics"):
+            return int(store.collection_metrics(run_id).get("detail_closed") or 0)
+        return 0
+
+    @staticmethod
+    def _merge_results(first, second):
+        import types
+
+        first_error = str(getattr(first, "error", "") or "")
+        return types.SimpleNamespace(
+            run_id=getattr(second, "run_id", "") or getattr(first, "run_id", ""),
+            collected=int(getattr(first, "collected", 0) or 0)
+            + int(getattr(second, "collected", 0) or 0),
+            total=int(getattr(second, "total", 0) or 0),
+            status=getattr(second, "status", "") or getattr(first, "status", ""),
+            error=getattr(second, "error", "") or first_error,
+        )

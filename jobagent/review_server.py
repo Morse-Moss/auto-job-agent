@@ -436,6 +436,17 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/job-updates":
             try:
                 payload = self._read_json(64_000)
+                if not isinstance(payload, dict):
+                    payload = {}
+                default_budgets = {"favorites": 25, "search": 25, "refresh": 20}
+                budgets = {
+                    **default_budgets,
+                    **((self.server.config.get("boss") or {}).get("update_budgets") or {}),
+                }
+                for key in ("favorites_budget", "search_budget", "refresh_budget"):
+                    payload.setdefault(
+                        key, int(budgets.get(key.removesuffix("_budget")) or 0)
+                    )
                 store = self.server.job_update_store()
                 try:
                     task = store.start(payload)

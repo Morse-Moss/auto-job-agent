@@ -49,6 +49,10 @@ class SendPaused(RuntimeError):
     """Security or identity anomaly. Stops the whole task and is never retried."""
 
 
+class JobClosed(SendFailed):
+    """The posting is closed/offline on Boss. Definite: nothing was sent."""
+
+
 class SendBusy(RuntimeError):
     """The browser is currently held by another executor."""
 
@@ -377,11 +381,13 @@ class OutreachSendService:
                 if halted:
                     continue
                 try:
-                    self._run_action(task_id, kind, perform)
+                    closed = self._run_action(task_id, kind, perform)
+                    if closed:
+                        halted = "岗位已关闭，停止本任务剩余动作"
                 except SendPaused as exc:
                     halted = str(exc)
             if halted:
-                return self.store.finish(task_id, "paused", halted)
+                return self.store.finish(task_id, "failed" if halted.startswith("岗位已关闭") else "paused", halted)
             return self.store.finish(task_id, self._summarize(task_id))
         finally:
             self.lease.release(self.owner)
@@ -392,14 +398,20 @@ class OutreachSendService:
                 return action
         raise SendValidationError(f"发送任务缺少 {kind} 动作")
 
-    def _run_action(self, task_id: str, kind: str, perform) -> None:
+    def _run_action(self, task_id: str, kind: str, perform) -> bool:
+        """Claim and run one action. Returns True when the job itself is closed."""
         # The atomic claim decides whether this runner may act at all. A False
         # result means: already confirmed, result unknown, taken by another
         # runner, or retry budget spent.
         if not self.store.claim_action(task_id, kind):
-            return
+            return False
+        task = self.store.get(task_id)
         try:
             evidence = perform()
+        except JobClosed as exc:
+            self.store.finish_action(task_id, kind, "failed", error=str(exc))
+            self._mark_job_closed(task["platform"], task["job_id"], str(exc))
+            return True
         except SendPaused:
             self.store.finish_action(task_id, kind, "unknown", error="已暂停，结果待人工核对")
             raise
@@ -417,6 +429,31 @@ class OutreachSendService:
             self.store.finish_action(task_id, kind, "confirmed", evidence=str(evidence))
         else:
             self.store.finish_action(task_id, kind, "unknown", error="未取得送达证据")
+
+    def _mark_job_closed(self, platform: str, job_id: str, reason: str) -> None:
+        """Write the closed posting back to freshness so the inventory heals.
+
+        The send path is a live liveness probe: when Boss itself says the
+        posting is closed, record it with the same convention the refresh
+        flow uses. Best-effort — a write-back failure never breaks sending.
+        """
+        try:
+            connection = sqlite3.connect(self.store.path)
+            try:
+                from jobagent.freshness import set_lifecycle_state
+
+                set_lifecycle_state(
+                    connection,
+                    str(platform),
+                    str(job_id),
+                    "closed",
+                    reason[:200],
+                    run_id=self.owner,
+                )
+            finally:
+                connection.close()
+        except Exception:  # noqa: BLE001 — bookkeeping must not break sending
+            pass
 
     def _summarize(self, task_id: str) -> str:
         states = {action["kind"]: action["status"] for action in self.store.list_actions(task_id)}

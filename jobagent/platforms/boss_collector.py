@@ -733,8 +733,31 @@ class BossCollector:
         self._wait(page, self._navigation_delay())
 
     @staticmethod
-    def _require_login(page) -> None:
+    def _login_cookie_ok(page) -> bool:
+        """Primary login evidence: the httpOnly wt2 cookie, read over CDP.
+
+        DOM selectors rot when Boss redesigns, and a slowly rendering page made
+        the old 8s DOM probe misreport a logged-in session as logged-out
+        (real incident 2026-09-12 15:08). The cookie survives re-renders.
+        """
+        try:
+            cookies = page.context.cookies("https://www.zhipin.com")
+        except Exception:  # noqa: BLE001 — no context means no session anyway
+            return False
+        return any(c.get("name") == "wt2" and c.get("value") for c in cookies)
+
+    @classmethod
+    def _require_login(cls, page) -> None:
         BossPlatform._assert_page_safe(page)
+        if cls._login_cookie_ok(page):
+            return
+        # Cookie missing: give a slow-rendering page a chance before judging.
+        delay = 2_000
+        for _ in range(3):
+            page.wait_for_timeout(delay)
+            if cls._login_cookie_ok(page):
+                return
+            delay *= 2
         try:
             page.wait_for_selector(SELECTORS["logged_in"], timeout=8_000)
         except PWTimeout as exc:

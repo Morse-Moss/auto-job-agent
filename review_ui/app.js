@@ -1446,6 +1446,16 @@ function renderJobUpdate(task) {
   elements.startJobUpdate.disabled = Boolean(task && ["planned", "running"].includes(status.status));
   elements.executeJobUpdate.disabled = !task || !["planned", "interrupted"].includes(status.status);
   elements.stopJobUpdate.disabled = !["planned", "running", "interrupted"].includes(status.status);
+  const errorLine = document.querySelector("#jobUpdateError");
+  if (!errorLine) return;
+  const failed = ["failed", "paused", "cancelled"].includes(status.status);
+  if (failed && (status.error || status.stop_reason)) {
+    const reason = status.error || status.stop_reason || "";
+    errorLine.textContent = `失败原因：${reason}　建议：多为页面加载慢导致的误判，可直接点"生成本轮更新任务"重新生成并执行；若提示登录问题，先去浏览器确认 Boss 登录态。`;
+    errorLine.hidden = false;
+  } else {
+    errorLine.hidden = true;
+  }
 }
 
 async function loadJobUpdate() {
@@ -1467,13 +1477,29 @@ function renderJobUpdatePlan(plan) {
     `${{favorites: "新增收藏", search: "搜索发现", detail_refresh: "旧 JD 复核"}[stage.source]} ${stage.budget} 条`
   ).join(" · ");
   document.querySelector("#jobUpdateCoverage").textContent =
-    `本轮选中 ${plan?.coverage?.selected_detail_jobs || 0} 个待复核岗位，另有 ${plan?.coverage?.remaining_detail_jobs || 0} 个待处理。尚未访问 Boss。`;
+    `本轮选中 ${plan?.coverage?.selected_detail_jobs || 0} 个待复核岗位，候补 ${plan?.stages?.find((s) => s.source === "detail_refresh")?.backup_job_ids?.length || 0} 个（复核中遇到已关闭岗位会自动递补），另有 ${plan?.coverage?.remaining_detail_jobs || 0} 个待处理。尚未访问 Boss。`;
+  const budgets = {favorites: 25, search: 25, refresh: 20};
+  for (const stage of stages) budgets[stage.source] = stage.budget;
+  const inputMap = {budgetFavorites: "favorites", budgetSearch: "search", budgetRefresh: "refresh"};
+  for (const [inputId, source] of Object.entries(inputMap)) {
+    const input = document.querySelector(`#${inputId}`);
+    if (input && document.activeElement !== input) input.value = budgets[source] ?? input.value;
+  }
+}
+
+function budgetPayload() {
+  const value = (id) => Math.max(0, Math.min(500, Number(document.querySelector(`#${id}`)?.value ?? NaN) || 0));
+  return {
+    favorites_budget: value("budgetFavorites"),
+    search_budget: value("budgetSearch"),
+    refresh_budget: value("budgetRefresh"),
+  };
 }
 
 async function startJobUpdate() {
   elements.startJobUpdate.disabled = true;
   try {
-    const payload = await fetchJson("/api/job-updates", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    const payload = await fetchJson("/api/job-updates", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(budgetPayload()) });
     renderJobUpdate(payload.job_update);
     renderJobUpdatePlan(payload.job_update.plan);
     if (state.freshness) await loadFreshnessDashboard(true);

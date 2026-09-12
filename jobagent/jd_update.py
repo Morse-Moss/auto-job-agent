@@ -64,6 +64,10 @@ def build_update_plan(
         str(item["job_id"]),
     ))
     selected = [str(item["job_id"]) for item in ordered[:refresh_budget]]
+    backups = [
+        str(item["job_id"])
+        for item in ordered[refresh_budget : refresh_budget * 2]
+    ]
     remaining = len(ordered) - len(selected)
     summary = dashboard.get("summary") or {}
     return {
@@ -82,6 +86,7 @@ def build_update_plan(
              "reason": "" if sources or not search_budget else "缺少已确认的搜索关键词或城市"},
             {"source": "detail_refresh", "budget": refresh_budget,
              "budget_unit": "existing_job_attempts", "job_ids": selected,
+             "backup_job_ids": backups,
              "status": "planned" if selected else "skipped"},
         ],
         "coverage": {

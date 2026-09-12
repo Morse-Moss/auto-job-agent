@@ -355,9 +355,15 @@
         <div>
           <p class="section-label">用户主动触发</p>
           <h3 id="jobUpdateHeading">准备本轮更新</h3>
+          <div class="update-budget-row" id="updateBudgetRow">
+            <label>新增收藏 <input type="number" id="budgetFavorites" min="0" max="500" value="25"></label>
+            <label>搜索发现 <input type="number" id="budgetSearch" min="0" max="500" value="25"></label>
+            <label>旧 JD 复核 <input type="number" id="budgetRefresh" min="0" max="500" value="20"></label>
+          </div>
           <p id="jobUpdateSummary">正在读取本轮范围…</p>
           <p id="jobUpdateStatus" role="status">正在读取已保存的任务…</p>
-          <details><summary>查看范围与说明</summary><p id="jobUpdateCoverage"></p><p>当前可保存和取消计划，实际采集功能尚未接入。</p></details>
+          <p id="jobUpdateError" class="update-error" hidden></p>
+          <details><summary>查看范围与说明</summary><p id="jobUpdateCoverage"></p><p>计划只读不联网；执行时会真实浏览 Boss 采集新岗位并复核旧岗位，不会发送任何消息。发现已关闭的岗位会自动记录并从可投池除名，并用候补岗位顶上复核名额。预算修改后点"生成本轮更新任务"生效。</p></details>
         </div>
         <div class="job-update-actions">
           <button type="button" class="primary-action" id="startJobUpdate" disabled>生成本轮更新任务</button>

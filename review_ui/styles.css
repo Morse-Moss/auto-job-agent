@@ -364,6 +364,13 @@ h3 { font-size: 15px; line-height: 1.4; }
 .send-action.resolve-row { grid-template-columns: 1fr; border-color: var(--coral); }
 .resolve-actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
 
+.update-budget-row { display: flex; gap: 12px; margin: 8px 0; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+.update-budget-row label { display: flex; align-items: center; gap: 6px; }
+.update-budget-row input {
+  width: 72px; min-height: 30px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 4px; font-size: 12px; background: white; color: var(--ink);
+}
+.update-error { margin: 8px 0 0; font-size: 12px; color: var(--coral); }
+
 .outreach-progress-section { margin-top: 16px; padding: 14px; border: 1px solid var(--line); border-radius: 4px; background: #fafbf8; }
 .progress-boundary { margin: 0 0 10px; font-size: 12px; color: var(--muted); }
 .progress-timeline { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; max-height: 320px; overflow-y: auto; }

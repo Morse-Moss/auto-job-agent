@@ -17,7 +17,7 @@ from pathlib import Path
 from playwright.sync_api import TimeoutError as PWTimeout
 from playwright.sync_api import sync_playwright
 
-from ..outreach_send import SendFailed, SendPaused
+from ..outreach_send import JobClosed, SendFailed, SendPaused
 
 BASE_URL = "https://www.zhipin.com"
 SECURITY_URL_MARKERS = (
@@ -191,7 +191,7 @@ class BossSender:
             except Exception:  # noqa: BLE001
                 pass
             if any(marker in body_text for marker in CLOSED_JOB_MARKERS):
-                raise SendFailed(
+                raise JobClosed(
                     "岗位已关闭或已下线，无法发起沟通（招呼语未发出）"
                 ) from exc
             raise SendFailed("未找到「立即沟通/继续沟通」入口，无法打开会话") from exc
