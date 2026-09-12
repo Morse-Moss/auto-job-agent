@@ -468,3 +468,12 @@ class OutreachSendService:
 
     def close(self) -> None:
         self.store.close()
+        # 必须随服务一起释放 sender 的 Playwright 连接：否则每次执行泄漏一个
+        # 持有浏览器 CDP 会话的 node 驱动进程，积累后卡死浏览器导航管线
+        #（真实事故 2026-09-12：5 个泄漏驱动导致全部 page.goto 零响应超时）。
+        sender_close = getattr(self.sender, "close", None)
+        if callable(sender_close):
+            try:
+                sender_close()
+            except Exception:  # noqa: BLE001 — 释放失败不掩盖主流程结果
+                pass
