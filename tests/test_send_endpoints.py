@@ -118,6 +118,55 @@ class SendEndpointTests(unittest.TestCase):
             post(f"{self.base}/api/outreach/send/send-missing/execute")
         self.assertEqual(raised.exception.code, 400)
 
+    def test_resolve_paused_task_continue_with_image(self):
+        """暂停+招呼语结果未知 → 人工核对“已发出” → 只补发长图，不重发招呼语。"""
+        with post(f"{self.base}/api/outreach/job-1/authorize") as response:
+            task = json.loads(response.read().decode("utf-8"))["send"]
+        post(f"{self.base}/api/outreach/send/{task['task_id']}/execute")
+        # 直接把任务改成暂停态：模拟 Boss 安全校验打断招呼语
+        import sqlite3
+        conn = sqlite3.connect(self.tmp.name + "/jobs.db")
+        conn.execute("UPDATE outreach_send_tasks SET status='paused', stop_reason='检测到 Boss 安全校验' WHERE task_id=?", (task["task_id"],))
+        conn.execute("UPDATE outreach_send_actions SET status='unknown', attempts=1, error='已暂停，结果待人工核对' WHERE task_id=? AND kind='greeting'", (task["task_id"],))
+        conn.execute("UPDATE outreach_send_actions SET status='pending', attempts=0, error='' WHERE task_id=? AND kind='image'", (task["task_id"],))
+        conn.commit()
+        conn.close()
+        self.sender.calls.clear()
+
+        with post(
+            f"{self.base}/api/outreach/job-1/send/resolve",
+            {"greeting_sent": True, "note": "聊天窗口已看到招呼语"},
+        ) as response:
+            done = json.loads(response.read().decode("utf-8"))["send"]
+        self.assertEqual(done["status"], "confirmed")
+        self.assertEqual(self.sender.calls, ["image"])
+
+    def test_resolve_paused_task_resend_greeting(self):
+        """人工核对“没发出” → 招呼语和长图都发送。"""
+        with post(f"{self.base}/api/outreach/job-1/authorize") as response:
+            task = json.loads(response.read().decode("utf-8"))["send"]
+        import sqlite3
+        conn = sqlite3.connect(self.tmp.name + "/jobs.db")
+        conn.execute("UPDATE outreach_send_tasks SET status='paused', stop_reason='检测到 Boss 安全校验' WHERE task_id=?", (task["task_id"],))
+        conn.execute("UPDATE outreach_send_actions SET status='unknown', attempts=1 WHERE task_id=? AND kind='greeting'", (task["task_id"],))
+        conn.commit()
+        conn.close()
+
+        with post(
+            f"{self.base}/api/outreach/job-1/send/resolve",
+            {"greeting_sent": False},
+        ) as response:
+            done = json.loads(response.read().decode("utf-8"))["send"]
+        self.assertEqual(done["status"], "confirmed")
+        self.assertEqual(self.sender.calls, ["text", "image"])
+
+    def test_resolve_rejects_non_paused_task(self):
+        with post(f"{self.base}/api/outreach/job-1/authorize"):
+            pass
+        with self.assertRaises(HTTPError) as raised:
+            post(f"{self.base}/api/outreach/job-1/send/resolve", {"greeting_sent": True})
+        self.assertEqual(raised.exception.code, 400)
+
 
 class SendPrecheckTests(unittest.TestCase):
     """预检端点：CDP 不可达时也必须返回结构化结果，绝不 500。"""

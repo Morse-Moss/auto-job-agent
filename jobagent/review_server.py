@@ -381,6 +381,23 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
                     lambda service: {"send": service.authorize(platform, parts[2])}
                 )
                 return
+            if len(parts) == 5 and parts[4] == "resolve":
+                platform = str(query.get("platform", ["boss"])[0])
+                try:
+                    payload = self._read_json(64_000)
+                    self._send_call(
+                        lambda service: {"send": service.resolve_and_continue(
+                            platform,
+                            parts[2],
+                            greeting_sent=bool(payload.get("greeting_sent")),
+                            note=str(payload.get("note") or ""),
+                        )}
+                    )
+                except SendBusy as exc:
+                    self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                except (ValueError, json.JSONDecodeError, SendValidationError) as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
             if len(parts) == 4 and parts[3] == "progress":
                 try:
                     payload = self._read_json(64_000)

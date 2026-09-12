@@ -217,6 +217,56 @@ class OutreachSendStore:
         self.conn.commit()
         return self.get(task_id)
 
+    def resolve_paused_action(
+        self, task_id: str, kind: str, *, sent: bool, note: str = ""
+    ) -> dict | None:
+        """Human verdict on a paused/unknown action, per manual chat inspection.
+
+        ``sent=True``  -> the message really went out: mark confirmed, never resend.
+        ``sent=False`` -> nothing was delivered: back to pending so the normal
+        execution path can send it exactly once.
+        Only a paused task with an unknown (or exhausted) action can be resolved;
+        anything else must go through authorize/execute.
+        """
+        task = self.get(task_id)
+        if task is None:
+            raise SendValidationError("发送任务不存在")
+        if task["status"] != "paused":
+            raise SendValidationError("只有已暂停的发送任务才需要人工核对")
+        now = _now()
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            action = self.conn.execute(
+                "SELECT status FROM outreach_send_actions WHERE task_id=? AND kind=?",
+                (task_id, kind),
+            ).fetchone()
+            if action is None:
+                raise SendValidationError(f"发送任务缺少 {kind} 动作")
+            if action["status"] == "confirmed":
+                return self.get(task_id)
+            if action["status"] not in {"unknown", "failed"}:
+                raise SendValidationError(
+                    f"{kind} 动作当前状态为 {action['status']}，无法人工核对"
+                )
+            if sent:
+                self.conn.execute(
+                    "UPDATE outreach_send_actions SET status='confirmed', "
+                    "evidence=?, error='', updated_at=? WHERE task_id=? AND kind=?",
+                    (f"人工核对：已发出。{note}".strip(), now, task_id, kind),
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE outreach_send_actions SET status='pending', "
+                    "error=?, updated_at=? WHERE task_id=? AND kind=?",
+                    (f"人工核对：未发出，待重发。{note}".strip(), now, task_id, kind),
+                )
+            self.conn.execute(
+                "UPDATE outreach_send_tasks SET status='queued', stop_reason='', "
+                "finished_at=NULL, updated_at=? WHERE task_id=?",
+                (now, task_id),
+            )
+        return self.get(task_id)
+
     def close(self) -> None:
         self.conn.close()
 
@@ -261,6 +311,25 @@ class OutreachSendService:
     def status_for(self, platform: str, job_id: str) -> dict | None:
         """Latest send task for a job, or None when never authorized."""
         return self.store.latest_for(str(platform), str(job_id))
+
+    def resolve_and_continue(
+        self, platform: str, job_id: str, *, greeting_sent: bool, note: str = ""
+    ) -> dict:
+        """Apply the human verdict on a paused task, then run what is left.
+
+        This is the ONLY path that may resume a paused task, and it requires
+        the user to have manually checked the Boss chat window first: a wrong
+        verdict here means a duplicated greeting in a real chat.
+        """
+        task = self.status_for(platform, job_id)
+        if task is None:
+            raise SendValidationError("该岗位没有发送任务")
+        if task["status"] != "paused":
+            raise SendValidationError("该岗位的发送任务不在暂停状态，无需人工核对")
+        self.store.resolve_paused_action(
+            task["task_id"], TEXT_KIND, sent=bool(greeting_sent), note=str(note or "")
+        )
+        return self.execute(task["task_id"])
 
     def _load_ready_package(self, platform: str, job_id: str) -> dict:
         package = self.package_provider(platform, job_id)

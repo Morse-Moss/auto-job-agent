@@ -361,6 +361,8 @@ h3 { font-size: 15px; line-height: 1.4; }
 .send-action { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 4px; background: white; font-size: 12px; }
 .send-action strong { justify-self: end; }
 .send-action.confirmed { border-color: var(--green); }
+.send-action.resolve-row { grid-template-columns: 1fr; border-color: var(--coral); }
+.resolve-actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
 
 .outreach-progress-section { margin-top: 16px; padding: 14px; border: 1px solid var(--line); border-radius: 4px; background: #fafbf8; }
 .progress-boundary { margin: 0 0 10px; font-size: 12px; color: var(--muted); }

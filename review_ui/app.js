@@ -2154,10 +2154,69 @@ function renderSendGate(outreach) {
       if (action.error) row.append(createTextElement("small", "send-action-error", action.error));
       elements.outreachSendActions.append(row);
     });
+    if (status === "paused") {
+      elements.outreachSendActions.append(buildPausedResolveRow(task));
+    }
   } else {
     elements.outreachSendTask.hidden = true;
     elements.outreachSendActions.replaceChildren();
     elements.outreachSendStatus.textContent = "";
+  }
+}
+
+function buildPausedResolveRow(task) {
+  const row = document.createElement("li");
+  row.className = "send-action resolve-row";
+  const hint = createTextElement(
+    "small",
+    "send-action-error",
+    "系统被 Boss 安全校验打断，招呼语是否已发出需要你人工核对：先到 Boss 聊天窗口看这个岗位的对话，确认招呼语在不在，再点下面的按钮。点错会造成重复打扰。",
+  );
+  const actions = document.createElement("div");
+  actions.className = "resolve-actions";
+  const sentButton = document.createElement("button");
+  sentButton.type = "button";
+  sentButton.className = "confirm-action";
+  sentButton.textContent = "已发出，继续发长图";
+  sentButton.addEventListener("click", () => resolvePausedSend(task, true));
+  const notSentButton = document.createElement("button");
+  notSentButton.type = "button";
+  notSentButton.className = "secondary-action";
+  notSentButton.textContent = "没发出，重新发送";
+  notSentButton.addEventListener("click", () => resolvePausedSend(task, false));
+  actions.append(sentButton, notSentButton);
+  row.append(hint, actions);
+  return row;
+}
+
+async function resolvePausedSend(task, greetingSent) {
+  if (state.sendBusy) return;
+  const jobId = state.selectedOutreachId;
+  const platform = state.selectedOutreachPlatform || "boss";
+  if (!jobId || !task || !task.task_id) return;
+  const verdict = greetingSent
+    ? "确认招呼语已经发出去？点了之后系统只补发简历长图，不会重发招呼语。"
+    : "确认招呼语没有发出去？点了之后系统会重新发送招呼语和长图。";
+  if (!window.confirm(verdict)) return;
+  state.sendBusy = true;
+  renderSendGate(state.outreachDetail);
+  elements.outreachError.textContent = "正在按人工核对结果继续发送...";
+  try {
+    const payload = await fetchJson(outreachApi(jobId, "/send/resolve", platform), {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ greeting_sent: greetingSent, note: "界面人工核对" }),
+    });
+    if (state.selectedOutreachId === jobId && state.selectedOutreachPlatform === platform) {
+      state.sendTask = payload.send || null;
+      elements.outreachError.textContent = "";
+    }
+  } catch (error) {
+    elements.outreachError.textContent = error.message;
+  } finally {
+    state.sendBusy = false;
+    if (state.selectedOutreachId === jobId && state.selectedOutreachPlatform === platform) {
+      renderSendGate(state.outreachDetail);
+    }
   }
 }
 
