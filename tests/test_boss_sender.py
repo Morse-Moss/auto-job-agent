@@ -50,6 +50,7 @@ class FakePage:
         has_input=True,
         has_send=True,
         has_image_input=True,
+        has_chat_btn=True,
         image_count=0,
         echo_typing=True,
         count_on_upload=True,
@@ -59,6 +60,7 @@ class FakePage:
         self.has_input = has_input
         self.has_send = has_send
         self.has_image_input = has_image_input
+        self.has_chat_btn = has_chat_btn
         self.image_count = image_count
         self.echo_typing = echo_typing
         self.count_on_upload = count_on_upload
@@ -93,6 +95,8 @@ class FakePage:
                 raise PWTimeout("no image input")
             return FakeElement()
         if "btn-startchat" in selector or "op-btn-chat" in selector:
+            if not self.has_chat_btn:
+                raise PWTimeout("no chat button")
             return FakeElement(text="立即沟通")
         return FakeElement()
 
@@ -200,6 +204,14 @@ class BossSenderTests(unittest.TestCase):
         page = FakePage(url=DETAIL_URL)
         sender = BossSender({}, page=page)
         sender.send_text({"job_id": "job-1"}, make_package())
+
+    def test_closed_job_reports_definite_failure(self):
+        """宇宙树真实事故：岗位已关闭时没有沟通按钮，应明确报“岗位已关闭”。"""
+        page = FakePage(url=DETAIL_URL, has_chat_btn=False, body="职位已关闭")
+        sender = BossSender({}, page=page)
+        with self.assertRaises(SendFailed) as raised:
+            sender.send_text({"job_id": "job-1"}, make_package())
+        self.assertIn("岗位已关闭", str(raised.exception))
         self.assertTrue(page.goto_urls)
 
 

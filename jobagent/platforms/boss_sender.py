@@ -26,6 +26,8 @@ SECURITY_URL_MARKERS = (
     "/safe/verify",
 )
 
+CLOSED_JOB_MARKERS = ("职位已关闭", "已停止招聘", "该职位已下线")
+
 SELECTORS = {
     "logged_in": "[ka='header-username'], .user-nav .nav-figure",
     "chat_btn": "a.btn-startchat, a.op-btn-chat",
@@ -183,6 +185,15 @@ class BossSender:
         try:
             button = page.wait_for_selector(SELECTORS["chat_btn"], timeout=10_000)
         except PWTimeout as exc:
+            body_text = ""
+            try:
+                body_text = page.inner_text("body", timeout=3_000) or ""
+            except Exception:  # noqa: BLE001
+                pass
+            if any(marker in body_text for marker in CLOSED_JOB_MARKERS):
+                raise SendFailed(
+                    "岗位已关闭或已下线，无法发起沟通（招呼语未发出）"
+                ) from exc
             raise SendFailed("未找到「立即沟通/继续沟通」入口，无法打开会话") from exc
         button.click()
         self._wait(page, self.cfg.get("chat_settle_range_seconds", [3, 6]))
