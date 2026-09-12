@@ -21,7 +21,6 @@ from ..outreach_send import SendFailed, SendPaused
 
 BASE_URL = "https://www.zhipin.com"
 SECURITY_URL_MARKERS = (
-    "_security_check=",
     "/web/passport/zp/verify",
     "/web/user/safe/verify",
     "/safe/verify",
@@ -129,8 +128,11 @@ class BossSender:
 
     @staticmethod
     def _pick_page(context):
+        # 跳过停在安全校验页的标签页（与 precheck 的挑选规则一致），
+        # 否则一个后台残留的校验页会让每次发送瞬间误停。
         for page in context.pages:
-            if "zhipin.com" in (page.url or ""):
+            url = page.url or ""
+            if "zhipin.com" in url and not BossSender._is_security_url(url):
                 return page
         return context.new_page()
 

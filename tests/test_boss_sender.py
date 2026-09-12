@@ -184,6 +184,18 @@ class BossSenderTests(unittest.TestCase):
         with self.assertRaises(SendPaused):
             sender.send_text({"job_id": "job-1"}, make_package())
 
+    def test_security_check_query_param_is_not_a_security_page(self):
+        """Boss 普通页面会带 _security_check= 防伪参数，不得误判为校验页。
+
+        真实事故：搜索页 URL 带该参数导致发送瞬间误停，招呼语根本没发。
+        """
+        normal_url = "https://www.zhipin.com/web/geek/jobs?query=AI&_security_check=1_1788317101695"
+        self.assertFalse(BossSender._is_security_url(normal_url))
+        self.assertTrue(BossSender._is_security_url(SECURITY_URL))
+        page = FakePage(url=normal_url)
+        sender = BossSender({}, page=page)
+        sender.send_text({"job_id": "job-1"}, make_package())
+
     def test_opens_chat_from_job_detail_when_not_on_chat(self):
         page = FakePage(url=DETAIL_URL)
         sender = BossSender({}, page=page)
