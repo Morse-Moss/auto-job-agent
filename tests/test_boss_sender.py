@@ -3,6 +3,7 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
 from playwright.sync_api import TimeoutError as PWTimeout
 
@@ -68,8 +69,11 @@ class FakePage:
         self.pressed = []
         self.uploads = []
         self.goto_urls = []
+        self.selector_calls = []
+        self.on_click_chat_btn = None
         self._closed = False
         self._keyboard = FakeKeyboard(self)
+        self.context = SimpleNamespace(pages=[self])
 
     @property
     def keyboard(self):
@@ -85,7 +89,8 @@ class FakePage:
     def wait_for_timeout(self, ms):
         return None
 
-    def wait_for_selector(self, selector, timeout=None):
+    def wait_for_selector(self, selector, timeout=None, state=None):
+        self.selector_calls.append((selector, state))
         if "chat-input" in selector:
             if not self.has_input:
                 raise PWTimeout("no chat input")
@@ -97,7 +102,16 @@ class FakePage:
         if "btn-startchat" in selector or "op-btn-chat" in selector:
             if not self.has_chat_btn:
                 raise PWTimeout("no chat button")
-            return FakeElement(text="立即沟通")
+            element = FakeElement(text="立即沟通")
+            if self.on_click_chat_btn:
+                original_click = element.click
+
+                def click_with_hook():
+                    original_click()
+                    self.on_click_chat_btn()
+
+                element.click = click_with_hook
+            return element
         return FakeElement()
 
     def query_selector(self, selector):
@@ -213,6 +227,34 @@ class BossSenderTests(unittest.TestCase):
             sender.send_text({"job_id": "job-1"}, make_package())
         self.assertIn("岗位已关闭", str(raised.exception))
         self.assertTrue(page.goto_urls)
+
+    def test_follows_newly_opened_chat_tab(self):
+        """深圳轮动真实事故：点「立即沟通」后 Boss 新开聊天标签页，
+        输入框在新页里；sender 必须跟进新页，而不是留在详情页等待。"""
+        detail = FakePage(url=DETAIL_URL)
+        chat = FakePage(url=CHAT_URL)
+        detail.on_click_chat_btn = lambda: detail.context.pages.append(chat)
+        sender = BossSender({}, page=detail)
+        evidence = sender.send_text({"job_id": "job-1"}, make_package())
+        self.assertIn("招呼语", evidence)
+        # 招呼语打进了新聊天页，而不是详情页
+        self.assertEqual(chat.typed, [GREETING])
+        self.assertEqual(detail.typed, [])
+
+    def test_image_input_waits_attached_not_visible(self):
+        """深圳轮动真实事故：图片上传 file input 是隐藏控件，
+        默认等 visible 会永远超时；必须以 attached 等待。"""
+        with TemporaryDirectory() as tmp:
+            image = Path(tmp) / "resume.jpg"
+            image.write_bytes(b"fake")
+            page = FakePage(url=CHAT_URL)
+            sender = BossSender({}, page=page)
+            sender.send_image({"job_id": "job-1"}, make_package(str(image)))
+            image_calls = [
+                call for call in page.selector_calls if "sendimg" in call[0]
+            ]
+            self.assertTrue(image_calls)
+            self.assertEqual(image_calls[0][1], "attached")
 
 
 if __name__ == "__main__":

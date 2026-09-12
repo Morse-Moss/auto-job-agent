@@ -172,12 +172,22 @@ class BossSender:
 
     # -- chat window ---------------------------------------------------
     def _ensure_chat(self, job_id: str):
-        """Return a page with the job's chat window open (read nothing else)."""
+        """Return a page with the job's chat window open (read nothing else).
+
+        Boss may open the chat as a NEW tab (/web/geek/chat) instead of
+        navigating in place (real incident 2026-09-12: the input box lived in
+        the new tab while we kept waiting on the job-detail page). Track pages
+        across the click and follow the newly opened chat tab.
+        """
         page = self._get_page()
         # Never navigate away from (or retry past) a security page.
         self._assert_safe(page)
+        context = page.context
         if "/web/geek/chat" in (page.url or ""):
             return page
+        chats_before = {
+            id(p) for p in context.pages if "/web/geek/chat" in (p.url or "")
+        }
         detail = f"{BASE_URL}/job_detail/{job_id}.html"
         page.goto(detail, wait_until="domcontentloaded")
         self._wait(page, self.cfg.get("page_settle_range_seconds", [12, 18]))
@@ -198,6 +208,17 @@ class BossSender:
         button.click()
         self._wait(page, self.cfg.get("chat_settle_range_seconds", [3, 6]))
         self._assert_safe(page)
+        if "/web/geek/chat" in (page.url or ""):
+            return page
+        # 点击后新开的聊天标签页：跟进它，后续输入/上传都在新页里。
+        new_chats = [
+            p
+            for p in context.pages
+            if "/web/geek/chat" in (p.url or "") and id(p) not in chats_before
+        ]
+        if new_chats:
+            self._page = new_chats[-1]
+            return self._page
         return page
 
     # -- actions -------------------------------------------------------
@@ -234,7 +255,11 @@ class BossSender:
         self._assert_safe(page)
         before = self._image_message_count(page)
         try:
-            page.wait_for_selector(SELECTORS["image_input"], timeout=15_000)
+            # file input 是隐藏控件：等 attached 而不是默认的 visible，
+            # 否则永远超时（真实验收 2026-09-12）。
+            page.wait_for_selector(
+                SELECTORS["image_input"], timeout=15_000, state="attached"
+            )
             page.set_input_files(SELECTORS["image_input"], image_path)
         except PWTimeout as exc:
             raise SendFailed("未找到聊天图片上传控件，长图未发出") from exc
