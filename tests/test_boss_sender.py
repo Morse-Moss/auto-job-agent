@@ -15,6 +15,8 @@ DETAIL_URL = "https://www.zhipin.com/job_detail/job-1.html"
 SECURITY_URL = "https://www.zhipin.com/web/user/safe/verify?_security_check=1"
 
 GREETING = "你好，我做过企业级 AI Agent 落地，方便聊聊岗位的客户场景吗？"
+COMPANY = "深圳市轮动科技有..."
+TITLE = "AI 交付专员（FDE）"
 
 
 class FakeElement:
@@ -74,6 +76,8 @@ class FakePage:
         self._closed = False
         self._keyboard = FakeKeyboard(self)
         self.context = SimpleNamespace(pages=[self])
+        if not self.body:
+            self.body = f"{TITLE} {COMPANY}"  # 默认会话头部可被身份校验命中
 
     @property
     def keyboard(self):
@@ -103,14 +107,12 @@ class FakePage:
             if not self.has_chat_btn:
                 raise PWTimeout("no chat button")
             element = FakeElement(text="立即沟通")
-            if self.on_click_chat_btn:
-                original_click = element.click
+            hook = self.on_click_chat_btn or (lambda: setattr(self, "url", CHAT_URL))
 
-                def click_with_hook():
-                    original_click()
-                    self.on_click_chat_btn()
+            def click_with_hook():
+                hook()
 
-                element.click = click_with_hook
+            element.click = click_with_hook
             return element
         return FakeElement()
 
@@ -123,6 +125,8 @@ class FakePage:
         return self.body
 
     def evaluate(self, script):
+        if "innerText" in script:
+            return self.body
         return self.image_count
 
     def set_input_files(self, selector, path):
@@ -135,6 +139,8 @@ def make_package(image_path=""):
     return {
         "platform": "boss",
         "job_id": "job-1",
+        "company": COMPANY,
+        "title": TITLE,
         "greeting_text": GREETING,
         "image_path": image_path,
     }
@@ -240,6 +246,32 @@ class BossSenderTests(unittest.TestCase):
         # 招呼语打进了新聊天页，而不是详情页
         self.assertEqual(chat.typed, [GREETING])
         self.assertEqual(detail.typed, [])
+
+    def test_leftover_chat_tab_is_never_trusted_for_another_job(self):
+        """轮动重复发送真实事故：残留的聊天标签页属于别家公司的会话时，
+        绝不能直接复用——必须从详情页重新进入并校验会话对象。"""
+        leftover = FakePage(url=CHAT_URL, body="五世科技 AI流程搭建专员")
+        detail = FakePage(url=DETAIL_URL)
+        shared_context = SimpleNamespace(pages=[leftover, detail])
+        leftover.context = shared_context
+        detail.context = shared_context
+        target_chat = FakePage(url=CHAT_URL)
+        # 工作页（残留聊天页）被导航到详情页后，点击沟通 → Boss 开出正确会话
+        leftover.on_click_chat_btn = lambda: shared_context.pages.append(target_chat)
+        sender = BossSender({}, page=leftover)
+        sender.send_text({"job_id": "job-1"}, make_package())
+        # 招呼语进了目标会话；残留会话一个字都没被输入
+        self.assertEqual(target_chat.typed, [GREETING])
+        self.assertEqual(leftover.typed, [])
+
+    def test_unmatched_conversation_is_definite_failure_before_typing(self):
+        """打开的会话与目标职位对不上时，必须在输入任何内容前明确失败。"""
+        page = FakePage(url=DETAIL_URL, body="完全无关的其他公司会话内容")
+        sender = BossSender({}, page=page)
+        with self.assertRaises(SendFailed) as raised:
+            sender.send_text({"job_id": "job-1"}, make_package())
+        self.assertIn("不一致", str(raised.exception))
+        self.assertEqual(page.typed, [])
 
     def test_image_input_waits_attached_not_visible(self):
         """深圳轮动真实事故：图片上传 file input 是隐藏控件，

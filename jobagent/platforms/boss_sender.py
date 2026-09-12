@@ -11,6 +11,7 @@
 """
 
 import random
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -171,20 +172,31 @@ class BossSender:
             self._assert_safe(page)
 
     # -- chat window ---------------------------------------------------
-    def _ensure_chat(self, job_id: str):
-        """Return a page with the job's chat window open (read nothing else).
+    def _ensure_chat(self, job_id: str, company: str = "", title: str = ""):
+        """Return a page with THIS job's chat window open (read nothing else).
 
-        Boss may open the chat as a NEW tab (/web/geek/chat) instead of
-        navigating in place (real incident 2026-09-12: the input box lived in
-        the new tab while we kept waiting on the job-detail page). Track pages
-        across the click and follow the newly opened chat tab.
+        Two real incidents shaped this flow:
+        - 2026-09-12 (轮动): clicking 立即沟通 opens the chat as a NEW tab;
+          we must follow it instead of waiting on the job-detail page.
+        - 2026-09-12 (重复发送): a leftover chat tab must NEVER be trusted as
+          "the conversation" — it may belong to a different job. Always enter
+          through the job-detail page, then verify the conversation header
+          actually mentions this job's title/company before typing anything.
         """
+        cached = getattr(self, "_verified_chat", None)
+        if (
+            cached
+            and cached.get("job_id") == job_id
+            and not cached["page"].is_closed()
+            and "/web/geek/chat" in (cached["page"].url or "")
+            and self._conversation_matches(cached["page"], company, title)
+        ):
+            return cached["page"]
+
         page = self._get_page()
         # Never navigate away from (or retry past) a security page.
         self._assert_safe(page)
         context = page.context
-        if "/web/geek/chat" in (page.url or ""):
-            return page
         chats_before = {
             id(p) for p in context.pages if "/web/geek/chat" in (p.url or "")
         }
@@ -208,25 +220,58 @@ class BossSender:
         button.click()
         self._wait(page, self.cfg.get("chat_settle_range_seconds", [3, 6]))
         self._assert_safe(page)
-        if "/web/geek/chat" in (page.url or ""):
-            return page
-        # 点击后新开的聊天标签页：跟进它，后续输入/上传都在新页里。
-        new_chats = [
-            p
-            for p in context.pages
-            if "/web/geek/chat" in (p.url or "") and id(p) not in chats_before
-        ]
-        if new_chats:
-            self._page = new_chats[-1]
-            return self._page
-        return page
+        chat = page
+        if "/web/geek/chat" not in (page.url or ""):
+            # 点击后新开的聊天标签页：跟进它，后续输入/上传都在新页里。
+            new_chats = [
+                p
+                for p in context.pages
+                if "/web/geek/chat" in (p.url or "") and id(p) not in chats_before
+            ]
+            if new_chats:
+                chat = new_chats[-1]
+            elif not any("/web/geek/chat" in (p.url or "") for p in context.pages):
+                raise SendFailed("点击沟通后聊天窗口未打开，未发送任何内容")
+        # 会话身份校验：确认打开的是目标职位的会话，再允许输入。
+        deadline = time.monotonic() + 8
+        while not self._conversation_matches(chat, company, title):
+            if time.monotonic() >= deadline:
+                raise SendFailed(
+                    "聊天窗口与目标职位不一致（疑似复用了别的会话），"
+                    "未发送任何内容"
+                )
+            chat.wait_for_timeout(500)
+        self._verified_chat = {"job_id": job_id, "page": chat}
+        return chat
+
+    @staticmethod
+    def _conversation_matches(page, company: str, title: str) -> bool:
+        """True when the open conversation header mentions this job."""
+        try:
+            text = page.evaluate(
+                "() => document.body ? document.body.innerText : ''"
+            ) or ""
+        except Exception:  # noqa: BLE001 — a broken probe must not type blindly
+            return False
+        needle_title = str(title or "").strip()[:12]
+        if needle_title and needle_title in text:
+            return True
+        needle_company = str(company or "").strip().replace("...", "")[:5]
+        if len(needle_company) >= 4 and needle_company in text:
+            return True
+        # 无任何参照信息时无法校验：保持旧行为放行（真实投递包始终带双字段）。
+        return not needle_title and not needle_company
 
     # -- actions -------------------------------------------------------
     def send_text(self, task: dict, package: dict) -> str:
         greeting = str(package.get("greeting_text") or "").strip()
         if not greeting:
             raise SendFailed("投递包缺少招呼语")
-        page = self._ensure_chat(str(task.get("job_id") or ""))
+        page = self._ensure_chat(
+            str(task.get("job_id") or ""),
+            company=str(package.get("company") or ""),
+            title=str(package.get("title") or ""),
+        )
         self._assert_safe(page)
         try:
             box = page.wait_for_selector(SELECTORS["chat_input"], timeout=15_000)
@@ -251,7 +296,11 @@ class BossSender:
         image_path = str(package.get("image_path") or "")
         if not image_path or not Path(image_path).is_file():
             raise SendFailed("简历长图文件不存在，未发出")
-        page = self._ensure_chat(str(task.get("job_id") or ""))
+        page = self._ensure_chat(
+            str(task.get("job_id") or ""),
+            company=str(package.get("company") or ""),
+            title=str(package.get("title") or ""),
+        )
         self._assert_safe(page)
         before = self._image_message_count(page)
         try:
