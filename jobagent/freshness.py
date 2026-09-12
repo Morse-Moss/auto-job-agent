@@ -638,8 +638,10 @@ def _ttl_days(interest: str | None, fit_tier: str | None) -> int:
         return 4
     if interest == "reject":
         return 30
+    # 实测死亡率（2026-09-12：9/13 岗位在采后 1-3 天内关闭）表明 core 岗
+    # 7 天 TTL 意味着大半岗位死在复核之前；收敛到 3 天贴住高发死亡窗口。
     if fit_tier == "core":
-        return 7
+        return 3
     if fit_tier == "stretch":
         return 14
     return 30
@@ -799,6 +801,11 @@ def build_freshness_dashboard(
         jobs[-1]["refresh_attention"] = classify_refresh_attention(jobs[-1])
         jobs[-1]["refresh_action"] = refresh_action_for_job(jobs[-1])
         jobs[-1]["refresh_due"] = jobs[-1]["refresh_attention"] is not None
+        if row["interest"] == "reject":
+            # 用户已明确放弃：下架不会重新上架，复核预算不花在 reject 上。
+            jobs[-1]["refresh_attention"] = None
+            jobs[-1]["refresh_action"] = None
+            jobs[-1]["refresh_due"] = False
     state_order = {"stale": 0, "inaccessible": 1, "aging": 2, "active": 3, "closed": 4, "archived": 5}
     jobs.sort(key=lambda job: (state_order.get(job["lifecycle_state"], 9), job["refresh_priority"], -job["age_days"], job["job_id"]))
     refresh_plan = sorted(

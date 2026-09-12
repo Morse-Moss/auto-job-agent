@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import random
 import re
+import time
 import urllib.parse
 from dataclasses import dataclass
 from collections.abc import Iterable
@@ -40,6 +42,13 @@ class CollectionResult:
     status: str
     error: str | None = None
     scanned_sources: int = 0
+
+
+class CollectionStopped(Exception):
+    """Raised when the user asks the in-flight collection to stop.
+
+    Items already collected stay persisted; nothing is discarded.
+    """
 
 
 class BossCollector:
@@ -137,11 +146,20 @@ class BossCollector:
             error=error,
         )
 
-    def run_incremental(self, favorites_budget: int = 0, search_budget: int = 0) -> CollectionResult:
+    def run_incremental(
+        self,
+        favorites_budget: int = 0,
+        search_budget: int = 0,
+        *,
+        should_stop=None,
+        progress=None,
+    ) -> CollectionResult:
         """Collect separate per-source increments in one browser session.
 
         This keeps the legacy total-inventory API untouched. A budget counts
-        inventory records, including failed detail placeholders.
+        inventory records, including failed detail placeholders. ``should_stop``
+        is polled before every item so a user stop lands within one item, and
+        ``progress(collected, budget)`` fires after each item.
         """
         favorites_budget = max(0, int(favorites_budget))
         search_budget = max(0, int(search_budget))
@@ -172,12 +190,23 @@ class BossCollector:
                 if original_page:
                     original_page.bring_to_front()
                 if favorites_budget:
-                    self._collect_favorites(list_page, detail_page, run_id=run_id, target=starting_count + favorites_budget)
+                    self._collect_favorites(
+                        list_page, detail_page, run_id=run_id,
+                        target=starting_count + favorites_budget,
+                        should_stop=should_stop, progress=progress,
+                        budget=favorites_budget,
+                    )
                 if search_budget:
                     search_start = self.store.detail_inventory_count()
-                    self._collect_search(list_page, run_id=run_id, target=search_start + search_budget)
+                    self._collect_search(
+                        list_page, run_id=run_id, target=search_start + search_budget,
+                        should_stop=should_stop, progress=progress,
+                        budget=search_budget,
+                    )
         except BossSecurityCheck as exc:
             status, error = "security_check", str(exc)
+        except CollectionStopped:
+            status, error = "stopped_by_user", "用户请求停止，已采部分保留"
         except Exception as exc:
             status, error = "stopped", f"{type(exc).__name__}: {exc}"
         finally:
@@ -212,8 +241,19 @@ class BossCollector:
                 break
         return result
 
-    def refresh(self, job_ids: Iterable[str], max_jobs: int = 20) -> CollectionResult:
-        """Refresh a bounded list of existing details through the read-only Boss page."""
+    def refresh(
+        self,
+        job_ids: Iterable[str],
+        max_jobs: int = 20,
+        *,
+        should_stop=None,
+        progress=None,
+    ) -> CollectionResult:
+        """Refresh a bounded list of existing details through the read-only Boss page.
+
+        ``should_stop`` is polled before every job so a user stop lands within
+        one item; ``progress(refreshed, budget)`` fires after each item.
+        """
         selected = self._bounded_job_ids(job_ids, max_jobs=max_jobs)
         run_id = self.store.start_run(target_count=len(selected), source="boss-refresh")
         if not selected:
@@ -252,6 +292,8 @@ class BossCollector:
                         original_page.bring_to_front()
 
                     for job_id in selected:
+                        if self._stop_requested(should_stop):
+                            raise CollectionStopped()
                         row = self.store.get_refresh_target(job_id)
                         if row is None:
                             continue
@@ -278,7 +320,11 @@ class BossCollector:
                                 self.store.save_observation(detail, run_id)
                                 self.store.save_detail(detail, run_id)
                             refreshed += 1
+                            if progress:
+                                progress(refreshed, len(selected))
                         except BossSecurityCheck:
+                            raise
+                        except CollectionStopped:
                             raise
                         except Exception as exc:
                             self.store.save_failure(
@@ -302,6 +348,8 @@ class BossCollector:
         except BossSecurityCheck as exc:
             status = "security_check"
             error = str(exc)
+        except CollectionStopped:
+            status, error = "stopped_by_user", "用户请求停止，已复核部分保留"
         except Exception as exc:
             status = "stopped"
             error = f"{type(exc).__name__}: {exc}"
@@ -459,7 +507,17 @@ class BossCollector:
                     scanned += 1
         return scanned
 
-    def _collect_favorites(self, list_page, detail_page, run_id: str, target: int) -> None:
+    @staticmethod
+    def _stop_requested(should_stop) -> bool:
+        try:
+            return bool(should_stop()) if callable(should_stop) else False
+        except Exception:  # noqa: BLE001 — a broken probe must not kill the run
+            return False
+
+    def _collect_favorites(
+        self, list_page, detail_page, run_id: str, target: int,
+        *, should_stop=None, progress=None, budget: int = 0,
+    ) -> None:
         self._navigate(list_page, FAVORITES_URL)
         self._require_login(list_page)
         favorite_tab = list_page.locator(FAVORITE_TAB)
@@ -480,6 +538,8 @@ class BossCollector:
             for index in range(count):
                 if self.store.detail_inventory_count() >= target:
                     return
+                if self._stop_requested(should_stop):
+                    raise CollectionStopped()
                 card = cards.nth(index)
                 job = self._favorite_card(card, page_number)
                 if not job.get("job_id"):
@@ -495,6 +555,11 @@ class BossCollector:
                     # loader 在 _collect_one 内同步调用，捕获本轮 job 是安全的
                     lambda: self._load_detail_page(detail_page, job),  # noqa: B023
                 )
+                if progress:
+                    progress(
+                        max(0, self.store.detail_inventory_count() - (target - budget)),
+                        budget,
+                    )
                 if self.store.detail_inventory_count() < target:
                     self._wait(detail_page, self._detail_delay())
 
@@ -515,7 +580,10 @@ class BossCollector:
                 raise RuntimeError("Favorites pagination did not advance")
             page_number += 1
 
-    def _collect_search(self, page, run_id: str, target: int) -> None:
+    def _collect_search(
+        self, page, run_id: str, target: int,
+        *, should_stop=None, progress=None, budget: int = 0,
+    ) -> None:
         keywords = self.collection_cfg.get("keywords") or self.boss_cfg.get("keywords") or []
         cities = self.collection_cfg.get("cities") or [self.boss_cfg.get("city", "上海")]
         max_jobs = int(self.collection_cfg.get("max_jobs_per_source", 45))
@@ -547,6 +615,8 @@ class BossCollector:
                 for index in range(count):
                     if self.store.detail_inventory_count() >= target:
                         return
+                    if self._stop_requested(should_stop):
+                        raise CollectionStopped()
                     card = cards.nth(index)
                     job = self._search_card(card, city, str(keyword), index)
                     if not job.get("job_id"):
@@ -561,6 +631,11 @@ class BossCollector:
                         run_id,
                         lambda card=card, job=job: self._load_search_detail(page, card, job),
                     )
+                    if progress:
+                        progress(
+                            max(0, self.store.detail_inventory_count() - (target - budget)),
+                            budget,
+                        )
                     if self.store.detail_inventory_count() < target:
                         self._wait(page, self._detail_delay())
                 self.store.update_cursor(source_key, 1, count, "exhausted")
@@ -597,7 +672,7 @@ class BossCollector:
             payload = response.value.json()
         except PWTimeout:
             BossPlatform._assert_page_safe(page)
-        self._wait(page, self._detail_settle_delay())
+        self._settle_detail_page(page)
         return self._detail_result(page, job, payload)
 
     def _refresh_delay(self):
@@ -614,8 +689,47 @@ class BossCollector:
             payload = response.value.json()
         except PWTimeout:
             BossPlatform._assert_page_safe(page)
-        self._wait(page, self._detail_settle_delay())
+        self._settle_detail_page(page)
         return self._detail_result(page, job, payload)
+
+    @staticmethod
+    def _detail_ready(page) -> bool:
+        """True once JD text or a closed marker is actually rendered."""
+        for selector in (
+            ".job-detail-body .desc",
+            ".job-detail-section .job-sec-text",
+            ".job-sec-text",
+        ):
+            locator = page.locator(selector)
+            if locator.count():
+                try:
+                    if (locator.first.inner_text(timeout=500) or "").strip():
+                        return True
+                except PWTimeout:
+                    continue
+        for marker in ("职位已关闭", "职位不存在", "该职位已下线", "招聘已结束"):
+            if page.locator(f"text={marker}").count():
+                return True
+        return False
+
+    def _settle_detail_page(self, page) -> None:
+        """Wait only as long as the page needs, with a hard cap.
+
+        Adaptive mode polls for real JD content (or a closed marker) and adds
+        a small randomized humanizing pause; the fixed 8-15s settle remains
+        available via collection.adaptive_wait=false.
+        """
+        if not bool(self.collection_cfg.get("adaptive_wait", True)):
+            self._wait(page, self._detail_settle_delay())
+            return
+        cap_seconds = float(self.collection_cfg.get("detail_settle_cap_seconds", 6))
+        deadline = time.monotonic() + cap_seconds
+        while time.monotonic() < deadline:
+            if self._detail_ready(page):
+                break
+            page.wait_for_timeout(250)
+        lo, hi = self.collection_cfg.get("adaptive_min_pause_seconds", [0.8, 2.0])
+        page.wait_for_timeout(int(random.uniform(float(lo), float(hi)) * 1000))
 
     @staticmethod
     def _detail_result(page, job: dict, payload: dict | None) -> dict:

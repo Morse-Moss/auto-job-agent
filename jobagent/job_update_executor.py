@@ -14,10 +14,15 @@ STAGE_STATUS = {
     "sample_completed": "completed",
     "exhausted": "completed",
     "security_check": "paused",
+    "stopped_by_user": "cancelled",
     "stopped": "failed",
 }
 
-HALT_KIND = {"security_check": "security", "stopped": "error"}
+HALT_KIND = {
+    "security_check": "security",
+    "stopped_by_user": "user",
+    "stopped": "error",
+}
 
 FINAL_STATUS = {"user": "cancelled", "security": "paused", "error": "failed"}
 
@@ -115,7 +120,9 @@ class JobUpdateExecutor:
                     stage.setdefault("collected", 0)
                     continue
 
-                result = self._run_stage(stage, store, collector)
+                result = self._run_stage(
+                    stage, store, collector, run_id=run_id, plan=plan,
+                )
                 external = str(getattr(result, "status", "") or "")
                 error = str(getattr(result, "error", "") or "")
                 stage["external_status"] = external
@@ -177,27 +184,64 @@ class JobUpdateExecutor:
             "refresh_result_unknown": 0,
         }
 
-    def _run_stage(self, stage, store, collector):
+    def _run_stage(self, stage, store, collector, *, run_id: str, plan: dict):
+        """Run one stage with item-level stop checks and live progress.
+
+        ``should_stop`` re-reads the stop flag before every item so a user
+        stop lands within one item instead of at the next stage boundary.
+        ``progress`` persists "已采 n/预算 m" into the plan after each item.
+        """
+        def should_stop() -> bool:
+            try:
+                return bool(store.get(run_id).get("stop_requested"))
+            except Exception:  # noqa: BLE001 — never kill a run over a probe
+                return False
+
+        def make_progress(budget: int):
+            def writer(collected: int, _budget: int) -> None:
+                stage["progress"] = {"collected": int(collected), "budget": int(budget)}
+                store.write_plan(run_id, plan)
+            return writer
+
         source = stage.get("source")
         if source == "favorites":
             return collector.run_incremental(
-                favorites_budget=int(stage.get("budget") or 0), search_budget=0
+                favorites_budget=int(stage.get("budget") or 0), search_budget=0,
+                should_stop=should_stop,
+                progress=make_progress(int(stage.get("budget") or 0)),
             )
         if source == "search":
             return collector.run_incremental(
-                favorites_budget=0, search_budget=int(stage.get("budget") or 0)
+                favorites_budget=0, search_budget=int(stage.get("budget") or 0),
+                should_stop=should_stop,
+                progress=make_progress(int(stage.get("budget") or 0)),
             )
         if source == "detail_refresh":
             job_ids = list(stage.get("job_ids") or [])
-            result = collector.refresh(job_ids, max_jobs=len(job_ids))
+            progress = make_progress(len(job_ids))
+            result = collector.refresh(
+                job_ids, max_jobs=len(job_ids),
+                should_stop=should_stop, progress=progress,
+            )
             # 岗位关闭不会重新上架：用候补顶上被死岗消耗的复核名额，
             # 保证每轮净产出。候补数量以实测关闭数为上限。
             closed = self._closed_count(result, store)
             backups = list(stage.get("backup_job_ids") or [])
             if closed > 0 and backups:
                 extra = backups[: int(closed)]
-                second = collector.refresh(extra, max_jobs=len(extra))
-                result = self._merge_results(result, second)
+                first_collected = int(getattr(result, "collected", 0) or 0)
+                total_budget = len(job_ids) + len(extra)
+
+                def backup_progress(collected: int, _budget: int) -> None:
+                    progress(first_collected + collected, total_budget)
+
+                result = self._merge_results(
+                    result,
+                    collector.refresh(
+                        extra, max_jobs=len(extra),
+                        should_stop=should_stop, progress=backup_progress,
+                    ),
+                )
             return result
         raise ValueError(f"未知阶段：{source}")
 

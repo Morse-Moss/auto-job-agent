@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from jobagent.freshness import (
+    _ttl_days,
     build_freshness_dashboard,
     build_role_track_dashboard,
     classify_refresh_attention,
@@ -441,6 +442,35 @@ class FreshnessStateTests(unittest.TestCase):
                 [job["job_id"] for job in dashboard["refresh_plan"][:4]],
                 ["old-want", "old-maybe", "match-priority", "fresh-priority"],
             )
+            connection.close()
+
+    def test_ttl_days_follows_measured_mortality(self):
+        # 实测死亡率（2026-09-12：9/13 采后 1-3 天关闭）后的收敛值
+        assert _ttl_days(None, "core") == 3
+        assert _ttl_days(None, "stretch") == 14
+        assert _ttl_days("want", "core") == 2
+        assert _ttl_days("maybe", "core") == 4
+        assert _ttl_days("reject", "core") == 30
+
+    def test_rejected_jobs_never_consume_auto_refresh_budget(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "jobs.db"
+            _seed_jobs(path)
+            connection = sqlite3.connect(path)
+            connection.row_factory = sqlite3.Row
+            migrate_freshness_schema(connection)
+            sync_legacy_freshness(connection)
+            dashboard = build_freshness_dashboard(
+                connection, now="2026-09-10T00:00:00+08:00"
+            )
+            reject_job = next(
+                job for job in dashboard["jobs"] if job["job_id"] == "old-reject"
+            )
+            # 岗位早已超过 30 天 TTL，但用户已明确放弃：不自动复核
+            self.assertGreater(reject_job["age_days"], 30)
+            self.assertIsNone(reject_job["refresh_attention"])
+            self.assertIsNone(reject_job["refresh_action"])
+            self.assertFalse(reject_job["refresh_due"])
             connection.close()
 
     def test_detail_change_preserves_old_and_new_jd_versions(self):

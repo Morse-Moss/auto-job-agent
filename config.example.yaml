@@ -103,6 +103,11 @@ collection:
   detail_settle_range_seconds: [8, 15]
   detail_delay_range_seconds: [35, 65]
   max_consecutive_failures: 3
+  # P2-3 自适应等待：详情页内容选择器出现即继续，总时长封顶，替代固定沉睡。
+  # 设为 false 恢复固定 detail_settle_range_seconds 沉睡。
+  adaptive_wait: true
+  detail_settle_cap_seconds: 6
+  adaptive_min_pause_seconds: [0.8, 2.0]
 
 # ===== 版本化个人匹配预览（本地、无模型调用） =====
 matching:

@@ -1439,10 +1439,41 @@ function jobUpdateLabel(task) {
   }[task?.status] || "尚未生成更新任务";
 }
 
+function jobUpdateProgressLine(task) {
+  const labels = { favorites: "新增收藏", search: "搜索发现", detail_refresh: "旧 JD 复核" };
+  return (task?.stages || [])
+    .filter((stage) => stage.progress)
+    .map((stage) => `${labels[stage.source] || stage.source} 已采 ${stage.progress.collected}/${stage.progress.budget}`)
+    .join(" · ");
+}
+
+let jobUpdatePollTimer = null;
+function stopJobUpdatePolling() {
+  if (jobUpdatePollTimer) { clearInterval(jobUpdatePollTimer); jobUpdatePollTimer = null; }
+}
+function startJobUpdatePolling() {
+  stopJobUpdatePolling();
+  jobUpdatePollTimer = setInterval(async () => {
+    try {
+      const payload = await fetchJson("/api/job-updates/latest");
+      const task = payload.job_update;
+      if (task && task.status === "running") {
+        renderJobUpdate(task);
+        if (task.plan) renderJobUpdatePlan(task.plan);
+      } else {
+        stopJobUpdatePolling();
+      }
+    } catch (error) { /* 网络抖动静默跳过，下一轮再试 */ }
+  }, 4000);
+}
+
 function renderJobUpdate(task) {
   state.jobUpdate = task || null;
   const status = task || {};
-  elements.jobUpdateStatus.textContent = jobUpdateLabel(status);
+  const progressLine = status.status === "running" ? jobUpdateProgressLine(status) : "";
+  elements.jobUpdateStatus.textContent = status.status === "running"
+    ? (progressLine ? `任务执行中：${progressLine}` : "任务执行中")
+    : jobUpdateLabel(status);
   elements.startJobUpdate.disabled = Boolean(task && ["planned", "running"].includes(status.status));
   elements.executeJobUpdate.disabled = !task || !["planned", "interrupted"].includes(status.status);
   elements.stopJobUpdate.disabled = !["planned", "running", "interrupted"].includes(status.status);
@@ -1465,6 +1496,7 @@ async function loadJobUpdate() {
     ]);
     renderJobUpdate(saved.job_update);
     renderJobUpdatePlan(saved.job_update?.plan || preview.job_update);
+    if (saved.job_update?.status === "running") startJobUpdatePolling();
   } catch (error) {
     elements.jobUpdateStatus.textContent = error.message;
     elements.startJobUpdate.disabled = true;
@@ -1527,6 +1559,7 @@ async function executeJobUpdate() {
   if (!runId) return;
   elements.executeJobUpdate.disabled = true;
   elements.jobUpdateStatus.textContent = "正在连接 Boss 并执行本轮更新，请留在此页面观察状态…";
+  startJobUpdatePolling();
   try {
     const payload = await fetchJson(`/api/job-updates/${encodeURIComponent(runId)}/execute`, {
       method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
@@ -1537,6 +1570,8 @@ async function executeJobUpdate() {
   } catch (error) {
     elements.jobUpdateStatus.textContent = error.message;
     elements.executeJobUpdate.disabled = false;
+  } finally {
+    stopJobUpdatePolling();
   }
 }
 

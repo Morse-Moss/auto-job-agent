@@ -45,16 +45,32 @@ class FakeCollector:
             error=data.get("error"),
         )
 
-    def run_incremental(self, favorites_budget=0, search_budget=0):
+    def _stopped_result(self):
+        return SimpleNamespace(
+            run_id="fake-run", collected=0, total=0,
+            status="stopped_by_user", error="用户请求停止，已采部分保留")
+
+    def run_incremental(self, favorites_budget=0, search_budget=0,
+                        should_stop=None, progress=None):
         self.calls.append(("incremental", favorites_budget, search_budget))
         if self.on_stage:
             self.on_stage("incremental")
+        if should_stop and should_stop():
+            return self._stopped_result()
+        if progress:
+            progress(int(self.results.get("incremental", {}).get("collected", 0) or 0),
+                     favorites_budget + search_budget)
         return self._result("incremental")
 
-    def refresh(self, job_ids, max_jobs=20):
+    def refresh(self, job_ids, max_jobs=20, should_stop=None, progress=None):
         self.calls.append(("refresh", list(job_ids), max_jobs))
         if self.on_stage:
             self.on_stage("refresh")
+        if should_stop and should_stop():
+            return self._stopped_result()
+        if progress:
+            progress(int(self.results.get("refresh", {}).get("collected", 0) or 0),
+                     len(job_ids))
         return self._result("refresh")
 
 
@@ -276,3 +292,95 @@ def test_execute_endpoint_returns_conflict_while_another_owner_holds_browser(tmp
         server.shutdown()
         thread.join(timeout=5)
         server.server_close()
+
+
+def test_stop_inside_stage_cancels_run_without_new_stages():
+    with tempfile.TemporaryDirectory() as directory:
+        store = JobUpdateStore(Path(directory) / "jobs.db", CONFIG)
+        try:
+            task = store.start({"favorites_budget": 2, "search_budget": 3, "refresh_budget": 2})
+            task = plan_with_budgets(store, task["run_id"], favorites=2, search=3,
+                                     refresh_ids=("j1", "j2"))
+            collector = FakeCollector({"incremental": {"collected": 1}})
+            original = collector.run_incremental
+
+            # 模拟：收藏阶段进行到一半时用户点停止（should_stop 变为真）
+            def incremental_with_mid_stage_stop(*args, **kwargs):
+                if len(collector.calls) >= 1:
+                    kwargs["should_stop"] = lambda: True
+                return original(*args, **kwargs)
+
+            collector.run_incremental = incremental_with_mid_stage_stop
+            result = JobUpdateExecutor().run(task, store, collector=collector)
+            assert result["status"] == "cancelled"
+            assert result["stages"][0]["status"] == "completed"  # 停止前已采的部分保留
+            assert result["stages"][1]["status"] == "cancelled"
+            assert result["stages"][2]["status"] == "cancelled"
+            assert "停止" in (result["error"] or "")
+        finally:
+            store.close()
+
+
+def test_stage_progress_is_persisted_for_the_panel():
+    with tempfile.TemporaryDirectory() as directory:
+        store = JobUpdateStore(Path(directory) / "jobs.db", CONFIG)
+        try:
+            task = store.start({"favorites_budget": 2, "search_budget": 3, "refresh_budget": 2})
+            task = plan_with_budgets(store, task["run_id"], favorites=2, search=3,
+                                     refresh_ids=("j1", "j2"))
+            collector = FakeCollector({"incremental": {"collected": 2},
+                                       "refresh": {"collected": 2}})
+            JobUpdateExecutor().run(task, store, collector=collector)
+            plan = store.get(task["run_id"])["plan"]
+            assert plan["stages"][0]["progress"] == {"collected": 2, "budget": 2}
+            assert plan["stages"][2]["progress"] == {"collected": 2, "budget": 2}
+        finally:
+            store.close()
+
+
+def test_collector_refresh_stops_between_items_without_cdp_side_effects():
+    with tempfile.TemporaryDirectory() as directory:
+        store = CollectionStore(Path(directory) / "jobs.db")
+        collector = BossCollector({"boss": {}, "collection": {}}, store)
+        store.save_detail({"platform": "boss", "job_id": "j1", "source_url": "",
+                           "title": "t", "company": "c", "jd": "jd"}, "seed")
+        page = Mock()
+        manager = Mock()
+        manager.__enter__ = Mock(return_value=Mock(chromium=Mock(
+            connect_over_cdp=Mock(return_value=Mock(contexts=[Mock(pages=[], new_page=Mock(return_value=page))])))))
+        manager.__exit__ = Mock(return_value=False)
+        with patch.object(collector, "_navigate"), \
+             patch.object(collector, "_require_login"), \
+             patch.object(collector, "_load_detail_page", side_effect=AssertionError("must not load")), \
+             patch("jobagent.platforms.boss_collector.sync_playwright", return_value=manager):
+            result = collector.refresh(["j1"], should_stop=lambda: True)
+        assert result.status == "stopped_by_user"
+        assert result.collected == 0
+        store.close()
+
+
+def test_detail_settle_is_adaptive_and_capped():
+    with tempfile.TemporaryDirectory() as directory:
+        store = CollectionStore(Path(directory) / "jobs.db")
+        collector = BossCollector({"boss": {}, "collection": {
+            "detail_settle_cap_seconds": 0.1, "adaptive_min_pause_seconds": [0.01, 0.01],
+        }}, store)
+        page = Mock()
+        page.locator.return_value.count.return_value = 1
+        page.locator.return_value.first.inner_text.return_value = "岗位描述"
+        collector._settle_detail_page(page)
+        waits = [call.args[0] for call in page.wait_for_timeout.call_args_list]
+        assert len(waits) == 1  # 只有人性化小停顿，没有固定沉睡
+        assert waits[0] <= 100
+        store.close()
+
+
+def test_detail_settle_falls_back_to_fixed_wait_when_adaptive_disabled():
+    with tempfile.TemporaryDirectory() as directory:
+        store = CollectionStore(Path(directory) / "jobs.db")
+        collector = BossCollector({"boss": {}, "collection": {"adaptive_wait": False}}, store)
+        page = Mock()
+        with patch.object(collector, "_wait") as wait:
+            collector._settle_detail_page(page)
+        wait.assert_called_once_with(page, collector._detail_settle_delay())
+        store.close()
