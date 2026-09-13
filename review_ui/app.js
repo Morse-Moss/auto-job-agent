@@ -1775,6 +1775,69 @@ function setOutreachMobileTab(tab) {
   });
 }
 
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll("\"", "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+let factsCheckToken = 0;
+async function renderFactsCheck(outreach) {
+  const box = document.querySelector("#factsCheck");
+  if (!box) return;
+  // 事实对照（C 组防线）：招呼语里每条成就表述都要能对到登记过的真实经历。
+  // 后端慢或失败都不阻塞审核主流程，只在框内显示降级提示。
+  const token = ++factsCheckToken;
+  box.hidden = false;
+  box.textContent = "事实对照检查中...";
+  let check;
+  try {
+    const response = await fetch(
+      `/api/facts/check?job_id=${encodeURIComponent(outreach.job_id || "")}`,
+    );
+    const data = await response.json();
+    if (data && data.error) throw new Error(data.error);
+    check = data.check;
+  } catch (error) {
+    if (token !== factsCheckToken) return;
+    box.className = "facts-check attention";
+    box.textContent = `事实对照不可用（${error.message}），发送前请自行核对每条经历表述。`;
+    return;
+  }
+  if (token !== factsCheckToken) return;
+  if (!check || !check.tracked) {
+    box.className = "facts-check attention";
+    box.textContent = "该岗位的招呼语没有登记事实对照，发送前请逐条核对成就表述。";
+    return;
+  }
+  const rows = [];
+  for (const item of check.declared || []) {
+    if (!item.fact_found) {
+      rows.push(`<p class="facts-row attention">说法引用的事实条目缺失：${escapeHtml(item.fact_id)}（请补 experience_facts.json）</p>`);
+      continue;
+    }
+    if (!item.in_greeting) {
+      rows.push(`<p class="facts-row attention">声明的说法不在当前招呼语里（可能已编辑）：${escapeHtml(item.claim_text)}</p>`);
+      continue;
+    }
+    rows.push(
+      `<p class="facts-row ok">「${escapeHtml(item.claim_text)}」↔ ${escapeHtml(item.fact_text)}</p>`,
+    );
+  }
+  for (const hit of check.unchecked || []) {
+    rows.push(
+      `<p class="facts-row attention">未核对表述「${escapeHtml(hit.phrase)}」：…${escapeHtml(hit.context)}…（属实请忽略，不实必须删改）</p>`,
+    );
+  }
+  const hasProblem = (check.unchecked || []).length > 0
+    || (check.declared || []).some((item) => !item.fact_found || !item.in_greeting);
+  box.className = `facts-check ${hasProblem ? "attention" : "pass"}`;
+  box.innerHTML = `<p class="facts-title">${hasProblem ? "事实对照：有需要核对的表述" : "事实对照：全部说法有登记的真实经历支撑"}</p>${rows.join("") || "<p class=\"facts-row ok\">招呼语中没有成就类表述。</p>"}`;
+}
+
 function renderOutreachDetail(outreach) {
   state.outreachDetail = outreach;
   state.greetingDirty = false;
@@ -1823,6 +1886,7 @@ function renderOutreachDetail(outreach) {
   greetingQuality.className = `greeting-quality ${generated && greetingPasses ? "pass" : "attention"}`;
   applyOutreachControls(outreach);
   document.querySelector("#greetingCount").textContent = `${elements.greetingEditor.value.length} 字`;
+  renderFactsCheck(outreach);
 
   const artifactVersion = outreach.image_hash || outreach.content_version || 0;
   if (outreach.resume_assets && outreach.resume_assets.length) {
@@ -2013,6 +2077,13 @@ async function saveOutreachPart(kind) {
     const payload = await fetchJson(outreachApi(jobId, `/${kind}`, platform), {
       method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     });
+    if (isGreeting) {
+      // 修订可能影响已有发送任务的内容指纹：刷新后发送门会提示重新授权。
+      try {
+        const sendPayload = await fetchJson(outreachApi(jobId, "/send", platform));
+        state.sendTask = sendPayload.send || null;
+      } catch { state.sendTask = null; }
+    }
     if (state.selectedOutreachId === jobId && state.selectedOutreachPlatform === platform) {
       renderOutreachDetail(payload.outreach);
     }
@@ -2215,6 +2286,12 @@ function renderSendGate(outreach) {
       if (action.error) row.append(createTextElement("small", "send-action-error", action.error));
       elements.outreachSendActions.append(row);
     });
+    if (task.amended_at) {
+      elements.outreachSendActions.append(
+        createTextElement("small", "send-action-error",
+          `内容已修订：${task.amended_at}${task.amend_note ? ` · ${task.amend_note}` : ""}`),
+      );
+    }
     if (status === "paused") {
       elements.outreachSendActions.append(buildPausedResolveRow(task));
     }

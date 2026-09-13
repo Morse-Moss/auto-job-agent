@@ -19,6 +19,7 @@ from jobagent.matching import refresh_stale_matches
 from jobagent.jd_update import plan_from_database
 from jobagent.job_updates import JobUpdateStore
 from jobagent.job_update_executor import BrowserLease, BrowserLeaseBusy, JobUpdateExecutor
+from jobagent.facts import check_job
 from jobagent.outreach import (
     OutreachService,
     OutreachValidationError,
@@ -263,6 +264,16 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/learning":
             self._learning_dashboard()
             return
+        if path == "/api/facts/check":
+            job_id = str(query.get("job_id", [""])[0])
+            try:
+                self._send_json(HTTPStatus.OK, {"check": check_job(job_id)})
+            except Exception as exc:  # noqa: BLE001 — 检查失败不阻塞审核主流程
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"error": f"事实检查失败：{type(exc).__name__}: {exc}"},
+                )
+            return
         if path == "/api/outreach":
             self._outreach_call(lambda service: {"jobs": service.list_candidates()})
             return
@@ -373,6 +384,19 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
                             )}
                         )
                 except (ValueError, json.JSONDecodeError, OutreachValidationError) as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            if len(parts) == 4 and parts[3] == "amend":
+                try:
+                    payload = self._read_json(64_000)
+                    platform = str(query.get("platform", ["boss"])[0])
+                    self._amend_outreach(
+                        parts[2],
+                        platform,
+                        str(payload.get("text") or ""),
+                        str(payload.get("reason") or ""),
+                    )
+                except (ValueError, json.JSONDecodeError) as exc:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
             if len(parts) == 4 and parts[3] == "authorize":
@@ -743,6 +767,47 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         if not isinstance(payload, dict):
             raise OutreachValidationError("提交内容格式不正确")
         return payload
+
+    def _amend_outreach(self, job_id: str, platform: str, text: str, reason: str) -> None:
+        """修订招呼语的正规纠错路径（B5，2026-09-13）。
+
+        改文案 → 重新确认 → 授权时同步任务指纹并重置失败动作 → 留痕。
+        只把内容摆到"可发送"状态，绝不执行发送——发送必须由用户显式触发。
+        """
+        outreach = None
+        try:
+            outreach = self.server.outreach_service()
+            if not text.strip():
+                raise OutreachValidationError("修订后的招呼语不能为空")
+            outreach.update_greeting(platform, job_id, text)
+            outreach.confirm(platform, job_id, "greeting")
+            data = {"outreach": outreach.get(platform, job_id)}
+        except OutreachValidationError as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        except Exception as exc:
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"error": f"修订失败：{type(exc).__name__}: {exc}"},
+            )
+            return
+        finally:
+            if outreach is not None:
+                outreach.close()
+        send = None
+        try:
+            send = self.server.send_service()
+            send.authorize(platform, job_id)
+            send.note_amendment(platform, job_id, reason)
+            data["send"] = send.status_for(platform, job_id)
+        except SendValidationError as exc:
+            data["send_error"] = str(exc)
+        except Exception as exc:
+            data["send_error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            if send is not None:
+                send.close()
+        self._send_json(HTTPStatus.OK, data)
 
     def _outreach_call(self, action) -> None:
         service = None

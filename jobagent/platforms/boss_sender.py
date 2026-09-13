@@ -220,18 +220,19 @@ class BossSender:
         button.click()
         self._wait(page, self.cfg.get("chat_settle_range_seconds", [3, 6]))
         self._assert_safe(page)
-        chat = page
-        if "/web/geek/chat" not in (page.url or ""):
-            # 点击后新开的聊天标签页：跟进它，后续输入/上传都在新页里。
-            new_chats = [
+        chat = self._await_chat_window(page, context, chats_before)
+        if chat is None:
+            # 兜底：没有新开聊天窗，但浏览器里已有聊天标签（可能属于本岗位
+            # 之前的会话）。交给会话身份校验把关，绝不拿职位详情页冒充聊天页
+            # ——详情页永远没有聊天输入框，只会报出误导性的"找不到输入框"。
+            existing = [
                 p
                 for p in context.pages
-                if "/web/geek/chat" in (p.url or "") and id(p) not in chats_before
+                if "/web/geek/chat" in (p.url or "")
             ]
-            if new_chats:
-                chat = new_chats[-1]
-            elif not any("/web/geek/chat" in (p.url or "") for p in context.pages):
-                raise SendFailed("点击沟通后聊天窗口未打开，未发送任何内容")
+            chat = existing[-1] if existing else None
+        if chat is None:
+            raise SendFailed("点击沟通后聊天窗口未打开，未发送任何内容")
         # 会话身份校验：确认打开的是目标职位的会话，再允许输入。
         deadline = time.monotonic() + 8
         while not self._conversation_matches(chat, company, title):
@@ -243,6 +244,65 @@ class BossSender:
             chat.wait_for_timeout(500)
         self._verified_chat = {"job_id": job_id, "page": chat}
         return chat
+
+    def _await_chat_window(self, page, context, chats_before: set[int]):
+        """点击沟通后事件驱动等待聊天窗（真实事故 2026-09-13 云起未来）。
+
+        首次沟通点击后，Boss 可能弹确认层、或新标签页加载慢；固定 3-6 秒 +
+        一次性检测接不住，导致招呼语误判失败、只发出长图的 partial 中间态。
+        这里轮询最多 30 秒，命中任一信号即返回：
+        - 当前页 URL 跳到 /web/geek/chat；
+        - 出现新的聊天标签页；
+        - 点掉首次沟通的确认弹层后由上述两条命中。
+        超时返回 None，由调用方决定兜底或报错。
+        """
+        deadline = time.monotonic() + 30
+        confirm_hint = ""
+        while time.monotonic() < deadline:
+            self._assert_safe(page)
+            if "/web/geek/chat" in (page.url or ""):
+                return page
+            new_chats = [
+                p
+                for p in context.pages
+                if "/web/geek/chat" in (p.url or "") and id(p) not in chats_before
+            ]
+            if new_chats:
+                return new_chats[-1]
+            # 首次沟通的确认弹层：容器内找「继续沟通/开始沟通/确定」按钮点掉。
+            clicked = self._click_chat_confirm(page)
+            if clicked and clicked != confirm_hint:
+                confirm_hint = clicked  # 记录避免同一弹层反复点击刷日志
+            page.wait_for_timeout(1_000)
+        return None
+
+    @staticmethod
+    def _click_chat_confirm(page) -> str:
+        """尝试点掉首次沟通确认弹层。返回被点击的按钮文案，没点到返回空。"""
+        try:
+            return str(
+                page.evaluate(
+                    """() => {
+                        const containers = document.querySelectorAll(
+                            '.dialog-wrap, .zp-dialog, .bp-dialog, .dialog-footer, '
+                            + '.dialog-box, .v-dialog, .btn-area'
+                        );
+                        const wanted = new Set(['继续沟通', '开始沟通', '确定', '发送']);
+                        for (const box of containers) {
+                            if (!box.offsetParent) continue;
+                            const btns = box.querySelectorAll('button, a.btn');
+                            for (const b of btns) {
+                                const t = (b.innerText || '').trim();
+                                if (wanted.has(t)) { b.click(); return t; }
+                            }
+                        }
+                        return '';
+                    }"""
+                )
+                or ""
+            )
+        except Exception:  # noqa: BLE001 — 弹层探测失败不阻塞轮询
+            return ""
 
     @staticmethod
     def _conversation_matches(page, company: str, title: str) -> bool:

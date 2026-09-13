@@ -11,7 +11,9 @@ CDP session, and so the real Boss adapter stays a thin, auditable layer.
 from __future__ import annotations
 
 import hashlib
+import random
 import sqlite3
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +29,9 @@ TASK_STATES = ("queued", "running", "partial", "confirmed", "failed", "paused", 
 
 # One initial attempt plus at most one retry, and only for definite failures.
 MAX_ATTEMPTS = 2
+
+# 同一次执行内重试前的短延迟（真实发送模拟人的停顿；测试里 patch 成 0）。
+RETRY_DELAY_RANGE = (2.0, 4.0)
 
 
 def _now() -> str:
@@ -99,6 +104,21 @@ class OutreachSendStore:
             );
             """
         )
+        # 修订记录（B5）：内容确认后发现不符时的正规纠错留痕。
+        columns = {
+            row[1]
+            for row in self.conn.execute(
+                "PRAGMA table_info(outreach_send_tasks)"
+            ).fetchall()
+        }
+        for name, ddl in (
+            ("amended_at", "TEXT"),
+            ("amend_note", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if name not in columns:
+                self.conn.execute(
+                    f"ALTER TABLE outreach_send_tasks ADD COLUMN {name} {ddl}"
+                )
         self.conn.commit()
 
     def _record(self, row: sqlite3.Row | None) -> dict | None:
@@ -142,7 +162,14 @@ class OutreachSendStore:
         jd_hash: str,
         resume_hash: str,
     ) -> dict:
-        """Return the one task for this job at this content version."""
+        """Return the one task for this job at this content version.
+
+        同版本重复授权且内容指纹已变（确认后修订文案的正规纠错路径，
+        2026-09-13）时：更新任务指纹、把 failed 动作重置回 pending 并重置
+        重试预算——指纹变了就是新内容，旧失败不再占用预算。已 confirmed
+        的动作不受影响，claim_action 保证它们永不重发；已完成任务（全送达）
+        不允许再改，防止事后篡改账本。
+        """
         version = int(content_version)
         with self.conn:
             self.conn.execute("BEGIN IMMEDIATE")
@@ -152,6 +179,37 @@ class OutreachSendStore:
                 (platform, job_id, version),
             ).fetchone()
             if existing:
+                task = self.get(existing["task_id"])
+                new_hashes = {
+                    "greeting_hash": greeting_hash,
+                    "image_hash": image_hash,
+                    "jd_hash": jd_hash,
+                    "resume_hash": resume_hash,
+                }
+                changed = {
+                    key: value
+                    for key, value in new_hashes.items()
+                    if task[key] != value
+                }
+                if changed and task["status"] == "confirmed":
+                    raise SendValidationError("该任务已全部送达，内容不可再修订")
+                if changed:
+                    sets = ", ".join(f"{key}=?" for key in changed)
+                    self.conn.execute(
+                        f"UPDATE outreach_send_tasks SET {sets}, updated_at=? "
+                        "WHERE task_id=?",
+                        (*changed.values(), _now(), task["task_id"]),
+                    )
+                    for kind in ACTION_KINDS:
+                        hash_key = f"{kind}_hash"
+                        if hash_key not in changed:
+                            continue
+                        self.conn.execute(
+                            "UPDATE outreach_send_actions SET status='pending', "
+                            "attempts=0, error='', updated_at=? "
+                            "WHERE task_id=? AND kind=? AND status='failed'",
+                            (_now(), task["task_id"], kind),
+                        )
                 return self.get(existing["task_id"])
             task_id = f"send-{uuid.uuid4().hex}"
             now = _now()
@@ -271,6 +329,15 @@ class OutreachSendStore:
             )
         return self.get(task_id)
 
+    def record_amend(self, task_id: str, note: str) -> None:
+        """留痕一次内容修订：何时改的、为什么改（B5，2026-09-13）。"""
+        self.conn.execute(
+            "UPDATE outreach_send_tasks SET amended_at=?, amend_note=? "
+            "WHERE task_id=?",
+            (_now(), str(note or ""), task_id),
+        )
+        self.conn.commit()
+
     def close(self) -> None:
         self.conn.close()
 
@@ -315,6 +382,14 @@ class OutreachSendService:
     def status_for(self, platform: str, job_id: str) -> dict | None:
         """Latest send task for a job, or None when never authorized."""
         return self.store.latest_for(str(platform), str(job_id))
+
+    def note_amendment(self, platform: str, job_id: str, reason: str) -> dict | None:
+        """记录一次内容修订（B5）。任务不存在时静默跳过（还没有授权账本）。"""
+        task = self.status_for(platform, job_id)
+        if task is not None:
+            self.store.record_amend(task["task_id"], str(reason or ""))
+            return self.store.get(task["task_id"])
+        return None
 
     def resolve_and_continue(
         self, platform: str, job_id: str, *, greeting_sent: bool, note: str = ""
@@ -374,6 +449,7 @@ class OutreachSendService:
             self._assert_snapshot(task, package)
             self.store.mark_running(task_id)
             halted = ""
+            halt_status = None
             for kind, perform in (
                 (TEXT_KIND, lambda: self.sender.send_text(task, package)),
                 (IMAGE_KIND, lambda: self.sender.send_image(task, package)),
@@ -381,13 +457,28 @@ class OutreachSendService:
                 if halted:
                     continue
                 try:
-                    closed = self._run_action(task_id, kind, perform)
-                    if closed:
-                        halted = "岗位已关闭，停止本任务剩余动作"
+                    state = self._run_action(task_id, kind, perform)
                 except SendPaused as exc:
-                    halted = str(exc)
+                    halted, halt_status = str(exc), "paused"
+                    continue
+                if state == "closed":
+                    halted, halt_status = "岗位已关闭，停止本任务剩余动作", "failed"
+                    continue
+                if state == "failed":
+                    # 同一次执行内短延迟重试一次：招呼语第一次点击后聊天窗
+                    # 未开（2026-09-13 云起未来）这类偶发时序失败不应留尾巴。
+                    time.sleep(random.uniform(*RETRY_DELAY_RANGE))
+                    state = self._run_action(task_id, kind, perform)
+                    if state == "closed":
+                        halted, halt_status = "岗位已关闭，停止本任务剩余动作", "failed"
+                        continue
+                if state in ("failed", "unknown"):
+                    # 非确定送达就停：招呼语没发出去时不发长图，避免
+                    # "只有长图没有招呼语"的部分送达中间态（2026-09-13）。
+                    halted = f"{kind} 动作未确认送达，停止本任务剩余动作"
             if halted:
-                return self.store.finish(task_id, "failed" if halted.startswith("岗位已关闭") else "paused", halted)
+                status = halt_status or self._summarize(task_id)
+                return self.store.finish(task_id, status, halted)
             return self.store.finish(task_id, self._summarize(task_id))
         finally:
             self.lease.release(self.owner)
@@ -398,37 +489,41 @@ class OutreachSendService:
                 return action
         raise SendValidationError(f"发送任务缺少 {kind} 动作")
 
-    def _run_action(self, task_id: str, kind: str, perform) -> bool:
-        """Claim and run one action. Returns True when the job itself is closed."""
-        # The atomic claim decides whether this runner may act at all. A False
-        # result means: already confirmed, result unknown, taken by another
-        # runner, or retry budget spent.
+    def _run_action(self, task_id: str, kind: str, perform) -> str:
+        """Claim and run one action.
+
+        Returns the resulting state: confirmed / failed / unknown / closed.
+        When the claim fails (already confirmed, result unknown, another
+        runner holds it, or retry budget spent) the current state is returned
+        unchanged so the caller can decide.
+        """
         if not self.store.claim_action(task_id, kind):
-            return False
+            return self._action(task_id, kind)["status"]
         task = self.store.get(task_id)
         try:
             evidence = perform()
         except JobClosed as exc:
             self.store.finish_action(task_id, kind, "failed", error=str(exc))
             self._mark_job_closed(task["platform"], task["job_id"], str(exc))
-            return True
+            return "closed"
         except SendPaused:
             self.store.finish_action(task_id, kind, "unknown", error="已暂停，结果待人工核对")
             raise
         except SendFailed as exc:
             self.store.finish_action(task_id, kind, "failed", error=str(exc))
-            return
+            return "failed"
         except Exception as exc:
             # An unclassified error means the delivery state is unknown, so it
             # must never be retried automatically.
             self.store.finish_action(
                 task_id, kind, "unknown", error=f"{type(exc).__name__}: {exc}"
             )
-            return
+            return "unknown"
         if evidence:
             self.store.finish_action(task_id, kind, "confirmed", evidence=str(evidence))
-        else:
-            self.store.finish_action(task_id, kind, "unknown", error="未取得送达证据")
+            return "confirmed"
+        self.store.finish_action(task_id, kind, "unknown", error="未取得送达证据")
+        return "unknown"
 
     def _mark_job_closed(self, platform: str, job_id: str, reason: str) -> None:
         """Write the closed posting back to freshness so the inventory heals.

@@ -1375,3 +1375,12 @@ textarea { min-height: 88px; padding: 9px 10px; resize: vertical; line-height: 1
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
 }
+
+/* 招呼语事实对照（C 组防线 2026-09-13） */
+.facts-check { margin-top: 8px; padding: 8px 10px; border-left: 3px solid var(--green); background: var(--green-soft); font-size: 10px; line-height: 1.6; }
+.facts-check.pass { border-left-color: var(--green); background: var(--green-soft); color: var(--green); }
+.facts-check.attention { border-left-color: var(--amber); background: var(--amber-soft); color: var(--amber); }
+.facts-title { font-weight: 700; margin-bottom: 4px; }
+.facts-row { margin: 3px 0; color: var(--ink); opacity: 0.92; }
+.facts-row.attention { color: var(--amber); }
+.facts-row.ok { color: var(--green); }

@@ -242,3 +242,108 @@ def test_execute_holds_the_browser_lease_and_releases_it(tmp_path):
         assert lease.owner is None
     finally:
         service.close()
+
+
+@pytest.fixture(autouse=True)
+def _no_retry_sleep(monkeypatch):
+    """重试延迟在测试里归零，避免真实 2-4 秒停顿拖慢套件。"""
+    import jobagent.outreach_send as module
+
+    monkeypatch.setattr(module, "RETRY_DELAY_RANGE", (0.0, 0.0))
+
+
+def test_greeting_failure_stops_image_and_holds_retry_budget(tmp_path):
+    """A2+A3：招呼语确定失败时中止，长图不发；重试在同一次执行内完成。"""
+    sender = FakeSender(text_exc=SendFailed("聊天窗口未打开"))
+    service = build(tmp_path, {("boss", "job-1"): package()}, sender)
+    try:
+        task = service.authorize("boss", "job-1")
+        done = service.execute(task["task_id"])
+        # 第一次失败 + 同次执行重试一次 = 两次调用，长图从未尝试
+        assert sender.calls == [("text", "job-1"), ("text", "job-1")]
+        assert done["status"] == "failed"
+        assert actions_of(done)["greeting"]["status"] == "failed"
+        assert actions_of(done)["image"]["status"] == "pending"
+        # 重试预算耗尽后，再次执行不再发送
+        service.execute(task["task_id"])
+        assert len(sender.calls) == 2
+    finally:
+        service.close()
+
+
+def test_greeting_retry_recovers_within_one_execute(tmp_path):
+    """A3：第一次偶发失败、重试成功后，长图照常发出，任务完整确认。"""
+    sender = FakeSender()
+    sender.text_exc = SendFailed("聊天窗口未打开")
+    original_send_text = sender.send_text
+
+    def flaky_text(task, pack):
+        result_exc = sender.text_exc
+        sender.text_exc = None  # 只失败第一次
+        if result_exc is not None:
+            raise result_exc
+        return original_send_text(task, pack)
+
+    sender.send_text = flaky_text
+    service = build(tmp_path, {("boss", "job-1"): package()}, sender)
+    try:
+        task = service.authorize("boss", "job-1")
+        done = service.execute(task["task_id"])
+        assert done["status"] == "confirmed"
+        # 失败那次不产生送达调用；重试成功后长图照常发出
+        assert [c[0] for c in sender.calls] == ["text", "image"]
+        assert actions_of(done)["greeting"]["attempts"] == 2
+    finally:
+        service.close()
+
+
+def test_authorize_updates_hashes_for_amended_content(tmp_path):
+    """B4：同版本修订文案后重新授权，更新指纹并重置失败动作的预算。"""
+    packages = {("boss", "job-1"): package()}
+    service = build(tmp_path, packages, FakeSender(text_exc=SendFailed("失败")))
+    try:
+        task = service.authorize("boss", "job-1")
+        service.execute(task["task_id"])
+        assert service.store.get(task["task_id"])["status"] == "failed"
+        # 修订招呼语（同版本、新文本），重新授权
+        packages[("boss", "job-1")] = package(greeting_text="你好，修订后的真实表述。")
+        amended = service.authorize("boss", "job-1")
+        assert amended["task_id"] == task["task_id"]
+        assert amended["greeting_hash"] != task["greeting_hash"]
+        action = actions_of(amended)["greeting"]
+        assert action["status"] == "pending"
+        assert action["attempts"] == 0
+        # 长图动作保持原状态，未被重置重发
+        assert actions_of(amended)["image"]["status"] == "pending"
+    finally:
+        service.close()
+
+
+def test_amend_is_rejected_after_full_delivery(tmp_path):
+    """B4：已全部送达的任务不允许再改内容，防止事后篡改账本。"""
+    packages = {("boss", "job-1"): package()}
+    service = build(tmp_path, packages, FakeSender())
+    try:
+        task = service.authorize("boss", "job-1")
+        service.execute(task["task_id"])
+        assert service.store.get(task["task_id"])["status"] == "confirmed"
+        packages[("boss", "job-1")] = package(greeting_text="你好，事后想改。")
+        with pytest.raises(SendValidationError):
+            service.authorize("boss", "job-1")
+    finally:
+        service.close()
+
+
+def test_note_amendment_records_trace(tmp_path):
+    """B5：修订留痕（时间 + 原因），无任务时静默跳过。"""
+    packages = {("boss", "job-1"): package()}
+    service = build(tmp_path, packages, FakeSender())
+    try:
+        assert service.note_amendment("boss", "job-1", "更早于授权的修订") is None
+        task = service.authorize("boss", "job-1")
+        noted = service.note_amendment("boss", "job-1", "删除不实的 RAG 表述")
+        assert noted["task_id"] == task["task_id"]
+        assert noted["amended_at"]
+        assert noted["amend_note"] == "删除不实的 RAG 表述"
+    finally:
+        service.close()
