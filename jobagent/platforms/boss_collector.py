@@ -654,7 +654,11 @@ class BossCollector:
                     self.store.update_cursor(source_key, 1, 0, "empty")
                     continue
 
-                count = min(cards.count(), max_jobs)
+                # 搜索页是无限滚动列表：不滚动只能拿到首屏约 15 条
+                # （2026-09-14 实测：每滚一次约追加 15 张卡）。这里先滚动加载
+                # 到每源上限再逐条采详情，否则每个来源只能采到 15 条。
+                loaded = self._scroll_search_cards(page, cards, max_jobs)
+                count = min(loaded, max_jobs)
                 seen_ids: set[str] = set()
                 for index in range(count):
                     if self.store.detail_inventory_count() >= target:
@@ -684,6 +688,25 @@ class BossCollector:
                         self._wait(page, self._detail_delay())
                 self.store.update_cursor(source_key, 1, count, "exhausted")
                 self.store.finalize_scan(source_key, seen_ids, run_id)
+
+    def _scroll_search_cards(self, page, cards, want: int) -> int:
+        """滚动加载搜索列表，直到达到 want 张卡片或连续两次不再增长。
+
+        搜索页是无限滚动（用户滚动才加载下一页数据），每次滚动约追加
+        15 张卡片。连续两次数量不变说明已到底或已加载完。
+        """
+        count = cards.count()
+        stale = 0
+        while count < want and stale < 2:
+            page.mouse.wheel(0, 8000)
+            self._wait(page, [1.0, 1.8])
+            new_count = cards.count()
+            if new_count <= count:
+                stale += 1
+            else:
+                stale = 0
+            count = new_count
+        return count
 
     def _collect_one(self, job: dict, run_id: str, loader) -> None:
         try:
