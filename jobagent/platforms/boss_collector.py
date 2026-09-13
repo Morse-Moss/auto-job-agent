@@ -8,6 +8,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass
 from collections.abc import Iterable
+from datetime import datetime
 
 from playwright.sync_api import TimeoutError as PWTimeout
 from playwright.sync_api import sync_playwright
@@ -316,9 +317,20 @@ class BossCollector:
                                 )
                             else:
                                 if not (detail.get("jd") or "").strip():
-                                    raise RuntimeError("JD text is empty")
-                                self.store.save_observation(detail, run_id)
-                                self.store.save_detail(detail, run_id)
+                                    if self._dead_detail_page(detail_page):
+                                        detail["jd"] = job.get("jd_text") or ""
+                                        self.store.save_observation(detail, run_id)
+                                        self.store.save_detail(
+                                            detail,
+                                            run_id,
+                                            detail_status="closed",
+                                            error="详情页无JD正文且命中死岗位签名（跳回首页或首页标题），判定岗位已下线",
+                                        )
+                                    else:
+                                        raise RuntimeError("JD text is empty")
+                                else:
+                                    self.store.save_observation(detail, run_id)
+                                    self.store.save_detail(detail, run_id)
                             refreshed += 1
                             if progress:
                                 progress(refreshed, len(selected))
@@ -393,7 +405,8 @@ class BossCollector:
                 list_page = context.new_page()
                 own_pages.append(list_page)
                 if source in ("all", "favorites"):
-                    scanned_sources += self._scan_favorites_coverage(list_page, run_id, max_pages)
+                    if source == "favorites" or not self._favorites_recently_scanned():
+                        scanned_sources += self._scan_favorites_coverage(list_page, run_id, max_pages)
                 if source in ("all", "search"):
                     scanned_sources += self._scan_search_coverage(
                         list_page, run_id, max_pages, max_sources=max_sources
@@ -418,6 +431,37 @@ class BossCollector:
         return CollectionResult(
             run_id, 0, self.store.detail_inventory_count(), status, error, scanned_sources
         )
+
+    def _favorites_recently_scanned(self, max_age_hours: float = 6.0) -> bool:
+        """True when a completed coverage scan already covered favorites recently.
+
+        --scan-source all always includes favorites; multi-round scan loops
+        (incident 2026-09-13) re-walked the whole favorites list every round
+        even though nothing changed between rounds. A completed coverage run
+        within the window means favorites was walked, so skip it. Explicit
+        --scan-source favorites requests bypass this check.
+        """
+        try:
+            row = self.store.conn.execute(
+                """
+                SELECT started_at FROM detail_collection_runs
+                 WHERE source = 'boss-scan-coverage' AND status = 'completed'
+                 ORDER BY started_at DESC LIMIT 1
+                """
+            ).fetchone()
+        except Exception:  # noqa: BLE001 — a broken probe must not kill the scan
+            return False
+        if row is None:
+            return False
+        started = str(row["started_at"] or "")
+        try:
+            last = datetime.fromisoformat(started)
+        except ValueError:
+            return False
+        if last.tzinfo is None:
+            last = last.astimezone()
+        age = datetime.now().astimezone() - last
+        return 0 <= age.total_seconds() < max_age_hours * 3600
 
     def _scan_favorites_coverage(self, page, run_id: str, max_pages: int) -> int:
         self._navigate(page, FAVORITES_URL)
@@ -730,6 +774,26 @@ class BossCollector:
             page.wait_for_timeout(250)
         lo, hi = self.collection_cfg.get("adaptive_min_pause_seconds", [0.8, 2.0])
         page.wait_for_timeout(int(random.uniform(float(lo), float(hi)) * 1000))
+
+    @staticmethod
+    def _dead_detail_page(page) -> bool:
+        """True when a detail page shows a dead-job signature instead of JD content.
+
+        Boss renders deleted jobs two ways (incident 2026-09-13): a hard
+        redirect back to the homepage (URL no longer job_detail), or the
+        job_detail URL kept but the homepage shell rendered (title becomes the
+        generic homepage title). Live detail pages always keep a job-specific
+        title, so either signature with empty JD means the job is gone.
+        Only call this after JD extraction came up empty — never instead of it.
+        """
+        try:
+            if "job_detail" not in (page.url or ""):
+                return True
+            if "BOSS直聘-找工作" in (page.title() or ""):
+                return True
+        except Exception:  # noqa: BLE001 — an unreadable page is not evidence
+            return False
+        return False
 
     @staticmethod
     def _detail_result(page, job: dict, payload: dict | None) -> dict:

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import main as main_module
 from jobagent.collection import (
@@ -627,6 +627,219 @@ class CollectionBrowserLifecycleTests(unittest.TestCase):
                 self.assertTrue(all(page.closed for page in owned))
             finally:
                 store.close()
+
+
+class _FakeDetailPage:
+    """Minimal page double exposing only what _dead_detail_page inspects."""
+
+    def __init__(self, url, title):
+        self.url = url
+        self._title = title
+
+    def title(self):
+        return self._title
+
+
+class BossCollectorDeadDetailTests(unittest.TestCase):
+    HOME_TITLE = "BOSS直聘-找工作BOSS直聘直接谈！招聘求职找工作！"
+
+    def test_dead_detail_page_signatures(self):
+        redirected = BossCollector._dead_detail_page(
+            _FakeDetailPage("https://www.zhipin.com/", self.HOME_TITLE)
+        )
+        homepage_shell = BossCollector._dead_detail_page(
+            _FakeDetailPage(
+                "https://www.zhipin.com/job_detail/job-1.html", self.HOME_TITLE
+            )
+        )
+        alive = BossCollector._dead_detail_page(
+            _FakeDetailPage(
+                "https://www.zhipin.com/job_detail/job-1.html",
+                "「AI工程师」_某公司招聘_BOSS直聘",
+            )
+        )
+        self.assertTrue(redirected)
+        self.assertTrue(homepage_shell)
+        self.assertFalse(alive)
+
+    def _seed_refreshable_job(self, store):
+        run_id = store.start_run(target_count=1)
+        job = {
+            "platform": "boss",
+            "job_id": "job-1",
+            "source": "boss-search",
+            "source_key": "search:上海:AI 应用工程师",
+            "source_page": 1,
+            "source_url": "https://www.zhipin.com/job_detail/job-1.html",
+            "title": "AI FDE",
+            "company": "Example",
+            "jd": "负责客户需求诊断、Agent/RAG 开发与部署交付。",
+        }
+        store.save_observation(job, run_id)
+        store.save_detail(job, run_id)
+        return job
+
+    def _manager_for(self, context):
+        playwright = SimpleNamespace(
+            chromium=SimpleNamespace(
+                connect_over_cdp=Mock(return_value=SimpleNamespace(contexts=[context]))
+            )
+        )
+        manager = MagicMock()
+        manager.__enter__.return_value = playwright
+        manager.__exit__.return_value = False
+        return manager
+
+    def test_refresh_marks_dead_homepage_shell_as_closed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = CollectionStore(Path(temp_dir) / "jobs.db")
+            self._seed_refreshable_job(store)
+            collector = BossCollector(
+                {"boss": {"cdp_endpoint": "http://127.0.0.1:17332"}, "collection": {}},
+                store,
+            )
+            context = Mock()
+            context.pages = []
+            detail_page = Mock()
+            detail_page.url = "https://www.zhipin.com/job_detail/job-1.html"
+            context.new_page.return_value = detail_page
+
+            with (
+                patch(
+                    "jobagent.platforms.boss_collector.sync_playwright",
+                    return_value=self._manager_for(context),
+                ),
+                patch.object(collector, "_navigate"),
+                patch.object(collector, "_require_login"),
+                patch.object(
+                    collector,
+                    "_load_detail_page",
+                    return_value={
+                        "platform": "boss",
+                        "job_id": "job-1",
+                        "source": "boss-refresh",
+                        "source_key": "refresh",
+                        "source_url": "https://www.zhipin.com/job_detail/job-1.html",
+                        "title": "AI FDE",
+                        "company": "Example",
+                        "jd": "",
+                    },
+                ),
+                patch.object(collector, "_dead_detail_page", return_value=True),
+                patch.object(collector, "_wait"),
+            ):
+                result = collector.refresh(["job-1"], max_jobs=5)
+
+            self.assertEqual(result.status, "completed")
+            row = store.get_detail("job-1")
+            self.assertEqual(row["detail_status"], "closed")
+            state = store.conn.execute(
+                "SELECT evidence_state, closure_reason FROM job_freshness WHERE job_id = 'job-1'"
+            ).fetchone()
+            self.assertEqual(state["evidence_state"], "closed")
+            self.assertIn("已下线", state["closure_reason"] or "")
+            store.close()
+
+    def test_refresh_still_fails_when_no_dead_signature(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = CollectionStore(Path(temp_dir) / "jobs.db")
+            self._seed_refreshable_job(store)
+            collector = BossCollector(
+                {"boss": {"cdp_endpoint": "http://127.0.0.1:17332"}, "collection": {}},
+                store,
+            )
+            context = Mock()
+            context.pages = []
+            detail_page = Mock()
+            detail_page.url = "https://www.zhipin.com/job_detail/job-1.html"
+            context.new_page.return_value = detail_page
+
+            with (
+                patch(
+                    "jobagent.platforms.boss_collector.sync_playwright",
+                    return_value=self._manager_for(context),
+                ),
+                patch.object(collector, "_navigate"),
+                patch.object(collector, "_require_login"),
+                patch.object(
+                    collector,
+                    "_load_detail_page",
+                    return_value={
+                        "platform": "boss",
+                        "job_id": "job-1",
+                        "source": "boss-refresh",
+                        "source_key": "refresh",
+                        "source_url": "https://www.zhipin.com/job_detail/job-1.html",
+                        "title": "AI FDE",
+                        "company": "Example",
+                        "jd": "",
+                    },
+                ),
+                patch.object(collector, "_dead_detail_page", return_value=False),
+                patch.object(collector, "_wait"),
+            ):
+                result = collector.refresh(["job-1"], max_jobs=5)
+
+            self.assertEqual(result.status, "completed")
+            row = store.get_detail("job-1")
+            self.assertEqual(row["detail_status"], "failed")
+            state = store.conn.execute(
+                "SELECT evidence_state FROM job_freshness WHERE job_id = 'job-1'"
+            ).fetchone()
+            self.assertEqual(state["evidence_state"], "inaccessible")
+            store.close()
+
+    def test_scan_all_skips_favorites_when_recently_scanned(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = CollectionStore(Path(temp_dir) / "jobs.db")
+            run_id = store.start_run(target_count=0, source="boss-scan-coverage")
+            store.finish_run(run_id, "completed", records_collected=0)
+            collector = BossCollector(
+                {"boss": {"cdp_endpoint": "http://127.0.0.1:17332"}, "collection": {}},
+                store,
+            )
+            context = Mock()
+            context.pages = []
+            context.new_page.return_value = Mock()
+
+            with (
+                patch(
+                    "jobagent.platforms.boss_collector.sync_playwright",
+                    return_value=self._manager_for(context),
+                ),
+                patch.object(collector, "_scan_favorites_coverage") as favorites,
+                patch.object(collector, "_scan_search_coverage", return_value=1),
+            ):
+                result = collector.scan_coverage(source="all", max_sources=3)
+
+            favorites.assert_not_called()
+            self.assertEqual(result.status, "completed")
+            store.close()
+
+    def test_scan_favorites_explicit_request_bypasses_recency_skip(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = CollectionStore(Path(temp_dir) / "jobs.db")
+            run_id = store.start_run(target_count=0, source="boss-scan-coverage")
+            store.finish_run(run_id, "completed", records_collected=0)
+            collector = BossCollector(
+                {"boss": {"cdp_endpoint": "http://127.0.0.1:17332"}, "collection": {}},
+                store,
+            )
+            context = Mock()
+            context.pages = []
+            context.new_page.return_value = Mock()
+
+            with (
+                patch(
+                    "jobagent.platforms.boss_collector.sync_playwright",
+                    return_value=self._manager_for(context),
+                ),
+                patch.object(collector, "_scan_favorites_coverage", return_value=1),
+            ):
+                result = collector.scan_coverage(source="favorites")
+
+            self.assertEqual(result.scanned_sources, 1)
+            store.close()
 
 
 if __name__ == "__main__":
