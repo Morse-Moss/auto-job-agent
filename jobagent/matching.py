@@ -1205,6 +1205,9 @@ def build_match_dashboard(connection: sqlite3.Connection) -> dict:
             "empty_message": "尚未生成匹配预览，请先运行 py -3 main.py --match-preview。",
         }
 
+    detail_columns = {row[1] for row in connection.execute("PRAGMA table_info(job_details)")}
+    company_size_expr = "d.company_size" if "company_size" in detail_columns else "''"
+    industry_expr = "d.industry" if "industry" in detail_columns else "''"
     rows = connection.execute(
         f"""
          SELECT match.platform, match.job_id, match.recommendation, match.track,
@@ -1213,6 +1216,7 @@ def build_match_dashboard(connection: sqlite3.Connection) -> dict:
                match.previous_fit_tier, match.previous_relevance_score,
                match.salary_match_json,
                d.title, d.company, d.salary_raw, d.location, d.experience_raw,
+               {company_size_expr} AS company_size, {industry_expr} AS industry,
                decision.interest, decision.decided_at
         FROM job_match_analyses match
         JOIN job_details d

@@ -1674,7 +1674,7 @@ function renderOutreachQueue() {
     button.append(
       top,
       createTextElement("span", "outreach-job-company", job.company || "公司信息缺失"),
-      createTextElement("small", "", `${job.score || 0} 分 · ${job.recommendation === "priority" ? "优先投" : job.recommendation === "challenge" ? "挑战投" : "暂不建议"}${job.salary_raw ? ` · ${job.salary_raw}` : ""}`),
+      createTextElement("small", "", `${job.score || 0} 分 · ${job.recommendation === "priority" ? "优先投" : job.recommendation === "challenge" ? "挑战投" : "暂不建议"}${job.salary_raw ? ` · ${job.salary_raw}` : ""}${job.location ? ` · ${job.location}` : ""}${job.company_size ? ` · ${job.company_size}` : ""}${job.industry ? ` · ${job.industry}` : ""}`),
     );
     button.addEventListener("click", () => selectOutreach(job.job_id, job.platform));
     elements.outreachJobList.append(button);
@@ -1871,7 +1871,7 @@ function renderOutreachDetail(outreach) {
   elements.outreachError.textContent = "";
   document.querySelector("#outreachCompany").textContent = outreach.company || "公司信息缺失";
   document.querySelector("#outreachEditorHeading").textContent = outreach.title || "未命名岗位";
-  document.querySelector("#outreachJobMeta").textContent = `${outreach.score || 0} 分${outreach.salary_raw ? ` · ${outreach.salary_raw}` : ""}`;
+  document.querySelector("#outreachJobMeta").textContent = `${outreach.score || 0} 分${outreach.salary_raw ? ` · ${outreach.salary_raw}` : ""}${outreach.location ? ` · 地点：${outreach.location}` : ""}${outreach.company_size ? ` · 规模：${outreach.company_size}` : ""}${outreach.industry ? ` · 行业：${outreach.industry}` : ""}`;
   document.querySelector("#outreachMatchScore").textContent = String(outreach.score || 0);
   elements.outreachJdText.textContent = outreach.jd_text || "JD 正文缺失";
   document.querySelector("#outreachJdLength").textContent = `${(outreach.jd_text || "").length} 字`;
