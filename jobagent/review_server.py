@@ -399,6 +399,15 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
                 except (ValueError, json.JSONDecodeError) as exc:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
+            if len(parts) == 4 and parts[3] == "note":
+                try:
+                    payload = self._read_json(16_000)
+                    platform = str(query.get("platform", ["boss"])[0])
+                    note = str(payload.get("note") or "")
+                    self._outreach_call(lambda service: {"note": service.store.save_note(platform, parts[2], note)})
+                except (ValueError, json.JSONDecodeError) as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
             if len(parts) == 4 and parts[3] == "authorize":
                 platform = str(query.get("platform", ["boss"])[0])
                 self._send_call(

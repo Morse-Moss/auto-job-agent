@@ -9,17 +9,35 @@ from unittest.mock import patch
 from urllib.request import Request, urlopen
 
 import main as main_module
+from jobagent.review_server import create_server
 from jobagent.matching import (
     analyze_job_match,
+    salary_match,
     build_match_dashboard,
     migrate_matching_schema,
     refresh_stale_matches,
     normalize_text,
     run_match_preview,
 )
-from jobagent.review_server import create_server
 
 
+class SalaryMatchingTests(unittest.TestCase):
+    def test_salary_match_scores_target_around_ten_k(self):
+        result = salary_match("10-15K", {"target_min_k": 10, "target_max_k": 12})
+        self.assertEqual(result["level"], "high")
+        self.assertGreaterEqual(result["score"], 85)
+
+    def test_salary_match_marks_unknown_without_penalizing_as_rejection(self):
+        result = salary_match("", {"target_min_k": 10, "target_max_k": 12})
+        self.assertEqual(result["level"], "unknown")
+        self.assertEqual(result["score"], 50)
+
+    def test_match_analysis_contains_salary_signal(self):
+        result = analyze_job_match(
+            {"title": "AI 应用工程师", "jd_text": "使用 Python 和 Agent 开发。", "salary_raw": "10-15K"},
+            {"profile_id": "p", "version": "v1", "target_tracks": ["ai_application"], "skills": [], "hard_constraints": {}, "preferences": {"salary_target": {"target_min_k": 10, "target_max_k": 12}}},
+        )
+        self.assertEqual(result.salary_match["level"], "high")
 def candidate_profile(version: str = "profile-v1") -> dict:
     return {
         "profile_id": "candidate-chen",

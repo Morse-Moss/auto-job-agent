@@ -1384,3 +1384,5 @@ textarea { min-height: 88px; padding: 9px 10px; resize: vertical; line-height: 1
 .facts-row { margin: 3px 0; color: var(--ink); opacity: 0.92; }
 .facts-row.attention { color: var(--amber); }
 .facts-row.ok { color: var(--green); }
+.match-send-status { margin-left: 6px; font-size: 11px; color: #13846b; }
+.match-send-status.failed, .match-send-status.unknown, .match-send-status.paused { color: #b54708; }

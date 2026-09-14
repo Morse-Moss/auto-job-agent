@@ -7,7 +7,7 @@ import re
 import sqlite3
 import unicodedata
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field as dataclass_field
 from datetime import datetime
 from pathlib import Path
 
@@ -109,6 +109,7 @@ class JobMatchAnalysis:
     gaps: tuple[dict, ...]
     uncertainties: tuple[str, ...]
     preference_signals: tuple[dict, ...] = ()
+    salary_match: dict = dataclass_field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -305,6 +306,29 @@ def _information_state(job: dict, jd: str) -> tuple[str, tuple[str, ...], float]
     return status, tuple(uncertainties), round(confidence, 2)
 
 
+def salary_match(value: object, target: dict | None = None) -> dict:
+    """Compare a monthly JD range with the candidate's target range."""
+    text = normalize_text(value)
+    target = target or {}
+    target_min = float(target.get("target_min_k") or 10)
+    target_max = float(target.get("target_max_k") or target_min)
+    matched = re.search(r"(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*K", text, re.I)
+    if not matched:
+        return {"level": "unknown", "score": 50, "raw": text}
+    minimum, maximum = map(float, matched.groups())
+    if maximum < target_min:
+        level, score = "low", 35
+    elif minimum >= target_min and minimum <= target_max:
+        level, score = "high", 95
+    elif maximum >= target_min and minimum < target_min:
+        level, score = "acceptable", 78
+    elif minimum > target_max:
+        level, score = "stretch", 65
+    else:
+        level, score = "acceptable", 70
+    return {"level": level, "score": score, "raw": text, "minimum_k": minimum, "maximum_k": maximum}
+
+
 def analyze_job_match(job: dict, profile: dict) -> JobMatchAnalysis:
     title = normalize_text(job.get("title"))
     jd = normalize_text(job.get("jd_text") or job.get("jd"))
@@ -485,6 +509,7 @@ def analyze_job_match(job: dict, profile: dict) -> JobMatchAnalysis:
             gap_ids.add(topic["id"])
 
     information_status, uncertainties, confidence = _information_state(job, jd)
+    salary = salary_match(job.get("salary_raw"), (profile.get("preferences") or {}).get("salary_target"))
     if hard_requirements:
         recommendation = "not_fit"
         score = max(10, 38 - len(hard_requirements) * 8 + len(strengths) * 2)
@@ -543,6 +568,8 @@ def analyze_job_match(job: dict, profile: dict) -> JobMatchAnalysis:
                 }
             )
         score = max(0, min(100, score))
+        # Salary is a soft preference: it influences ranking without becoming a hard rejection.
+        score = round(score * 0.85 + salary["score"] * 0.15)
         major_gaps = sum(item.get("severity") == "major" for item in gaps)
         if track in target_tracks and score >= 75 and major_gaps == 0:
             recommendation = "priority"
@@ -568,6 +595,7 @@ def analyze_job_match(job: dict, profile: dict) -> JobMatchAnalysis:
         gaps=tuple(gaps),
         uncertainties=uncertainties,
         preference_signals=tuple(preference_signals),
+        salary_match=salary,
     )
 
 
@@ -601,6 +629,7 @@ def migrate_matching_schema(connection: sqlite3.Connection) -> None:
           uncertainties_json TEXT NOT NULL,
           previous_fit_tier TEXT NOT NULL DEFAULT '',
           previous_relevance_score INTEGER,
+          salary_match_json TEXT NOT NULL DEFAULT '{}',
           PRIMARY KEY(analysis_version, profile_id, profile_version, platform, job_id)
         );
         CREATE INDEX IF NOT EXISTS idx_job_match_latest
@@ -645,6 +674,8 @@ def migrate_matching_schema(connection: sqlite3.Connection) -> None:
         connection.execute(
             "ALTER TABLE job_match_analyses ADD COLUMN jd_content_hash TEXT"
         )
+    if "salary_match_json" not in match_columns:
+        connection.execute("ALTER TABLE job_match_analyses ADD COLUMN salary_match_json TEXT NOT NULL DEFAULT '{}' ")
     current_version = connection.execute("PRAGMA user_version").fetchone()[0]
     if current_version < MATCH_SCHEMA_VERSION:
         connection.execute(f"PRAGMA user_version = {MATCH_SCHEMA_VERSION}")
@@ -765,8 +796,8 @@ def run_match_preview(
                       analyzed_at, jd_content_hash, recommendation, track, score, confidence,
                       information_status, hard_requirements_json, strengths_json,
                       gaps_json, uncertainties_json, preference_signals_json, previous_fit_tier,
-                      previous_relevance_score
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                      previous_relevance_score, salary_match_json
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(
                       analysis_version, profile_id, profile_version, platform, job_id
                     ) DO UPDATE SET
@@ -783,7 +814,8 @@ def run_match_preview(
                       uncertainties_json = excluded.uncertainties_json,
                       preference_signals_json = excluded.preference_signals_json,
                       previous_fit_tier = excluded.previous_fit_tier,
-                      previous_relevance_score = excluded.previous_relevance_score
+                      previous_relevance_score = excluded.previous_relevance_score,
+                      salary_match_json = excluded.salary_match_json
                     """,
                     (
                         version,
@@ -805,6 +837,7 @@ def run_match_preview(
                         json.dumps(result.preference_signals, ensure_ascii=False),
                         str(old["fit_tier"] or "") if old else "",
                         int(old["relevance_score"]) if old else None,
+                        json.dumps(result.salary_match, ensure_ascii=False),
                     ),
                 )
                 distribution[result.recommendation] += 1
@@ -1178,6 +1211,7 @@ def build_match_dashboard(connection: sqlite3.Connection) -> dict:
                 match.score, match.confidence, match.information_status,
                 match.jd_content_hash, d.jd_text,
                match.previous_fit_tier, match.previous_relevance_score,
+               match.salary_match_json,
                d.title, d.company, d.salary_raw, d.location, d.experience_raw,
                decision.interest, decision.decided_at
         FROM job_match_analyses match
@@ -1205,6 +1239,17 @@ def build_match_dashboard(connection: sqlite3.Connection) -> dict:
             snapshot["profile_version"],
         ),
     ).fetchall()
+    send_status_rows = connection.execute(
+        """
+        SELECT platform, job_id, status
+        FROM outreach_send_tasks
+        WHERE status IN ('queued', 'running', 'partial', 'confirmed', 'failed', 'paused', 'unknown')
+        ORDER BY updated_at DESC
+        """
+    ).fetchall() if _table_exists(connection, "outreach_send_tasks") else []
+    send_status = {}
+    for sent in send_status_rows:
+        send_status.setdefault((sent["platform"], sent["job_id"]), sent["status"])
     jobs: list[dict] = []
     counts: Counter[str] = Counter()
     conflicts = 0
@@ -1217,6 +1262,11 @@ def build_match_dashboard(connection: sqlite3.Connection) -> dict:
     )
     for row in rows:
         item = dict(row)
+        item["send_status"] = send_status.get((item["platform"], item["job_id"]))
+        try:
+            item["salary_match"] = json.loads(item.pop("salary_match_json", "{}") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            item["salary_match"] = {}
         item["refresh_priority"], item["refresh_priority_reason"] = _refresh_priority(
             item.get("interest"), item.get("recommendation")
         )
@@ -1339,8 +1389,16 @@ def get_match_detail(
         ("gaps_json", "gaps"),
         ("uncertainties_json", "uncertainties"),
         ("preference_signals_json", "preference_signals"),
+        ("salary_match_json", "salary_match"),
     ):
-        result[target] = _json_list(result.pop(field, "[]"))
+        raw = result.pop(field, "{}" if target == "salary_match" else "[]")
+        if target == "salary_match":
+            try:
+                result[target] = json.loads(raw or "{}")
+            except (TypeError, json.JSONDecodeError):
+                result[target] = {}
+        else:
+            result[target] = _json_list(raw)
     result["changed"] = _recommendation_changed(
         result.get("previous_fit_tier", ""), result["recommendation"]
     )

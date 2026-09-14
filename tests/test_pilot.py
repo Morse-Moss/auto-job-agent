@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from jobagent.pilot import build_pilot_plan
+from jobagent.pilot import build_pilot_plan, action_score
 import main as main_module
 
 
@@ -12,6 +12,29 @@ NOW = "2026-09-02T10:00:00+08:00"
 
 
 class PilotPlanTests(unittest.TestCase):
+    def test_work_policy_changes_action_score_and_excludes_company(self):
+        match = self._match(company="风险初创", salary_match={"score": 40}, company_size="0-20人", jd_text="AI Agent 单休 销售指标")
+        fresh = self._freshness()
+        plan = build_pilot_plan({"jobs": [match]}, {"jobs": [fresh]}, self._resume("2026-09-01T10:00:00+08:00"), now=NOW, excluded_companies={"风险初创"})
+        self.assertEqual(plan["candidates"], [])
+        self.assertIn("company_excluded", plan["job_blocks"][0]["reasons"])
+
+    def test_double_rest_and_ai_startup_are_visible_in_candidate(self):
+        match = self._match(company="AI初创", salary_match={"score": 95}, company_size="0-20人", jd_text="AI Agent 双休")
+        plan = build_pilot_plan({"jobs": [match]}, {"jobs": [self._freshness()]}, self._resume("2026-09-01T10:00:00+08:00"), now=NOW)
+        self.assertEqual(plan["candidates"][0]["policy_tags"], ["double_rest", "ai_startup"])
+    def test_action_score_combines_fit_salary_freshness_and_completeness(self):
+        score = action_score({"score": 80, "salary_match": {"score": 95}, "confidence": 0.9, "information_status": "sufficient"}, {"age_days": 1})
+        self.assertEqual(score, 87)
+
+    def test_candidate_pool_defaults_to_thirty_and_keeps_unreviewed_jobs(self):
+        resume = self._resume("2026-09-01T10:00:00+08:00")
+        matches = [self._match(str(i), interest=None, score=i, recommendation="challenge") for i in range(35)]
+        freshness = [self._freshness(str(i)) for i in range(35)]
+        plan = build_pilot_plan({"jobs": matches}, {"jobs": freshness}, resume, now=NOW)
+        self.assertEqual(plan["limits"]["max_jobs"], 30)
+        self.assertEqual(len(plan["candidates"]), 30)
+        self.assertEqual(plan["action_pool"]["evaluated"], 30)
     def _resume(self, modified_at: str):
         temp_dir = tempfile.TemporaryDirectory()
         path = Path(temp_dir.name) / "resume.md"

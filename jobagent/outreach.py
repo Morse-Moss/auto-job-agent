@@ -10,7 +10,7 @@ import sqlite3
 import subprocess
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from docx import Document
@@ -642,6 +642,8 @@ class OutreachService:
 
     @staticmethod
     def _assert_eligible(job: dict) -> None:
+        if str(job.get("company") or "").strip() in {"云起未来", "云起科技", "比特鹰"}:
+            raise OutreachValidationError("该公司已投递或明确排除，禁止重复发送")
         decision = job.get("decision") or {}
         interest = decision.get("interest") or job.get("interest")
         if interest != "want":
@@ -659,16 +661,13 @@ class OutreachService:
         candidates = []
         for raw in self.candidate_loader() or []:
             job = self._prepare_job(raw)
-            try:
-                self._assert_eligible(job)
-            except OutreachValidationError:
-                continue
             saved = self.store.get(
                 str(job.get("platform") or "boss"),
                 str(job.get("job_id") or ""),
                 jd_hash=_content_hash(job["jd"]),
                 resume_hash=self.resume_hash,
             )
+            excluded = str(job.get("company") or "").strip() in {"云起未来", "云起科技", "比特鹰"}
             candidates.append(
                 {
                     "platform": str(job.get("platform") or "boss"),
@@ -676,10 +675,15 @@ class OutreachService:
                     "title": str(job.get("title") or ""),
                     "company": str(job.get("company") or ""),
                     "score": int(job.get("score") or 0),
+                    "recommendation": str(job.get("recommendation") or "unknown"),
+                    "interest": (job.get("decision") or {}).get("interest") or job.get("interest"),
                     "salary_raw": str(job.get("salary_raw") or ""),
                     "status": saved["status"] if saved else "not_generated",
-                    "ready": bool(saved and saved["ready"]),
+                    "ready": bool(saved and saved["ready"]) and not excluded,
+                    "send_blocked": excluded,
+                    "send_block_reason": "已投递或明确排除" if excluded else "",
                     "stale": bool(saved and saved["stale"]),
+                    "note": self.store.get_note(str(job.get("platform") or "boss"), str(job.get("job_id") or "")),
                 }
             )
         return candidates
@@ -693,7 +697,10 @@ class OutreachService:
         return prepared
 
     def get(self, platform: str, job_id: str) -> dict:
-        job = self._load_eligible_job(platform, job_id)
+        job = self.job_loader(platform, job_id)
+        if not job:
+            raise OutreachValidationError("岗位不存在或不在当前匹配结果中")
+        job = self._prepare_job(job)
         saved = self.store.get(
             platform, job_id,
             jd_hash=_content_hash(job["jd"]),
@@ -717,6 +724,7 @@ class OutreachService:
             # 所有岗位共用同一份母版简历；"定制"只是按 JD 重排既有内容，不换简历。
             "resume_source": self.resume_path.name,
             "resume_tailoring": "reorder_only",
+            "note": self.store.get_note(str(job.get("platform") or "boss"), str(job.get("job_id") or "")),
         }
         if self.assets:
             suggested = self._suggest_asset_id(job)
@@ -957,7 +965,18 @@ class OutreachStore:
             self.conn.execute(
                 "ALTER TABLE job_outreach ADD COLUMN resume_asset_id TEXT NOT NULL DEFAULT ''"
             )
+        self.conn.execute("CREATE TABLE IF NOT EXISTS job_outreach_notes (platform TEXT NOT NULL, job_id TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, PRIMARY KEY(platform, job_id))")
         self.conn.commit()
+
+    def get_note(self, platform: str, job_id: str) -> str:
+        row = self.conn.execute("SELECT note FROM job_outreach_notes WHERE platform=? AND job_id=?", (platform, job_id)).fetchone()
+        return str(row[0]) if row else ""
+
+    def save_note(self, platform: str, job_id: str, note: str) -> str:
+        value = note.strip()
+        self.conn.execute("INSERT INTO job_outreach_notes(platform, job_id, note, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(platform, job_id) DO UPDATE SET note=excluded.note, updated_at=excluded.updated_at", (platform, job_id, value, datetime.now(timezone.utc).isoformat()))
+        self.conn.commit()
+        return value
 
     @staticmethod
     def _serialize(

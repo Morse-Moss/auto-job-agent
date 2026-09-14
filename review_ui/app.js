@@ -24,6 +24,7 @@ const state = {
   freshnessFilter: "detail_due",
   jobUpdate: null,
   outreach: null,
+  outreachFilter: "all",
   selectedOutreachId: null,
   selectedOutreachPlatform: null,
   outreachDetail: null,
@@ -819,6 +820,10 @@ function renderMatchQueue() {
       createTextElement("span", `match-label ${job.recommendation}`, labels.recommendations[job.recommendation]),
       createTextElement("strong", "match-list-score", String(job.score)),
     );
+    if (job.send_status) {
+      const sendLabels = { confirmed: "已投递", queued: "待发送", running: "发送中", partial: "部分完成", failed: "发送失败", paused: "已暂停", unknown: "结果未知" };
+      top.append(createTextElement("span", `match-send-status ${job.send_status}`, sendLabels[job.send_status] || job.send_status));
+    }
     const title = createTextElement("span", "match-job-title", job.title || "未命名岗位");
     const company = createTextElement("span", "match-job-company", job.company || "公司信息缺失");
     const meta = document.createElement("span");
@@ -1644,11 +1649,17 @@ function outreachApi(jobId, suffix = "", platform = state.selectedOutreachPlatfo
 }
 
 function renderOutreachQueue() {
-  const jobs = state.outreach?.jobs || [];
+  const allJobs = state.outreach?.jobs || [];
+  const jobs = allJobs.filter((job) => {
+    if (state.outreachFilter === "sent") return Boolean(job.send_status) || Boolean(job.send_blocked);
+    return state.outreachFilter === "all" || job.recommendation === state.outreachFilter;
+  });
   document.querySelector("#outreachCount").textContent = String(jobs.length);
-  document.querySelector("#outreachSummary").textContent = jobs.length
-    ? `${jobs.length} 个岗位可以准备，${jobs.filter((job) => job.ready).length} 个已确认`
-    : "当前没有同时满足“想投、优先投、JD 有效”的岗位";
+  const priority = jobs.filter((job) => job.recommendation === "priority").length;
+  const challenge = jobs.filter((job) => job.recommendation === "challenge").length;
+  document.querySelector("#outreachSummary").textContent = allJobs.length
+    ? `共 ${allJobs.length} 个岗位 · 优先投 ${allJobs.filter((job) => job.recommendation === "priority").length} · 挑战投 ${allJobs.filter((job) => job.recommendation === "challenge").length} · 已投递 ${allJobs.filter((job) => job.send_status || job.send_blocked).length}`
+    : "当前没有有效匹配岗位";
   elements.outreachJobList.replaceChildren();
   jobs.forEach((job) => {
     const button = document.createElement("button");
@@ -1663,7 +1674,7 @@ function renderOutreachQueue() {
     button.append(
       top,
       createTextElement("span", "outreach-job-company", job.company || "公司信息缺失"),
-      createTextElement("small", "", `${job.score || 0} 分${job.salary_raw ? ` · ${job.salary_raw}` : ""}`),
+      createTextElement("small", "", `${job.score || 0} 分 · ${job.recommendation === "priority" ? "优先投" : job.recommendation === "challenge" ? "挑战投" : "暂不建议"}${job.salary_raw ? ` · ${job.salary_raw}` : ""}`),
     );
     button.addEventListener("click", () => selectOutreach(job.job_id, job.platform));
     elements.outreachJobList.append(button);
@@ -1672,6 +1683,12 @@ function renderOutreachQueue() {
     elements.outreachJobList.append(createTextElement("p", "list-empty", "先在岗位审阅中标记“想投”，并完成匹配与 JD 更新。"));
   }
 }
+
+document.querySelectorAll("[data-outreach-filter]").forEach((button) => button.addEventListener("click", () => {
+  state.outreachFilter = button.dataset.outreachFilter || "all";
+  document.querySelectorAll("[data-outreach-filter]").forEach((item) => item.classList.toggle("active", item === button));
+  renderOutreachQueue();
+}));
 
 function applyOutreachControls(outreach) {
   const generated = Boolean(outreach.content_version);
@@ -1840,6 +1857,13 @@ async function renderFactsCheck(outreach) {
 
 function renderOutreachDetail(outreach) {
   state.outreachDetail = outreach;
+  const note = document.querySelector("#outreachNote");
+  if (note) note.value = outreach.note || "";
+  const saveNote = document.querySelector("#saveOutreachNote");
+  if (saveNote) saveNote.onclick = async () => {
+    await fetch(outreachApi(outreach.job_id, "/note", outreach.platform), {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({note: note.value})});
+    saveNote.textContent = "已保存";
+  };
   state.greetingDirty = false;
   state.resumeDirty = false;
   elements.outreachEmpty.hidden = true;
@@ -2023,7 +2047,10 @@ async function loadOutreachDashboard(force = false) {
   renderOutreachQueue();
   const jobs = state.outreach.jobs || [];
   if (jobs.length && !state.selectedOutreachId) {
-    await selectOutreach(jobs[0].job_id, jobs[0].platform);
+    const first = jobs.find((job) => job.recommendation === "priority" && !job.send_blocked)
+      || jobs.find((job) => job.recommendation === "challenge" && !job.send_blocked)
+      || jobs[0];
+    await selectOutreach(first.job_id, first.platform);
   }
 }
 

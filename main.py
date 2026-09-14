@@ -120,8 +120,8 @@ def main() -> None:
     parser.add_argument(
         "--pilot-max",
         type=int,
-        default=3,
-        help="试点计划最多保留的岗位数，默认 3",
+        default=30,
+        help="候选池最多保留的岗位数，默认 30",
     )
     parser.add_argument(
         "--analysis-output",
@@ -175,11 +175,30 @@ def main() -> None:
         collection_store = CollectionStore(db_path)
         review_store = ReviewStore(db_path)
         try:
+            match_dashboard = review_store.match_dashboard()
+            execute = getattr(collection_store.conn, "execute", None)
+            company_rows = (
+                execute("SELECT platform, job_id, company_size FROM job_details").fetchall()
+                if callable(execute)
+                else []
+            )
+            company_sizes = {(str(row[0]), str(row[1])): str(row[2] or "") for row in company_rows}
+            for job in match_dashboard.get("jobs", []):
+                job["company_size"] = company_sizes.get(
+                    (str(job.get("platform") or "boss"), str(job.get("job_id") or "")), ""
+                )
+            sent_rows = (
+                execute("SELECT DISTINCT job_id FROM outreach_send_tasks WHERE status IN ('confirmed', 'partial')").fetchall()
+                if callable(execute)
+                else []
+            )
             plan = build_pilot_plan(
-                review_store.match_dashboard(),
+                match_dashboard,
                 build_freshness_dashboard(collection_store.conn),
                 resume_path,
                 max_jobs=args.pilot_max,
+                excluded_companies={"比特鹰", "云起未来"},
+                sent_job_ids={str(row[0]) for row in sent_rows},
             )
         finally:
             collection_store.close()

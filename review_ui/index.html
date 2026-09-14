@@ -623,6 +623,13 @@
             <div><p class="section-label">行动队列</p><h3>优先投岗位</h3></div>
             <span id="outreachCount">0</span>
           </div>
+          <div class="outreach-filters" role="tablist" aria-label="岗位分组">
+            <button type="button" class="active" data-outreach-filter="all">全部</button>
+            <button type="button" data-outreach-filter="priority">优先投</button>
+            <button type="button" data-outreach-filter="challenge">挑战投</button>
+            <button type="button" data-outreach-filter="not_fit">暂不建议</button>
+            <button type="button" data-outreach-filter="sent">已投递</button>
+          </div>
           <div class="outreach-job-list" id="outreachJobList">
             <p class="loading">正在读取...</p>
           </div>
@@ -639,6 +646,8 @@
                 <p class="section-label" id="outreachCompany"></p>
                 <h2 id="outreachEditorHeading"></h2>
                 <p id="outreachJobMeta"></p>
+                <textarea id="outreachNote" rows="3" placeholder="记录岗位备注"></textarea>
+                <button type="button" class="text-action" id="saveOutreachNote">保存备注</button>
               </div>
               <span class="outreach-status" id="outreachStatus"></span>
             </header>
