@@ -528,7 +528,16 @@ class OutreachApiTests(unittest.TestCase):
         self.assertIn("setCollapsibleGroup", script)
         self.assertIn("data-collapse-default", script)
 
-    def test_generate_rejects_job_without_explicit_want_decision(self):
+    def test_generate_does_not_block_on_want_decision_or_challenge_group(self):
+        """准备投递包不因未标记想投、或匹配分组为挑战投而被阻止（2026-09-14）。"""
+
+        class ReachedAi(RuntimeError):
+            pass
+
+        class FakeAi:
+            def greeting(self, *args, **kwargs):
+                raise ReachedAi("已通过资格校验，进入内容生成")
+
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             resume = root / "resume.md"
@@ -537,15 +546,36 @@ class OutreachApiTests(unittest.TestCase):
                 root / "jobs.db",
                 resume_path=resume,
                 job_loader=lambda platform, job_id: self._job(
-                    decision={"interest": "maybe"}
+                    decision={"interest": "maybe"},
+                    recommendation="challenge",
                 ),
+                candidate_loader=lambda: [],
+                ai=FakeAi(),
+                knowledge=None,
+                renderer=object(),
+            )
+            try:
+                with self.assertRaises(ReachedAi):
+                    service.generate("boss", "job-1")
+            finally:
+                service.close()
+
+    def test_generate_rejects_job_without_jd_text(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            resume = root / "resume.md"
+            resume.write_text("# Resume", encoding="utf-8")
+            service = OutreachService(
+                root / "jobs.db",
+                resume_path=resume,
+                job_loader=lambda platform, job_id: self._job(jd_text=""),
                 candidate_loader=lambda: [],
                 ai=object(),
                 knowledge=object(),
                 renderer=object(),
             )
             try:
-                with self.assertRaisesRegex(OutreachValidationError, "想投"):
+                with self.assertRaisesRegex(OutreachValidationError, "JD"):
                     service.generate("boss", "job-1")
             finally:
                 service.close()

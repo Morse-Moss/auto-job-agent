@@ -1,7 +1,10 @@
 const state = {
   jobs: [],
   stats: { total: 0, reviewed: 0 },
-  filter: "all",
+  reviewGroup: "all",
+  reviewSend: "all",
+  reviewInterest: "all",
+  reviewQuery: "",
   selectedId: null,
   selectedPlatform: null,
   selectedSampleName: "positioning-v1",
@@ -35,6 +38,8 @@ const state = {
   sendBusy: false,
   sendRequest: 0,
   sendPrecheck: null,
+  browserStarting: false,
+  browserStartMessage: null,
   pendingAssetId: null,
   progressRequest: 0,
 };
@@ -222,6 +227,7 @@ const elements = {
   outreachSendStatus: document.querySelector("#outreachSendStatus"),
   outreachSendActions: document.querySelector("#outreachSendActions"),
   outreachSendPrecheck: document.querySelector("#outreachSendPrecheck"),
+  startBrowserService: document.querySelector("#startBrowserService"),
   outreachProgressSection: document.querySelector("#outreachProgressSection"),
   outreachProgressTimeline: document.querySelector("#outreachProgressTimeline"),
   outreachProgressCount: document.querySelector("#outreachProgressCount"),
@@ -239,9 +245,23 @@ async function fetchJson(url, options) {
 }
 
 function filteredJobs() {
-  if (state.filter === "all") return state.jobs;
-  if (state.filter === "unreviewed") return state.jobs.filter((job) => !job.reviewed);
-  return state.jobs.filter((job) => job.interest === state.filter);
+  const query = state.reviewQuery.trim().toLowerCase();
+  return state.jobs.filter((job) => {
+    if (state.reviewGroup !== "all" && (job.fit_tier || "") !== state.reviewGroup) return false;
+    if (state.reviewSend !== "all" && (job.send_state || "none") !== state.reviewSend) return false;
+    if (state.reviewInterest !== "all") {
+      if (state.reviewInterest === "unreviewed") {
+        if (job.reviewed) return false;
+      } else if ((job.interest || "") !== state.reviewInterest) {
+        return false;
+      }
+    }
+    if (query) {
+      const haystack = `${job.title || ""} ${job.company || ""}`.toLowerCase();
+      if (!haystack.includes(query)) return false;
+    }
+    return true;
+  });
 }
 
 function renderProgress() {
@@ -1648,17 +1668,32 @@ function outreachApi(jobId, suffix = "", platform = state.selectedOutreachPlatfo
   return `/api/outreach/${encodeURIComponent(jobId)}${suffix}?${query}`;
 }
 
+async function refreshOutreachDetail(jobId, platform) {
+  const payload = await fetchJson(outreachApi(jobId, "", platform));
+  if (state.selectedOutreachId === jobId && state.selectedOutreachPlatform === platform) {
+    renderOutreachDetail(payload.outreach);
+  }
+  return payload.outreach;
+}
+
 function renderOutreachQueue() {
   const allJobs = state.outreach?.jobs || [];
   const jobs = allJobs.filter((job) => {
-    if (state.outreachFilter === "sent") return Boolean(job.send_status) || Boolean(job.send_blocked);
+    // 「已投递」只指真实送达；部分送达/结果未知不能被算成已投递。
+    if (state.outreachFilter === "sent") return job.send_state === "sent";
     return state.outreachFilter === "all" || job.recommendation === state.outreachFilter;
   });
   document.querySelector("#outreachCount").textContent = String(jobs.length);
-  const priority = jobs.filter((job) => job.recommendation === "priority").length;
-  const challenge = jobs.filter((job) => job.recommendation === "challenge").length;
+  const priority = allJobs.filter((job) => job.recommendation === "priority").length;
+  const challenge = allJobs.filter((job) => job.recommendation === "challenge").length;
+  const sent = allJobs.filter((job) => job.send_state === "sent").length;
+  const needsReview = allJobs.filter(
+    (job) => ["partial", "unknown", "paused"].includes(job.send_state),
+  ).length;
   document.querySelector("#outreachSummary").textContent = allJobs.length
-    ? `共 ${allJobs.length} 个岗位 · 优先投 ${allJobs.filter((job) => job.recommendation === "priority").length} · 挑战投 ${allJobs.filter((job) => job.recommendation === "challenge").length} · 已投递 ${allJobs.filter((job) => job.send_status || job.send_blocked).length}`
+    ? `共 ${allJobs.length} 个岗位 · 优先投 ${priority} · 挑战投 ${challenge}`
+      + ` · 已投递 ${sent}`
+      + (needsReview ? ` · 待人工核对 ${needsReview}` : "")
     : "当前没有有效匹配岗位";
   elements.outreachJobList.replaceChildren();
   jobs.forEach((job) => {
@@ -1692,14 +1727,22 @@ document.querySelectorAll("[data-outreach-filter]").forEach((button) => button.a
 
 function applyOutreachControls(outreach) {
   const generated = Boolean(outreach.content_version);
-  elements.generateOutreach.disabled = false;
-  elements.generateOutreach.textContent = generated ? "重新生成投递包" : "生成投递包";
+  // 资格由后端集中返回（outreach.capabilities），前端不再自行复制规则。
+  const capabilities = outreach.capabilities || {};
+  const prepare = capabilities.prepare || { allowed: false, reason: "" };
+  elements.generateOutreach.disabled = !prepare.allowed;
+  elements.generateOutreach.textContent = !prepare.allowed
+    ? "暂不能准备"
+    : (generated ? "重新生成投递包" : "生成投递包");
   elements.greetingEditor.disabled = !generated;
   elements.resumeEditor.disabled = !generated;
   elements.saveGreeting.disabled = !generated;
   elements.saveResume.disabled = !generated;
   elements.confirmGreeting.disabled = !generated || outreach.stale || outreach.greeting_confirmed || state.greetingDirty;
   elements.confirmResume.disabled = !generated || outreach.stale || outreach.resume_confirmed || state.resumeDirty;
+  if (!prepare.allowed && !generated) {
+    elements.outreachError.textContent = prepare.reason || "该岗位当前不能准备投递包。";
+  }
   elements.confirmGreeting.textContent = state.greetingDirty
     ? "请先保存修改"
     : (outreach.greeting_confirmed ? "招呼语已确认" : "确认招呼语");
@@ -1857,12 +1900,67 @@ async function renderFactsCheck(outreach) {
 
 function renderOutreachDetail(outreach) {
   state.outreachDetail = outreach;
+  const interestButtons = document.querySelectorAll("[data-outreach-interest]");
+  const paintInterest = (value) => {
+    interestButtons.forEach((item) => item.classList.toggle("active", item.dataset.outreachInterest === value));
+  };
+  paintInterest(outreach.interest);
+  interestButtons.forEach((button) => {
+    button.onclick = async () => {
+      if (button.disabled) return;
+      const wanted = button.dataset.outreachInterest;
+      const before = outreach.interest;
+      interestButtons.forEach((item) => { item.disabled = true; });
+      paintInterest(wanted);
+      elements.outreachError.textContent = "";
+      try {
+        // 只提交意向字段：不动备注、拒绝原因与学习标记（后端部分更新）。
+        const payload = await fetchJson(
+          jobApiUrl(outreach.job_id, DEFAULT_SAMPLE_NAME, "", outreach.platform),
+          {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ interest: wanted }),
+          },
+        );
+        const saved = payload.decision?.interest || wanted;
+        const current = (state.outreach?.jobs || []).find(
+          (item) => item.job_id === outreach.job_id && item.platform === outreach.platform,
+        );
+        if (current) current.interest = saved;
+        await refreshOutreachDetail(outreach.job_id, outreach.platform);
+        elements.outreachError.textContent = `已保存：${saved === "want" ? "想投" : saved === "reject" ? "不想投" : "再看"}`;
+      } catch (error) {
+        paintInterest(before);
+        elements.outreachError.textContent = `意向保存失败：${error.message}`;
+      } finally {
+        interestButtons.forEach((item) => { item.disabled = false; });
+      }
+    };
+  });
   const note = document.querySelector("#outreachNote");
   if (note) note.value = outreach.note || "";
   const saveNote = document.querySelector("#saveOutreachNote");
   if (saveNote) saveNote.onclick = async () => {
-    await fetch(outreachApi(outreach.job_id, "/note", outreach.platform), {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({note: note.value})});
-    saveNote.textContent = "已保存";
+    saveNote.disabled = true;
+    elements.outreachError.textContent = "";
+    try {
+      // 保存备注必须检查 HTTP 结果，失败不能显示“已保存”。
+      await fetchJson(
+        outreachApi(outreach.job_id, "/note", outreach.platform),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ note: note.value }),
+        },
+      );
+      saveNote.textContent = "已保存";
+    } catch (error) {
+      saveNote.textContent = "保存失败";
+      elements.outreachError.textContent = `备注保存失败：${error.message}`;
+    } finally {
+      saveNote.disabled = false;
+    }
   };
   state.greetingDirty = false;
   state.resumeDirty = false;
@@ -1872,6 +1970,13 @@ function renderOutreachDetail(outreach) {
   document.querySelector("#outreachCompany").textContent = outreach.company || "公司信息缺失";
   document.querySelector("#outreachEditorHeading").textContent = outreach.title || "未命名岗位";
   document.querySelector("#outreachJobMeta").textContent = `${outreach.score || 0} 分${outreach.salary_raw ? ` · ${outreach.salary_raw}` : ""}${outreach.location ? ` · 地点：${outreach.location}` : ""}${outreach.company_size ? ` · 规模：${outreach.company_size}` : ""}${outreach.industry ? ` · 行业：${outreach.industry}` : ""}`;
+  const sourceEl = document.querySelector("#outreachSource");
+  if (sourceEl) {
+    sourceEl.textContent = outreach.content_source_label
+      ? `内容来源：${outreach.content_source_label}`
+      : "内容来源：尚未生成";
+    sourceEl.dataset.source = outreach.content_source || "";
+  }
   document.querySelector("#outreachMatchScore").textContent = String(outreach.score || 0);
   elements.outreachJdText.textContent = outreach.jd_text || "JD 正文缺失";
   document.querySelector("#outreachJdLength").textContent = `${(outreach.jd_text || "").length} 字`;
@@ -2174,10 +2279,40 @@ function renderSendPrecheck() {
   if (!precheck) {
     elements.outreachSendPrecheck.textContent = "正在预检浏览器与登录态…";
     elements.outreachSendPrecheck.className = "send-precheck";
+    elements.startBrowserService.hidden = true;
     return;
   }
   elements.outreachSendPrecheck.textContent = precheck.detail || (precheck.ok ? "浏览器与登录态正常" : "浏览器未就绪");
   elements.outreachSendPrecheck.className = `send-precheck ${precheck.ok ? "ok" : "warn"}`;
+  // 只有“浏览器服务本身不可达”才提供一键启动；登录态问题必须本人去登录，不能代劳。
+  const canStart = !precheck.cdp && !state.browserStarting;
+  elements.startBrowserService.hidden = !canStart;
+  elements.startBrowserService.disabled = state.browserStarting;
+  elements.startBrowserService.textContent = state.browserStarting
+    ? "正在启动浏览器服务…"
+    : "一键启动浏览器服务";
+}
+
+async function startBrowserService() {
+  if (state.browserStarting) return;
+  state.browserStarting = true;
+  renderSendPrecheck();
+  try {
+    const payload = await fetchJson("/api/browser/start", { method: "POST" });
+    const browser = payload.browser || {};
+    // 启动结果只是一条提示；真正的判定仍以预检为准（启动成功不等于登录态有效）。
+    state.browserStartMessage = browser.detail || "已发起启动";
+  } catch (error) {
+    state.browserStartMessage = `启动失败：${error.message}`;
+  } finally {
+    state.browserStarting = false;
+  }
+  await loadSendPrecheck();
+  if (state.browserStartMessage && state.sendPrecheck && !state.sendPrecheck.ok) {
+    // 启动后仍未就绪时，把启动结果补在预检文案后面，便于判断卡在哪一步。
+    elements.outreachSendPrecheck.textContent =
+      `${elements.outreachSendPrecheck.textContent}（${state.browserStartMessage}）`;
+  }
 }
 
 async function loadProgress(jobId, platform) {
@@ -2187,7 +2322,7 @@ async function loadProgress(jobId, platform) {
   try {
     const payload = await fetchJson(outreachApi(jobId, "/progress", platform));
     if (request !== state.progressRequest) return;
-    renderProgress(jobId, platform, payload.progress || {});
+    renderOutreachProgress(jobId, platform, payload.progress || {});
   } catch (error) {
     if (request !== state.progressRequest) return;
     const item = document.createElement("li");
@@ -2197,7 +2332,7 @@ async function loadProgress(jobId, platform) {
   }
 }
 
-function renderProgress(jobId, platform, data) {
+function renderOutreachProgress(jobId, platform, data) {
   const events = data.events || [];
   elements.outreachProgressCount.textContent = events.length
     ? `${data.pending_count ? `${data.pending_count} 条待确认 · ` : ""}共 ${data.total} 条`
@@ -2485,13 +2620,23 @@ function renderQueue() {
     const meta = document.createElement("span");
     meta.className = "job-item-meta";
     const salary = document.createElement("span");
-    salary.textContent = job.salary_raw || "薪资未知";
+    salary.textContent = job.salary_raw || "薪资未获取";
+    const location = document.createElement("span");
+    location.textContent = job.location || "地点未获取";
+    const size = document.createElement("span");
+    size.textContent = job.company_size || "规模未获取";
+    const industry = document.createElement("span");
+    industry.textContent = job.industry || "行业未获取";
+    const score = document.createElement("span");
+    score.textContent = job.relevance_score === null || job.relevance_score === undefined
+      ? "评分未获取"
+      : `${job.relevance_score} 分`;
     const track = document.createElement("span");
     track.textContent = labels.tracks[job.track] || job.track || "其他";
     const tier = document.createElement("span");
     tier.className = `queue-tier ${job.fit_tier || ""}`;
     tier.textContent = labels.tiers[job.fit_tier] || "待判断";
-    meta.append(salary, track, tier);
+    meta.append(salary, location, size, industry, score, track, tier);
     button.append(top, title, company, meta);
     button.addEventListener("click", () => selectJob(
       job.job_id,
@@ -2507,7 +2652,7 @@ function addMeta(label, value) {
   const term = document.createElement("dt");
   const description = document.createElement("dd");
   term.textContent = label;
-  description.textContent = value || "未提供";
+  description.textContent = value || "未获取";
   wrapper.append(term, description);
   document.querySelector("#jobMeta").append(wrapper);
 }
@@ -2594,6 +2739,12 @@ function renderDetail(job) {
   addMeta("学历", job.education_raw);
   addMeta("招聘者", [job.recruiter_name, job.recruiter_role].filter(Boolean).join(" · "));
   addMeta("技能", (job.skills || []).join("、"));
+  addMeta(
+    "评分",
+    job.relevance_score === null || job.relevance_score === undefined
+      ? ""
+      : `${job.relevance_score} 分`,
+  );
 
   renderCompanyProfile(job);
   renderSystemAnalysis(job);
@@ -2625,10 +2776,12 @@ async function selectJob(jobId, sampleName = DEFAULT_SAMPLE_NAME, platform = "")
     if (requestId !== state.detailRequest) return;
     state.selectedPlatform = payload.job.platform || platform || null;
     renderDetail(payload.job);
+    if (narrowLayout()) switchReviewPane("detail");
   } catch (error) {
     if (requestId !== state.detailRequest) return;
     elements.detailEmpty.querySelector("strong").textContent = "这条岗位读取失败";
     elements.detailEmpty.querySelector("span").textContent = error.message;
+    if (narrowLayout()) switchReviewPane("detail");
   }
 }
 
@@ -2731,13 +2884,127 @@ function updateSaveAction() {
   elements.saveButton.textContent = rejected ? "放弃并看下一条" : "保存并看下一条";
 }
 
-document.querySelector("#filters").addEventListener("click", (event) => {
-  const button = event.target.closest("button[data-filter]");
-  if (!button) return;
-  state.filter = button.dataset.filter;
-  document.querySelectorAll("#filters button").forEach((item) => item.classList.toggle("active", item === button));
+function bindReviewFilter(containerId, attribute, stateKey) {
+  const container = document.querySelector(containerId);
+  if (!container) return;
+  container.addEventListener("click", (event) => {
+    const button = event.target.closest(`button[${attribute}]`);
+    if (!button) return;
+    state[stateKey] = button.getAttribute(attribute);
+    container.querySelectorAll("button").forEach((item) => {
+      item.classList.toggle("active", item === button);
+    });
+    renderQueue();
+  });
+}
+bindReviewFilter("#groupFilters", "data-group-filter", "reviewGroup");
+bindReviewFilter("#sendFilters", "data-send-filter", "reviewSend");
+bindReviewFilter("#interestFilters", "data-interest-filter", "reviewInterest");
+document.querySelector("#jobSearch")?.addEventListener("input", (event) => {
+  state.reviewQuery = event.target.value || "";
   renderQueue();
 });
+
+/* ===== 2026-09-14 审阅区栏宽调整 + 窄屏内容标签页 ===== */
+const REVIEW_PANE_MIN = { queue: 220, decision: 260 };
+const REVIEW_PANE_MAX = { queue: 520, decision: 620 };
+const REVIEW_PANE_VAR = { queue: "--queue-width", decision: "--decision-width" };
+const REVIEW_PANE_SELECTOR = { queue: ".queue-pane", decision: ".decision-pane" };
+const REVIEW_NARROW = "(max-width: 1180px)";
+
+function narrowLayout() {
+  return window.matchMedia(REVIEW_NARROW).matches;
+}
+
+function switchReviewPane(pane) {
+  const workspace = document.querySelector("#reviewView");
+  const tabs = document.querySelector("#reviewPaneTabs");
+  if (!workspace || !tabs) return;
+  workspace.dataset.activePane = pane;
+  tabs.querySelectorAll("button[data-review-pane]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.reviewPane === pane);
+  });
+}
+
+function applyStoredPaneWidths() {
+  const workspace = document.querySelector("#reviewView");
+  if (!workspace) return;
+  ["queue", "decision"].forEach((pane) => {
+    const value = Number(window.localStorage.getItem(`reviewPaneWidth:${pane}`));
+    if (Number.isFinite(value) && value > 0) {
+      workspace.style.setProperty(REVIEW_PANE_VAR[pane], `${value}px`);
+    }
+  });
+}
+
+function setPaneWidth(pane, width) {
+  const workspace = document.querySelector("#reviewView");
+  const clamped = Math.min(
+    REVIEW_PANE_MAX[pane],
+    Math.max(REVIEW_PANE_MIN[pane], Math.round(width)),
+  );
+  workspace.style.setProperty(REVIEW_PANE_VAR[pane], `${clamped}px`);
+  window.localStorage.setItem(`reviewPaneWidth:${pane}`, String(clamped));
+}
+
+function bindPaneResizer(handle) {
+  const pane = handle.dataset.resizePane;
+  let startX = 0;
+  let startWidth = 0;
+
+  const onMove = (event) => {
+    // 队列在左（右移变宽），决定区在右（左移变宽）
+    const delta = pane === "queue" ? event.clientX - startX : startX - event.clientX;
+    setPaneWidth(pane, startWidth + delta);
+  };
+  const onUp = () => {
+    handle.classList.remove("dragging");
+    document.body.classList.remove("resizing");
+    document.removeEventListener("pointermove", onMove);
+    document.removeEventListener("pointerup", onUp);
+  };
+
+  handle.addEventListener("pointerdown", (event) => {
+    if (narrowLayout()) return;
+    startX = event.clientX;
+    startWidth = document.querySelector(REVIEW_PANE_SELECTOR[pane]).getBoundingClientRect().width;
+    handle.classList.add("dragging");
+    document.body.classList.add("resizing");
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
+    event.preventDefault();
+  });
+
+  handle.addEventListener("keydown", (event) => {
+    if (narrowLayout()) return;
+    const step = event.shiftKey ? 40 : 12;
+    let delta = 0;
+    if (event.key === "ArrowLeft") delta = pane === "queue" ? -step : step;
+    else if (event.key === "ArrowRight") delta = pane === "queue" ? step : -step;
+    else return;
+    event.preventDefault();
+    const current = document.querySelector(REVIEW_PANE_SELECTOR[pane]).getBoundingClientRect().width;
+    setPaneWidth(pane, current + delta);
+  });
+}
+
+function initReviewPaneLayout() {
+  const workspace = document.querySelector("#reviewView");
+  const tabs = document.querySelector("#reviewPaneTabs");
+  if (!workspace || !tabs) return;
+  workspace.dataset.activePane = "queue";
+  tabs.addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-review-pane]");
+    if (button) switchReviewPane(button.dataset.reviewPane);
+  });
+  document.querySelectorAll("[data-resize-pane]").forEach(bindPaneResizer);
+  applyStoredPaneWidths();
+  window.matchMedia(REVIEW_NARROW).addEventListener("change", (event) => {
+    if (!event.matches) workspace.removeAttribute("data-active-pane");
+    else if (!workspace.dataset.activePane) workspace.dataset.activePane = "queue";
+  });
+}
+initReviewPaneLayout();
 
 document.querySelector(".view-tabs").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-view-target]");
@@ -2826,6 +3093,8 @@ elements.confirmGreeting.addEventListener("click", () => confirmOutreachPart("gr
 elements.confirmResume.addEventListener("click", () => confirmOutreachPart("resume"));
 elements.authorizeSend.addEventListener("click", authorizeSendAction);
 elements.executeSend.addEventListener("click", executeSendAction);
+// 一键启动浏览器服务：只修“服务不可达”，不代替登录，也不触发发送。
+elements.startBrowserService?.addEventListener("click", startBrowserService);
 elements.outreachProgressForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const jobId = state.selectedOutreachId;

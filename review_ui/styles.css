@@ -196,7 +196,10 @@ h3 { font-size: 15px; line-height: 1.4; }
 }
 .outreach-pane-heading { padding: 18px; border-bottom: 1px solid var(--line); }
 .outreach-pane-heading > span, .outreach-section-heading > span { color: var(--muted); font-size: 11px; }
-.outreach-job-list { max-height: calc(100vh - 260px); overflow-y: auto; }
+.outreach-job-list { max-height: calc(100vh - 260px); overflow: auto; }
+.outreach-job-list button { font-size: 14px; }
+.outreach-filters { display: flex; gap: 6px; overflow-x: auto; padding: 8px 0; white-space: nowrap; }
+.outreach-filters button { flex: 0 0 auto; font-size: 14px; }
 .outreach-job {
   width: 100%; padding: 14px 16px; display: grid; gap: 5px; text-align: left;
   border: 0; border-bottom: 1px solid var(--line); background: transparent; color: var(--ink);
@@ -216,6 +219,9 @@ h3 { font-size: 15px; line-height: 1.4; }
 .outreach-empty strong { color: var(--ink); font-size: 17px; }
 .outreach-job-header { padding-bottom: 16px; border-bottom: 2px solid var(--ink); }
 .outreach-job-header h2 { margin: 4px 0; font-size: 23px; }
+.outreach-interest-actions { display: flex; gap: 8px; margin-top: 10px; }
+.outreach-interest-actions button { padding: 7px 14px; border: 1px solid var(--line); background: var(--surface); color: var(--ink); cursor: pointer; }
+.outreach-interest-actions button.active { background: var(--green); color: #fff; border-color: var(--green); }
 .outreach-job-header p { color: var(--muted); }
 .outreach-generate-row { align-items: center; padding: 16px 0; }
 .outreach-generate-row p { color: var(--muted); font-size: 12px; }
@@ -235,6 +241,7 @@ h3 { font-size: 15px; line-height: 1.4; }
   grid-template-columns: minmax(300px, 1.05fr) minmax(300px, 1fr) minmax(330px, .95fr);
   border: 1px solid var(--line);
   background: var(--surface);
+  overflow-x: auto;
 }
 .outreach-panel { padding: 18px; overflow: auto; }
 .outreach-panel + .outreach-panel { border-left: 1px solid var(--line); }
@@ -353,6 +360,12 @@ h3 { font-size: 15px; line-height: 1.4; }
 .send-precheck { margin: 8px 0 0; font-size: 12px; color: var(--muted); }
 .send-precheck.ok { color: var(--green); }
 .send-precheck.warn { color: var(--coral); }
+/* 预检行 + 一键启动浏览器服务（2026-09-14） */
+.send-precheck-row {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+}
+.send-precheck-row .send-precheck { flex: 1 1 auto; }
+.send-precheck-row .secondary-action { flex: 0 0 auto; font-size: 13px; padding: 5px 11px; }
 .send-task { margin-top: 14px; padding: 12px; border: 1px solid var(--line); border-radius: 4px; background: #fafbf8; }
 .send-task-head { display: flex; justify-content: space-between; align-items: baseline; font-size: 12px; }
 .send-task-head span { color: var(--muted); }
@@ -475,8 +488,38 @@ h3 { font-size: 15px; line-height: 1.4; }
   height: calc(100vh - 84px);
   min-height: 640px;
   display: grid;
-  grid-template-columns: minmax(260px, 300px) minmax(480px, 1fr) minmax(300px, 340px);
+  grid-template-columns:
+    var(--queue-width, 300px) var(--resizer-width, 6px)
+    minmax(320px, 1fr)
+    var(--resizer-width, 6px) var(--decision-width, 340px);
 }
+
+/* 审阅区内容标签页：仅窄屏启用（见文件末尾响应式段） */
+.review-pane-tabs { display: none; }
+
+/* 拖拽调整栏宽：仅在桌面三栏模式出现 */
+.pane-resizer {
+  position: relative;
+  cursor: col-resize;
+  background: var(--canvas);
+  border-inline: 1px solid var(--line);
+  touch-action: none;
+}
+.pane-resizer::after {
+  content: "";
+  position: absolute;
+  inset-block: 42%;
+  inset-inline: 1px;
+  border-radius: 2px;
+  background: var(--line);
+}
+.pane-resizer:hover, .pane-resizer:focus-visible, .pane-resizer.dragging {
+  background: var(--blue-soft);
+}
+.pane-resizer:hover::after, .pane-resizer:focus-visible::after, .pane-resizer.dragging::after {
+  background: var(--blue);
+}
+body.resizing { cursor: col-resize; user-select: none; }
 .queue-pane, .detail-pane, .decision-pane { min-width: 0; min-height: 0; }
 .queue-pane, .decision-pane { background: var(--surface); }
 .queue-pane { display: flex; flex-direction: column; border-right: 1px solid var(--line); }
@@ -1207,10 +1250,30 @@ textarea { min-height: 88px; padding: 9px 10px; resize: vertical; line-height: 1
   .calibration-grid { grid-template-columns: 1fr; }
   .preference-form-grid { grid-template-columns: 1fr; }
   .profile-section { grid-row: auto; }
-  .workspace { height: auto; min-height: calc(100vh - 84px); grid-template-columns: 280px minmax(0, 1fr); }
-  .queue-pane { position: sticky; top: 0; height: calc(100vh - 84px); }
-  .detail-pane { min-height: 720px; }
-  .decision-pane { grid-column: 2; border-top: 6px solid var(--canvas); border-left: 0; }
+  .workspace { height: auto; min-height: calc(100vh - 84px); grid-template-columns: minmax(0, 1fr); }
+  /* 窄屏改为内容标签页，避免三个窄面板互相挤压 */
+  .pane-resizer { display: none; }
+  .review-pane-tabs {
+    display: flex; gap: 6px; padding: 9px 14px;
+    border-bottom: 1px solid var(--line); background: var(--surface);
+    position: sticky; top: 0; z-index: 6;
+  }
+  .review-pane-tabs button {
+    padding: 6px 13px; border: 1px solid var(--line); border-radius: 4px;
+    background: var(--surface); color: var(--muted); font-size: 14px;
+  }
+  .review-pane-tabs button.active { background: var(--ink); border-color: var(--ink); color: #ffffff; }
+  .queue-pane { height: auto; position: static; border-right: 0; }
+  .queue-pane .job-list { max-height: 62vh; }
+  .detail-pane { min-height: 0; }
+  .decision-pane { border-top: 1px solid var(--line); border-left: 0; }
+  /* 窄屏一次只显示一个内容区 */
+  .workspace[data-active-pane="queue"] .detail-pane,
+  .workspace[data-active-pane="queue"] .decision-pane,
+  .workspace[data-active-pane="detail"] .queue-pane,
+  .workspace[data-active-pane="detail"] .decision-pane,
+  .workspace[data-active-pane="decision"] .queue-pane,
+  .workspace[data-active-pane="decision"] .detail-pane { display: none; }
   .decision-pane > form, .correction-panel form, .correction-panel summary { max-width: 720px; margin-inline: auto; }
   .company-profile-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .company-profile-grid div:nth-child(2n) { border-right: 0; }
@@ -1352,7 +1415,8 @@ textarea { min-height: 88px; padding: 9px 10px; resize: vertical; line-height: 1
   .outreach-header > span { text-align: left; }
   .outreach-workspace { display: block; min-height: 0; }
   .outreach-queue { border-right: 0; border-bottom: 6px solid var(--canvas); }
-  .outreach-job-list { max-height: 280px; }
+  .outreach-job-list { max-height: 280px; overflow-x: auto; overflow-y: auto; }
+  .outreach-job-list button { min-width: 300px; }
   .outreach-editor { padding: 18px 14px; }
   .outreach-mobile-tabs {
     margin-bottom: 10px; display: grid; grid-template-columns: repeat(3, 1fr);
@@ -1363,7 +1427,8 @@ textarea { min-height: 88px; padding: 9px 10px; resize: vertical; line-height: 1
   }
   .outreach-mobile-tabs button:last-child { border-right: 0; }
   .outreach-mobile-tabs button.active { background: var(--ink); color: white; }
-  .outreach-comparison { display: block; height: auto; min-height: 520px; }
+  .outreach-comparison { display: block; height: auto; min-height: 520px; overflow-x: auto; }
+  .outreach-panel { min-width: 320px; font-size: 14px; }
   .outreach-panel { display: none; max-height: none; padding: 16px; }
   .outreach-panel.active { display: block; }
   .outreach-panel + .outreach-panel { border-left: 0; }
@@ -1386,3 +1451,28 @@ textarea { min-height: 88px; padding: 9px 10px; resize: vertical; line-height: 1
 .facts-row.ok { color: var(--green); }
 .match-send-status { margin-left: 6px; font-size: 11px; color: #13846b; }
 .match-send-status.failed, .match-send-status.unknown, .match-send-status.paused { color: #b54708; }
+
+
+/* ===== 2026-09-14 筛选分组与可读性 ===== */
+.filter-groups { padding: 10px 14px; display: grid; gap: 7px; border-bottom: 1px solid var(--line); }
+.filter-row { display: flex; align-items: center; gap: 8px; }
+.filter-label { font-size: 13px; color: var(--muted); flex: 0 0 56px; }
+.filter-groups .filters { display: flex; gap: 6px; flex-wrap: wrap; padding: 0; margin: 0; }
+.filter-groups .filters button { font-size: 13px; padding: 4px 10px; }
+.filter-groups .filters button.active { background: var(--ink); color: #fff; }
+.job-search { font-size: 14px; padding: 7px 10px; border: 1px solid var(--line); background: var(--surface); color: var(--ink); border-radius: 4px; }
+.send-state { font-size: 13px; padding: 1px 6px; border-radius: 3px; white-space: nowrap; }
+.send-state.sent { background: #e8f5ec; color: #1e7d34; }
+.send-state.partial { background: #fdf1e0; color: #b9770e; }
+.send-state.unknown { background: #fdecea; color: #c0392b; }
+.send-state.running { background: #eaf1fb; color: #1a63b8; }
+.send-state.paused { background: #fdf1e0; color: #b9770e; }
+.send-state.failed { background: #fdecea; color: #c0392b; }
+.outreach-source { font-size: 14px; color: var(--muted); margin: 4px 0 0; }
+.outreach-source[data-source="template"] { color: #b9770e; }
+.job-list button { font-size: 15px; }
+.job-item-title { font-size: 16px; }
+.job-item-meta { font-size: 13px; }
+.detail-pane { font-size: 15.5px; line-height: 1.6; }
+.detail-pane dd, .detail-pane li, .detail-pane p { font-size: 15px; }
+.jd-text { font-size: 15.5px; line-height: 1.75; }

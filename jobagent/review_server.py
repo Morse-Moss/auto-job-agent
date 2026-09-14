@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 import threading
 from datetime import datetime
 from http import HTTPStatus
@@ -13,6 +15,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from jobagent.resume_collection import collect_resume_market_data
 from jobagent.ai import create_ai_client
+from jobagent import browser_service
 from jobagent.config import resolve_project_path
 from jobagent.knowledge import create_provider
 from jobagent.matching import refresh_stale_matches
@@ -20,6 +23,12 @@ from jobagent.jd_update import plan_from_database
 from jobagent.job_updates import JobUpdateStore
 from jobagent.job_update_executor import BrowserLease, BrowserLeaseBusy, JobUpdateExecutor
 from jobagent.facts import check_job
+from jobagent.job_access import (
+    JobLookupError,
+    classify_send_states,
+    compute_capabilities,
+    resolve_job,
+)
 from jobagent.outreach import (
     OutreachService,
     OutreachValidationError,
@@ -49,6 +58,38 @@ STATIC_FILES = {
 }
 
 
+def _source_snapshot() -> dict[str, float]:
+    """关键源文件的当前修改时间，用于识别“代码更新但服务未重启”。"""
+    root = Path(__file__).resolve().parent.parent
+    tracked = [root / "main.py"]
+    tracked += sorted((root / "jobagent").glob("*.py"))
+    tracked += sorted((root / "jobagent" / "platforms").glob("*.py"))
+    tracked += sorted((root / "review_ui").glob("*"))
+    snapshot: dict[str, float] = {}
+    for path in tracked:
+        try:
+            snapshot[str(path.relative_to(root))] = path.stat().st_mtime
+        except OSError:
+            continue
+    return snapshot
+
+
+def _git_revision() -> str:
+    import subprocess
+
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parent.parent,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return (completed.stdout or "").strip()
+    except Exception:  # noqa: BLE001 — 版本信息失败不应影响服务
+        return ""
+
+
 class ReviewHttpServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -75,6 +116,7 @@ class ReviewHttpServer(ThreadingHTTPServer):
         self.send_service_factory = send_service_factory
         self.collection_lock = threading.Lock()
         self.calibration_operation_lock = threading.Lock()
+        self.browser_start_lock = threading.Lock()
         self.collection_state = {"status": "idle"}
         self.browser_lease = BrowserLease()
         self.job_update_executor = job_update_executor or JobUpdateExecutor(
@@ -85,6 +127,34 @@ class ReviewHttpServer(ThreadingHTTPServer):
             recovery_store.recover_interrupted()
         finally:
             recovery_store.close()
+        # 运行版本：记录加载时刻的源码指纹，用于识别“代码更新但服务未重启”。
+        self.loaded_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        self.loaded_files = _source_snapshot()
+
+    def handle_error(self, request, client_address):
+        """浏览器在响应写完前断开连接属正常现象，不打整段堆栈污染日志。"""
+        exc = sys.exc_info()[1]
+        if isinstance(
+            exc, (ConnectionAbortedError, ConnectionResetError, BrokenPipeError)
+        ):
+            return
+        super().handle_error(request, client_address)
+
+    def version(self) -> dict:
+        current = _source_snapshot()
+        changed = sorted(
+            name
+            for name, mtime in current.items()
+            if name in self.loaded_files and mtime > self.loaded_files[name] + 0.001
+        )
+        return {
+            "revision": _git_revision(),
+            "pid": os.getpid(),
+            "loaded_at": self.loaded_at,
+            "code_changed_since_start": bool(changed),
+            "changed_files": changed[:20],
+            "tracked_files": len(current),
+        }
 
     def outreach_service(self):
         if self.outreach_service_factory is None:
@@ -112,6 +182,29 @@ class ReviewHttpServer(ThreadingHTTPServer):
         """发送前浏览器预检：CDP 可达 + Boss 登录态，不导航不点击。"""
         sender = BossSender(self.config.get("boss") or {})
         return sender.precheck()
+
+    def browser_status(self) -> dict:
+        """浏览器服务状态（只读，不导航、不点击、不启动）。"""
+        endpoint = browser_service.endpoint_from_config(self.config)
+        running = browser_service.cdp_ready(endpoint)
+        return {
+            "endpoint": endpoint,
+            "running": running,
+            "detail": (
+                "浏览器服务在线（CDP 可用）"
+                if running
+                else "浏览器服务不可达，可一键启动"
+            ),
+        }
+
+    def start_browser(self) -> dict:
+        """显式动作：缺失时后台拉起 MorseTools general-web。
+
+        只由用户在界面上点击触发；页面加载、预检都不会走到这里。
+        启动服务不等于发送：不导航、不点击、不发消息，登录态仍需本人处理。
+        """
+        with self.browser_start_lock:
+            return browser_service.ensure_browser_service(self.config)
 
     def execute_job_update(self, run_id: str) -> dict:
         """Explicit external action. Never reachable from a page load or plan build."""
@@ -244,6 +337,9 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         if path == "/health":
             self._send_json(HTTPStatus.OK, {"status": "ok"})
             return
+        if path == "/api/version":
+            self._send_json(HTTPStatus.OK, {"version": self.server.version()})
+            return
         if path == "/api/send/precheck":
             try:
                 self._send_json(HTTPStatus.OK, {"precheck": self.server.send_precheck()})
@@ -260,6 +356,9 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
                         }
                     },
                 )
+            return
+        if path == "/api/browser/status":
+            self._send_json(HTTPStatus.OK, {"browser": self.server.browser_status()})
             return
         if path == "/api/learning":
             self._learning_dashboard()
@@ -358,6 +457,27 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         request_url = urlsplit(self.path)
         path = request_url.path
         query = parse_qs(request_url.query)
+        if path == "/api/browser/start":
+            # 显式外部动作：只在用户点击“启动浏览器服务”时触发。
+            try:
+                self._send_json(
+                    HTTPStatus.OK, {"browser": self.server.start_browser()}
+                )
+            except Exception as exc:  # 启动失败给结构化结果，不 500
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "browser": {
+                            "endpoint": browser_service.endpoint_from_config(
+                                self.server.config
+                            ),
+                            "running": False,
+                            "started": False,
+                            "detail": f"启动浏览器服务失败：{exc}",
+                        }
+                    },
+                )
+            return
         if path.startswith("/api/outreach/"):
             parts = [unquote(value) for value in path.split("/") if value]
             if len(parts) == 4 and parts[3] in {"generate", "confirm", "asset"}:
@@ -657,6 +777,15 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         store = ReviewStore(self.server.db_path)
         try:
             jobs = store.ensure_sample()
+            send_states = classify_send_states(self.server.db_path)
+            for job in jobs:
+                send_state = send_states.get(
+                    (job.get("platform"), job.get("job_id")),
+                    {"state": "none", "label": "未发送"},
+                )
+                job["send_state"] = send_state["state"]
+                job["send_state_label"] = send_state["label"]
+                job.update(compute_capabilities(job, send_state=send_state, package=None))
             self._send_json(
                 HTTPStatus.OK,
                 {"jobs": jobs, "stats": store.stats()},
@@ -933,11 +1062,15 @@ def create_server(
             output_dir = resolve_project_path(resume_cfg.get("output_dir", "output/tailored"))
             assets = normalize_resume_assets(resume_cfg.get("assets"))
             def load_job(platform, job_id):
-                review_store = ReviewStore(database)
+                # 以正式岗位库为准（platform+job_id）；审阅样本只控制展示范围。
                 try:
-                    return review_store.match_detail(job_id, platform)
-                finally:
-                    review_store.close()
+                    return resolve_job(database, job_id, platform=platform or None)
+                except JobLookupError:
+                    review_store = ReviewStore(database)
+                    try:
+                        return review_store.match_detail(job_id, platform)
+                    finally:
+                        review_store.close()
 
             def load_candidates():
                 review_store = ReviewStore(database)

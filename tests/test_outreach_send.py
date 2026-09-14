@@ -347,3 +347,39 @@ def test_note_amendment_records_trace(tmp_path):
         assert noted["amend_note"] == "删除不实的 RAG 表述"
     finally:
         service.close()
+
+
+def test_excluded_company_cannot_be_authorized(tmp_path):
+    """排除公司必须在最终发送入口生效（2026-09-14）。"""
+    service = build(tmp_path, {("boss", "job-1"): package(company="云起未来")}, FakeSender())
+    try:
+        with pytest.raises(SendValidationError):
+            service.authorize("boss", "job-1")
+    finally:
+        service.close()
+
+
+def test_completed_send_cannot_be_reauthorized(tmp_path):
+    """已投递岗位不得重复授权。"""
+    service = build(tmp_path, {("boss", "job-1"): package()}, FakeSender())
+    try:
+        task = service.authorize("boss", "job-1")
+        service.execute(task["task_id"])
+        assert service.status(task["task_id"])["status"] == "confirmed"
+        with pytest.raises(SendValidationError):
+            service.authorize("boss", "job-1")
+    finally:
+        service.close()
+
+
+def test_unknown_result_blocks_reauthorization(tmp_path):
+    """结果未知不得自动重试：既不重发也不再授权新任务。"""
+    service = build(tmp_path, {("boss", "job-1"): package()}, FakeSender(text=None))
+    try:
+        task = service.authorize("boss", "job-1")
+        service.execute(task["task_id"])
+        assert service.status(task["task_id"])["status"] == "unknown"
+        with pytest.raises(SendValidationError):
+            service.authorize("boss", "job-1")
+    finally:
+        service.close()

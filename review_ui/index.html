@@ -153,6 +153,11 @@
     </main>
 
     <main class="workspace" id="reviewView" hidden>
+      <nav class="review-pane-tabs" id="reviewPaneTabs" aria-label="审阅内容区切换">
+        <button type="button" class="active" data-review-pane="queue">岗位队列</button>
+        <button type="button" data-review-pane="detail">岗位详情</button>
+        <button type="button" data-review-pane="decision">我的决定</button>
+      </nav>
       <aside class="queue-pane" aria-label="岗位队列">
         <div class="pane-heading">
           <div>
@@ -161,17 +166,45 @@
           </div>
           <span class="count" id="visibleCount">0</span>
         </div>
-        <div class="filters" id="filters" aria-label="决策状态筛选">
-          <button type="button" class="active" data-filter="all">全部</button>
-          <button type="button" data-filter="unreviewed">未决</button>
-          <button type="button" data-filter="want">想投</button>
-          <button type="button" data-filter="maybe">再看</button>
-          <button type="button" data-filter="reject">放弃</button>
+        <div class="filter-groups" id="filterGroups" aria-label="岗位筛选">
+          <div class="filter-row">
+            <span class="filter-label">匹配分组</span>
+            <div class="filters" id="groupFilters" role="group" aria-label="匹配分组筛选">
+              <button type="button" class="active" data-group-filter="all">全部</button>
+              <button type="button" data-group-filter="core">核心</button>
+              <button type="button" data-group-filter="stretch">挑战</button>
+              <button type="button" data-group-filter="exclude">排除</button>
+            </div>
+          </div>
+          <div class="filter-row">
+            <span class="filter-label">投递状态</span>
+            <div class="filters" id="sendFilters" role="group" aria-label="投递状态筛选">
+              <button type="button" class="active" data-send-filter="all">全部</button>
+              <button type="button" data-send-filter="none">未发送</button>
+              <button type="button" data-send-filter="sent">已投递</button>
+              <button type="button" data-send-filter="partial">部分发送</button>
+              <button type="button" data-send-filter="unknown">结果未知</button>
+            </div>
+          </div>
+          <div class="filter-row">
+            <span class="filter-label">我的意向</span>
+            <div class="filters" id="interestFilters" role="group" aria-label="用户意向筛选">
+              <button type="button" class="active" data-interest-filter="all">全部</button>
+              <button type="button" data-interest-filter="unreviewed">未决</button>
+              <button type="button" data-interest-filter="want">想投</button>
+              <button type="button" data-interest-filter="maybe">再看</button>
+              <button type="button" data-interest-filter="reject">放弃</button>
+            </div>
+          </div>
+          <input type="search" id="jobSearch" class="job-search" placeholder="搜索公司或岗位" aria-label="搜索公司或岗位" />
         </div>
         <div class="job-list" id="jobList" aria-live="polite">
           <p class="loading">正在读取本地岗位...</p>
         </div>
       </aside>
+
+      <div class="pane-resizer" data-resize-pane="queue" role="separator"
+           aria-orientation="vertical" tabindex="0" aria-label="调整岗位队列宽度"></div>
 
       <article class="detail-pane" id="detailPane">
         <div class="empty-state" id="detailEmpty">
@@ -266,6 +299,9 @@
           </section>
         </div>
       </article>
+
+      <div class="pane-resizer" data-resize-pane="decision" role="separator"
+           aria-orientation="vertical" tabindex="0" aria-label="调整决定区宽度"></div>
 
       <aside class="decision-pane" aria-label="你的决定">
         <form id="decisionForm">
@@ -646,6 +682,11 @@
                 <p class="section-label" id="outreachCompany"></p>
                 <h2 id="outreachEditorHeading"></h2>
                 <p id="outreachJobMeta"></p>
+                <p id="outreachSource" class="outreach-source"></p>
+                <div class="outreach-interest-actions" role="group" aria-label="岗位意向">
+                  <button type="button" data-outreach-interest="want">想投</button>
+                  <button type="button" data-outreach-interest="reject">不想投</button>
+                </div>
                 <textarea id="outreachNote" rows="3" placeholder="记录岗位备注"></textarea>
                 <button type="button" class="text-action" id="saveOutreachNote">保存备注</button>
               </div>
@@ -754,7 +795,10 @@
                     <span id="outreachSendBadge" class="send-badge idle">未授权</span>
                   </div>
                   <p class="send-safety">授权只冻结当前这一版的招呼语与长图，不会发出任何消息。真实发送只发生在你点击“确认发送”的那一刻，一次只发这一个岗位。</p>
-                  <p class="send-precheck" id="outreachSendPrecheck">正在预检浏览器与登录态…</p>
+                  <div class="send-precheck-row">
+                    <p class="send-precheck" id="outreachSendPrecheck">正在预检浏览器与登录态…</p>
+                    <button type="button" class="secondary-action" id="startBrowserService" hidden>一键启动浏览器服务</button>
+                  </div>
                   <div class="outreach-actions send-actions">
                     <button type="button" class="secondary-action" id="authorizeSend" disabled>授权本岗</button>
                     <button type="button" class="confirm-action" id="executeSend" disabled>确认发送</button>

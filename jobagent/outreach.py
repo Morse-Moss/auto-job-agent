@@ -21,9 +21,28 @@ from docx.shared import Pt, RGBColor
 from PIL import Image, ImageChops
 
 from jobagent.config import ROOT
+from jobagent.job_access import (
+    classify_send_state,
+    classify_send_states,
+    compute_capabilities,
+    is_excluded_company,
+)
 
 
 CONFIRMATION_KINDS = {"greeting", "resume"}
+
+# 内容模式：界面必须显示来源，且不能把通用模板称为“AI 定制”。
+CONTENT_SOURCE_LABELS = {
+    "manual": "人工精修",
+    "model": "模型生成",
+    "template": "已认可通用模板",
+}
+
+# 已认可通用模板招呼语：只做自我定位与低压力下一步，不编造任何经历或数字。
+TEMPLATE_GREETING = (
+    "你好，我目前在做 AI 应用与智能体方向的开发，看到这个岗位想进一步了解。"
+    "方便的话，想请你介绍一下团队现在主要推进的事情。"
+)
 
 
 def _now() -> str:
@@ -641,37 +660,42 @@ class OutreachService:
         return prepared
 
     @staticmethod
-    def _assert_eligible(job: dict) -> None:
-        if str(job.get("company") or "").strip() in {"云起未来", "云起科技", "比特鹰"}:
-            raise OutreachValidationError("该公司已投递或明确排除，禁止重复发送")
-        decision = job.get("decision") or {}
-        interest = decision.get("interest") or job.get("interest")
-        if interest != "want":
-            raise OutreachValidationError("只有明确标记为“想投”的岗位才能生成投递包")
-        if job.get("recommendation") != "priority":
-            raise OutreachValidationError("当前只为匹配结论为“优先投”的岗位生成投递包")
-        if job.get("match_stale"):
-            raise OutreachValidationError("岗位匹配已失效，请先处理 JD 更新")
-        if job.get("information_status") != "sufficient":
-            raise OutreachValidationError("岗位信息不足，请先补齐并复核 JD")
+    def _assert_preparable(job: dict) -> None:
+        """准备投递包的资格：岗位存在且有 JD、未关闭。
+
+        刻意不要求：属于旧审阅样本、匹配结论为 priority（“挑战投”同样可准备）、
+        已标记想投。排除公司与重复发送在最终发送入口生效，不在这里一票否决。
+        """
         if not str(job.get("jd") or job.get("jd_text") or "").strip():
-            raise OutreachValidationError("岗位缺少 JD 正文")
+            raise OutreachValidationError("岗位缺少 JD 正文，无法准备投递包")
+        if str(job.get("evidence_state") or "") in {"closed", "archived"}:
+            raise OutreachValidationError("岗位已关闭，不能准备投递包")
 
     def list_candidates(self) -> list[dict]:
+        send_states = classify_send_states(self.store.path)
         candidates = []
         for raw in self.candidate_loader() or []:
             job = self._prepare_job(raw)
+            platform = str(job.get("platform") or "boss")
+            job_id = str(job.get("job_id") or "")
             saved = self.store.get(
-                str(job.get("platform") or "boss"),
-                str(job.get("job_id") or ""),
+                platform,
+                job_id,
                 jd_hash=_content_hash(job["jd"]),
                 resume_hash=self.resume_hash,
             )
-            excluded = str(job.get("company") or "").strip() in {"云起未来", "云起科技", "比特鹰"}
+            excluded = is_excluded_company(job.get("company"))
+            send_state = send_states.get(
+                (platform, job_id), {"state": "none", "label": "未发送"}
+            )
+            capabilities = compute_capabilities(
+                job, send_state=send_state, package=saved, excluded=excluded
+            )
+            source = str((saved or {}).get("content_source") or "")
             candidates.append(
                 {
-                    "platform": str(job.get("platform") or "boss"),
-                    "job_id": str(job.get("job_id") or ""),
+                    "platform": platform,
+                    "job_id": job_id,
                     "title": str(job.get("title") or ""),
                     "company": str(job.get("company") or ""),
                     "location": str(job.get("location") or ""),
@@ -683,26 +707,27 @@ class OutreachService:
                     "salary_raw": str(job.get("salary_raw") or ""),
                     "status": saved["status"] if saved else "not_generated",
                     "ready": bool(saved and saved["ready"]) and not excluded,
-                    "send_blocked": excluded,
-                    "send_block_reason": "已投递或明确排除" if excluded else "",
                     "stale": bool(saved and saved["stale"]),
-                    "note": self.store.get_note(str(job.get("platform") or "boss"), str(job.get("job_id") or "")),
+                    "content_source": source,
+                    "content_source_label": CONTENT_SOURCE_LABELS.get(source, ""),
+                    "note": self.store.get_note(platform, job_id),
+                    **capabilities,
                 }
             )
         return candidates
 
-    def _load_eligible_job(self, platform: str, job_id: str) -> dict:
+    def _load_preparable_job(self, platform: str, job_id: str) -> dict:
         job = self.job_loader(platform, job_id)
         if not job:
-            raise OutreachValidationError("岗位不存在或不在当前匹配结果中")
+            raise OutreachValidationError("岗位不存在")
         prepared = self._prepare_job(job)
-        self._assert_eligible(prepared)
+        self._assert_preparable(prepared)
         return prepared
 
     def get(self, platform: str, job_id: str) -> dict:
         job = self.job_loader(platform, job_id)
         if not job:
-            raise OutreachValidationError("岗位不存在或不在当前匹配结果中")
+            raise OutreachValidationError("岗位不存在")
         job = self._prepare_job(job)
         saved = self.store.get(
             platform, job_id,
@@ -720,6 +745,8 @@ class OutreachService:
             "location": str(job.get("location") or ""),
             "company_size": str(job.get("company_size") or ""),
             "industry": str(job.get("industry") or ""),
+            "recommendation": str(job.get("recommendation") or "unknown"),
+            "interest": (job.get("decision") or {}).get("interest") or job.get("interest"),
             "score": int(job.get("score") or 0),
             "salary_raw": str(job.get("salary_raw") or ""),
             "jd_text": str(job.get("jd") or ""),
@@ -751,6 +778,22 @@ class OutreachService:
             result["change_summary"] = compare_resume_order(
                 self.resume_text, result["tailored_md"]
             )
+        # 统一透传内容来源与操作资格：前端只读结果，不自行复制规则。
+        source = str(result.get("content_source") or "")
+        result["content_source_label"] = CONTENT_SOURCE_LABELS.get(source, "")
+        send_state = classify_send_state(
+            self.store.path, base["platform"], base["job_id"]
+        )
+        result["send_state"] = send_state["state"]
+        result["send_state_label"] = send_state["label"]
+        result.update(
+            compute_capabilities(
+                job,
+                send_state=send_state,
+                package=result if saved else None,
+                excluded=is_excluded_company(base.get("company")),
+            )
+        )
         return result
 
     # ------------------------------------------------------------------
@@ -803,7 +846,7 @@ class OutreachService:
         """切换岗位使用的成品简历，并使其长图需要重新确认。"""
         if not self.assets:
             raise OutreachValidationError("未配置 resume.assets，无法选择成品简历")
-        job = self._load_eligible_job(platform, job_id)
+        job = self._load_preparable_job(platform, job_id)
         if self.store.get(platform, job_id) is None:
             raise OutreachValidationError("请先生成投递包")
         asset = self._asset_by_id(asset_id)
@@ -823,7 +866,9 @@ class OutreachService:
         )
 
     def generate(self, platform: str, job_id: str, asset_id: str | None = None) -> dict:
-        job = self._load_eligible_job(platform, job_id)
+        from jobagent.ai import ManualEntryMissing
+
+        job = self._load_preparable_job(platform, job_id)
         resume_text = self.resume_text
         knowledge = self.knowledge.for_job(job) if self.knowledge else ""
         ai = self.ai or (self.ai_factory() if self.ai_factory else None)
@@ -835,10 +880,24 @@ class OutreachService:
             asset = self._asset_by_id(asset_id) if asset_id else self._asset_by_id(
                 self._suggest_asset_id(job)
             )
+        # 内容模式：人工精修 / 模型生成 / 已认可通用模板。人工 JSON 不要求覆盖
+        # 全部岗位，缺条目时用结构化信号切到通用模板，而不是匹配中文报错文案。
+        content_source = "model"
+        try:
+            greeting = ai.greeting(resume_text, job, knowledge)
+        except ManualEntryMissing:
+            content_source = "template"
+            greeting = TEMPLATE_GREETING
+        except ValueError as exc:
+            raise OutreachValidationError(str(exc)) from exc
+
         if asset is None:
             catalog = build_resume_catalog(resume_text)
             try:
                 plan = ai.resume_plan(resume_text, job, catalog)
+            except ManualEntryMissing:
+                plan = {}
+                content_source = "template"
             except ValueError as exc:
                 raise OutreachValidationError(
                     "AI 返回的简历微调计划无法解析，已阻止生成"
@@ -851,9 +910,8 @@ class OutreachService:
             # 成品资产不接收任何改写；母版原文仅作内容存档展示。
             tailored = resume_text
             change_summary = {}
-        greeting = ai.greeting(resume_text, job, knowledge)
         if not str(greeting or "").strip() or not str(tailored or "").strip():
-            raise OutreachValidationError("AI 没有返回完整的招呼语和定制简历")
+            raise OutreachValidationError("没有生成完整的招呼语和简历内容")
         if asset is None:
             rendered = self.renderer.render(
                 job, tailored, f"{job_id}-generated-{_content_hash(tailored)[:12]}"
@@ -870,15 +928,16 @@ class OutreachService:
             docx_hash=rendered.docx_hash, image_hash=rendered.image_hash,
             image_width=rendered.image_width, image_height=rendered.image_height,
             change_summary=change_summary, resume_asset_id=used_asset_id,
+            content_source=content_source,
         )
         return self._attach_job(saved, job)
 
     def update_greeting(self, platform: str, job_id: str, text: str) -> dict:
-        job = self._load_eligible_job(platform, job_id)
+        job = self._load_preparable_job(platform, job_id)
         return self._attach_job(self.store.update_greeting(platform, job_id, text), job)
 
     def update_resume(self, platform: str, job_id: str, markdown: str) -> dict:
-        job = self._load_eligible_job(platform, job_id)
+        job = self._load_preparable_job(platform, job_id)
         saved = self.store.get(platform, job_id)
         if saved is None:
             raise OutreachValidationError("请先生成投递包")
@@ -894,7 +953,7 @@ class OutreachService:
         return self._attach_job(updated, job)
 
     def confirm(self, platform: str, job_id: str, kind: str) -> dict:
-        job = self._load_eligible_job(platform, job_id)
+        job = self._load_preparable_job(platform, job_id)
         current = self.store.get(
             platform, job_id, jd_hash=_content_hash(job["jd"]), resume_hash=self.resume_hash
         )
@@ -970,6 +1029,10 @@ class OutreachStore:
         if "resume_asset_id" not in columns:
             self.conn.execute(
                 "ALTER TABLE job_outreach ADD COLUMN resume_asset_id TEXT NOT NULL DEFAULT ''"
+            )
+        if "content_source" not in columns:
+            self.conn.execute(
+                "ALTER TABLE job_outreach ADD COLUMN content_source TEXT NOT NULL DEFAULT ''"
             )
         self.conn.execute("CREATE TABLE IF NOT EXISTS job_outreach_notes (platform TEXT NOT NULL, job_id TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, PRIMARY KEY(platform, job_id))")
         self.conn.commit()
@@ -1056,6 +1119,7 @@ class OutreachStore:
         image_height: int,
         change_summary: dict | None = None,
         resume_asset_id: str = "",
+        content_source: str = "model",
     ) -> dict:
         existing = self.conn.execute(
             "SELECT content_version FROM job_outreach WHERE platform = ? AND job_id = ?",
@@ -1071,8 +1135,8 @@ class OutreachStore:
                   greeting_text, tailored_md, docx_path, image_path, docx_hash,
                   image_hash, image_width, image_height, greeting_confirmed_at,
                   resume_confirmed_at, content_edited, generated_at, updated_at, last_error,
-                  change_summary_json, resume_asset_id
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, '', ?, ?)
+                  change_summary_json, resume_asset_id, content_source
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, '', ?, ?, ?)
                 ON CONFLICT(platform, job_id) DO UPDATE SET
                   content_version = excluded.content_version,
                   jd_hash = excluded.jd_hash,
@@ -1092,7 +1156,8 @@ class OutreachStore:
                   updated_at = excluded.updated_at,
                   last_error = '',
                   change_summary_json = excluded.change_summary_json,
-                  resume_asset_id = excluded.resume_asset_id
+                  resume_asset_id = excluded.resume_asset_id,
+                  content_source = excluded.content_source
                 """,
                 (
                     platform, job_id, version, jd_hash, resume_hash,
@@ -1101,6 +1166,7 @@ class OutreachStore:
                     None, None, 0, generated_at, generated_at,
                     json.dumps(change_summary or {}, ensure_ascii=False),
                     str(resume_asset_id or ""),
+                    str(content_source or ""),
                 ),
             )
         return self.get(platform, job_id)

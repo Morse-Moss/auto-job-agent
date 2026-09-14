@@ -526,15 +526,87 @@ class DecisionPersistenceTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_decision_cannot_write_outside_the_active_sample(self):
+    def test_decision_can_be_saved_for_job_outside_active_sample(self):
+        """审阅样本只控制展示范围，不作为保存意向的前提（2026-09-14 落地）。"""
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "jobs.db"
             create_fixture_db(db_path)
             store = ReviewStore(db_path)
             try:
                 store.ensure_sample("positioning-v1", quotas={"favorites": 1})
-                with self.assertRaises(ReviewValidationError):
-                    store.save_decision("job-23", {"interest": "reject"})
+                sampled = {job["job_id"] for job in store.list_jobs()}
+                outside = next(
+                    row["job_id"]
+                    for row in store.conn.execute(
+                        "SELECT job_id FROM job_details ORDER BY job_id"
+                    ).fetchall()
+                    if row["job_id"] not in sampled
+                )
+                decision = store.save_decision(outside, {"interest": "want"})
+
+                self.assertEqual(decision["interest"], "want")
+                stored = store.conn.execute(
+                    "SELECT interest FROM job_decisions WHERE job_id = ?", (outside,)
+                ).fetchone()
+                self.assertEqual(stored["interest"], "want")
+            finally:
+                store.close()
+
+    def test_interest_only_update_preserves_note_reason_learning_and_history(self):
+        """只改意向不得清空备注/拒绝原因/学习标记，且旧值写入历史。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "jobs.db"
+            create_fixture_db(db_path)
+            store = ReviewStore(db_path)
+            try:
+                store.ensure_sample("positioning-v1", quotas={"favorites": 1})
+                job_id = store.list_jobs()[0]["job_id"]
+                store.save_decision(
+                    job_id,
+                    {
+                        "interest": "maybe",
+                        "note": "先补 RAG",
+                        "rejection_reason": "地点远",
+                        "learning_intent": True,
+                    },
+                )
+                store.save_decision(job_id, {"interest": "want"})
+
+                row = store.conn.execute(
+                    "SELECT interest, note, rejection_reason, learning_intent "
+                    "FROM job_decisions WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                self.assertEqual(row["interest"], "want")
+                self.assertEqual(row["note"], "先补 RAG")
+                self.assertEqual(row["rejection_reason"], "地点远")
+                self.assertEqual(row["learning_intent"], 1)
+                history = store.conn.execute(
+                    "SELECT interest, note FROM job_decision_history WHERE job_id = ? ORDER BY id",
+                    (job_id,),
+                ).fetchall()
+                self.assertEqual([tuple(item) for item in history], [("maybe", "先补 RAG")])
+            finally:
+                store.close()
+
+    def test_decision_reports_platform_ambiguity_instead_of_guessing(self):
+        """同编号存在于多平台时要求显式指定，不做 LIMIT 1 宽泛回退。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "jobs.db"
+            create_fixture_db(db_path)
+            connection = sqlite3.connect(db_path)
+            connection.execute(
+                "INSERT INTO job_details "
+                "(platform, job_id, source_url, detail_status, collected_at, jd_text) "
+                "VALUES ('other', 'job-23', 'https://example.com/x', 'collected', "
+                "'2026-01-01T00:00:00+08:00', '另一个平台的同一编号岗位')"
+            )
+            connection.commit()
+            connection.close()
+            store = ReviewStore(db_path)
+            try:
+                with self.assertRaisesRegex(ReviewValidationError, "多个平台"):
+                    store.save_decision("job-23", {"interest": "want"})
             finally:
                 store.close()
 

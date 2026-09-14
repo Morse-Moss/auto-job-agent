@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 
 from jobagent.job_update_executor import BrowserLease
+from jobagent.job_access import classify_send_state, is_excluded_company
 
 TEXT_KIND = "greeting"
 IMAGE_KIND = "image"
@@ -363,6 +364,7 @@ class OutreachSendService:
     # -- authorization -------------------------------------------------
     def authorize(self, platform: str, job_id: str) -> dict:
         package = self._load_ready_package(platform, job_id)
+        self._assert_not_already_sent(str(platform), str(job_id))
         return self.store.authorize(
             str(platform),
             str(job_id),
@@ -413,7 +415,10 @@ class OutreachSendService:
     def _load_ready_package(self, platform: str, job_id: str) -> dict:
         package = self.package_provider(platform, job_id)
         if not package:
-            raise SendValidationError("岗位不存在或不在当前匹配结果中")
+            raise SendValidationError("岗位不存在")
+        # 排除公司必须在最终发送入口生效，包括历史已授权任务与内容修订后的重授权。
+        if is_excluded_company(package.get("company")):
+            raise SendValidationError("该公司已投递或明确排除，禁止发送")
         if package.get("stale"):
             raise SendValidationError("投递包已失效：JD 或简历基准已变化，请重新生成")
         if not package.get("ready"):
@@ -421,6 +426,14 @@ class OutreachSendService:
                 "投递包尚未就绪：招呼语与简历长图必须分别确认，且内容不能失效"
             )
         return package
+
+    def _assert_not_already_sent(self, platform: str, job_id: str) -> None:
+        """未重复发送：真正送达过或结果未知的岗位不再授权新任务。"""
+        state = classify_send_state(self.store.path, platform, job_id)["state"]
+        if state == "sent":
+            raise SendValidationError("该岗位已完成发送，禁止重复发送")
+        if state == "unknown":
+            raise SendValidationError("上次发送结果未知，禁止自动重试，请先人工核对")
 
     def _assert_snapshot(self, task: dict, package: dict) -> None:
         if _hash(package.get("greeting_text")) != task["greeting_hash"]:

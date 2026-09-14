@@ -28,6 +28,11 @@ from jobagent.matching import (
     get_match_detail,
     migrate_matching_schema,
 )
+from jobagent.job_access import JobLookupError, resolve_job
+
+
+# 哨兵：区分“未提供该字段”（保持原值）与“显式提供空值”。
+_UNSET = object()
 
 
 DEFAULT_SAMPLE_QUOTAS = {
@@ -530,12 +535,21 @@ class ReviewStore:
             )
         return self.list_jobs(sample_name)
 
+    def _optional_detail_columns(self, names: tuple[str, ...]) -> str:
+        """按真实表结构挑选可选列；老库缺列时回落 NULL，不让审阅列表整页报错。"""
+        present = {row[1] for row in self.conn.execute("PRAGMA table_info(job_details)")}
+        return ", ".join(
+            f"d.{name}" if name in present else f"NULL AS {name}" for name in names
+        )
+
     def list_jobs(self, sample_name: str = "positioning-v1") -> list[dict]:
+        optional_columns = self._optional_detail_columns(("company_size", "industry"))
         rows = self.conn.execute(
             f"""
             SELECT s.position, s.sample_bucket, d.platform, d.job_id, d.title,
                    d.company, d.salary_raw, d.location, d.experience_raw,
-                   d.source_key, a.fit_tier, a.track, a.relevance_score,
+                   {optional_columns},
+                   d.jd_text, d.source_key, a.fit_tier, a.track, a.relevance_score,
                    a.fde_value_score, decision.interest, decision.decided_at
             FROM job_review_samples s
             JOIN job_details d
@@ -765,35 +779,71 @@ class ReviewStore:
         sample_name: str = "positioning-v1",
         platform: str | None = None,
     ) -> dict:
-        interest = str(payload.get("interest") or "")
-        if interest not in INTEREST_VALUES:
+        """保存/更新用户意向（面向正式岗位库）。
+
+        要点（2026-09-14 落地）：
+        - 身份是 ``platform + job_id``，直接从正式岗位库解析，审阅样本只控制
+          展示范围，不再决定能否保存；平台歧义时要求显式指定，不做 LIMIT 1
+          宽泛回退。
+        - 只更新 payload 里出现的字段：只改意向不会清空备注、拒绝原因或学习
+          标记，旧值原样保留并写入历史。
+        """
+        try:
+            job = resolve_job(self.db_path, job_id, platform=platform)
+        except JobLookupError as exc:
+            raise ReviewValidationError(str(exc)) from exc
+
+        if "interest" in payload:
+            interest = str(payload.get("interest") or "")
+            if interest not in INTEREST_VALUES:
+                raise ReviewValidationError("请选择想投、再看或放弃")
+        else:
+            interest = None
+        if "learning_intent" in payload:
+            learning_value = payload.get("learning_intent")
+            if learning_value is not None and not isinstance(learning_value, bool):
+                raise ReviewValidationError("学习清单选项格式不正确")
+            learning_intent = None if learning_value is None else int(learning_value)
+        else:
+            learning_intent = _UNSET
+
+        previous = self.conn.execute(
+            "SELECT * FROM job_decisions WHERE platform = ? AND job_id = ?",
+            (job["platform"], job_id),
+        ).fetchone()
+        current = dict(previous) if previous else None
+
+        resolved_interest = interest if interest is not None else (current or {}).get("interest")
+        if resolved_interest not in INTEREST_VALUES:
             raise ReviewValidationError("请选择想投、再看或放弃")
-        learning_value = payload.get("learning_intent")
-        if learning_value is not None and not isinstance(learning_value, bool):
-            raise ReviewValidationError("学习清单选项格式不正确")
-        decision = {
-            "interest": interest,
-            "rejection_reason": str(payload.get("rejection_reason") or "").strip(),
-            "note": str(payload.get("note") or "").strip(),
-            "learning_intent": None if learning_value is None else int(learning_value),
-        }
-        job = self._sample_job(job_id, sample_name, platform=platform)
+        rejection_reason = (
+            str(payload.get("rejection_reason") or "").strip()
+            if "rejection_reason" in payload
+            else str((current or {}).get("rejection_reason") or "")
+        )
+        note = (
+            str(payload.get("note") or "").strip()
+            if "note" in payload
+            else str((current or {}).get("note") or "")
+        )
+        resolved_learning = (
+            learning_intent
+            if learning_intent is not _UNSET
+            else (current or {}).get("learning_intent")
+        )
+
         decided_at = _now()
         with self.conn:
-            previous = self.conn.execute(
-                "SELECT * FROM job_decisions WHERE platform = ? AND job_id = ?",
-                (job["platform"], job_id),
-            ).fetchone()
-            if previous:
+            if current:
                 self.conn.execute(
                     """INSERT INTO job_decision_history (
                          platform, job_id, interest, rejection_reason, note,
                          learning_intent, decided_at, superseded_at
                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
-                        previous["platform"], previous["job_id"], previous["interest"],
-                        previous["rejection_reason"], previous["note"],
-                        previous["learning_intent"], previous["decided_at"], decided_at,
+                        current["platform"], current["job_id"], current["interest"],
+                        current["rejection_reason"], current["note"],
+                        current["learning_intent"], current["decided_at"], decided_at,
                     ),
                 )
             self.conn.execute(
@@ -806,28 +856,24 @@ class ReviewStore:
                   interest = excluded.interest,
                   rejection_reason = excluded.rejection_reason,
                   note = excluded.note,
-                  learning_intent = COALESCE(
-                    excluded.learning_intent, job_decisions.learning_intent
-                  ),
+                  learning_intent = excluded.learning_intent,
                   decided_at = excluded.decided_at
                 """,
                 (
                     job["platform"],
                     job_id,
-                    decision["interest"],
-                    decision["rejection_reason"],
-                    decision["note"],
-                    decision["learning_intent"],
+                    resolved_interest,
+                    rejection_reason,
+                    note,
+                    resolved_learning,
                     decided_at,
                 ),
             )
-        stored_learning = self.conn.execute(
-            "SELECT learning_intent FROM job_decisions WHERE platform = ? AND job_id = ?",
-            (job["platform"], job_id),
-        ).fetchone()[0]
         return {
-            **decision,
-            "learning_intent": None if stored_learning is None else bool(stored_learning),
+            "interest": resolved_interest,
+            "rejection_reason": rejection_reason,
+            "note": note,
+            "learning_intent": None if resolved_learning is None else bool(resolved_learning),
             "decided_at": decided_at,
         }
 

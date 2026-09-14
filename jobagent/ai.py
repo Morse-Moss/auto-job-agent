@@ -271,6 +271,18 @@ class OpenAICompatibleClient:
         )
 
 
+class ManualEntryMissing(ValueError):
+    """人工托管 JSON 里没有该岗位的条目。
+
+    这是一个结构化信号，不是错误字符串：调用方据此切换到“模型生成”或
+    “已认可通用模板”内容模式，而不是去匹配中文报错文案。
+    """
+
+    def __init__(self, job_id: str):
+        self.job_id = str(job_id)
+        super().__init__(f"人工托管内容缺少岗位 {self.job_id} 的条目")
+
+
 class ManualOutreachProvider:
     """由人工（或脚本）预先撰写的投递内容，不调用任何外部模型。
 
@@ -320,11 +332,16 @@ class ManualOutreachProvider:
         jobs = data.get("jobs") if isinstance(data, dict) else None
         return jobs if isinstance(jobs, dict) else {}
 
+    def has_entry(self, job: dict) -> bool:
+        """该岗位是否有人工精修条目。人工 JSON 不要求覆盖全部岗位。"""
+        entry = self._jobs().get(str(job.get("job_id") or ""))
+        return isinstance(entry, dict)
+
     def _entry(self, job: dict) -> dict:
         job_id = str(job.get("job_id") or "")
         entry = self._jobs().get(job_id)
         if not isinstance(entry, dict):
-            raise ValueError(f"人工托管内容缺少岗位 {job_id} 的条目")
+            raise ManualEntryMissing(job_id)
         return entry
 
     def greeting(self, resume_md: str, job: dict, knowledge: str = "") -> str:
@@ -334,9 +351,13 @@ class ManualOutreachProvider:
         return text
 
     def resume_plan(self, resume_md: str, job: dict, catalog: dict) -> dict:
-        plan = self._entry(job).get("resume_plan") or {}
-        if not isinstance(plan, dict):
+        entry = self._entry(job)
+        plan = entry.get("resume_plan")
+        if plan is None:
+            # 未提供 resume_plan 表示母版顺序不变，不是错误。
             return {}
+        if not isinstance(plan, dict):
+            raise ValueError("人工托管内容的 resume_plan 格式不正确")
         return plan
 
     def match_score(self, resume_md: str, job: dict, preferences: str = "") -> tuple[int, str]:
